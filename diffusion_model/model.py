@@ -1,0 +1,157 @@
+"""Stage-specific models for the 3-stage joint-aware latent diffusion pipeline."""
+
+from __future__ import annotations
+
+from typing import Dict, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from diffusion_model.diffusion import DiffusionProcess
+from diffusion_model.sensor_model import IMULatentAligner
+from diffusion_model.skeleton_model import GraphDecoder, GraphDenoiserMasked, GraphEncoder
+from diffusion_model.util import DEFAULT_LAMBDA_CLS, assert_shape
+
+
+class SkeletonTransformerClassifier(nn.Module):
+    """Transformer classifier over decoded skeleton trajectories."""
+
+    def __init__(self, num_joints: int = 32, num_classes: int = 14, d_model: int = 256) -> None:
+        super().__init__()
+        self.num_joints = num_joints
+        self.num_classes = num_classes
+        self.d_model = d_model
+        self.in_proj = nn.Linear(num_joints * 3, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=8,
+            dim_feedforward=d_model * 4,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=3)
+        self.head = nn.Linear(d_model, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Classify x with shape [B, T, J, 3] and return logits [B, C]."""
+        assert_shape(x, [None, None, self.num_joints, 3], "SkeletonTransformerClassifier.x")
+        b, t, j, c = x.shape
+        x_flat = x.reshape(b, t, j * c)
+        h = self.in_proj(x_flat)
+        h = self.encoder(h)
+        pooled = h.mean(dim=1)
+        logits = self.head(pooled)
+        assert_shape(logits, [b, self.num_classes], "SkeletonTransformerClassifier.logits")
+        return logits
+
+
+class Stage1Model(nn.Module):
+    """Stage 1 model: skeleton latent diffusion and decoder reconstruction sanity."""
+
+    def __init__(self, latent_dim: int = 256, num_joints: int = 32, timesteps: int = 500) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_joints = num_joints
+        self.encoder = GraphEncoder(input_dim=3, latent_dim=latent_dim, num_joints=num_joints)
+        self.denoiser = GraphDenoiserMasked(latent_dim=latent_dim, num_joints=num_joints)
+        self.decoder = GraphDecoder(latent_dim=latent_dim, output_dim=3, num_joints=num_joints)
+        self.diffusion = DiffusionProcess(timesteps=timesteps)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Compute stage-1 diffusion loss and reconstruction outputs."""
+        assert_shape(x, [None, None, self.num_joints, 3], "Stage1Model.x")
+        z0 = self.encoder(x)
+        t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
+        loss_diff = self.diffusion.predict_noise_loss(self.denoiser, z0, t, h=None)
+        x_hat = self.decoder(z0)
+        loss_recon = F.mse_loss(x_hat, x)
+        return {"loss_diff": loss_diff, "loss_recon": loss_recon, "z0": z0, "x_hat": x_hat}
+
+
+class Stage2Model(nn.Module):
+    """Stage 2 model: IMU to latent global embedding alignment with frozen encoder."""
+
+    def __init__(self, encoder: GraphEncoder, latent_dim: int = 256, num_joints: int = 32) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_joints = num_joints
+        self.encoder = encoder
+        self.aligner = IMULatentAligner(latent_dim=latent_dim)
+        self.freeze_encoder()
+
+    def freeze_encoder(self) -> None:
+        """Freeze stage-1 encoder and verify all params are frozen."""
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+        assert all(not p.requires_grad for p in self.encoder.parameters()), "encoder freeze verification failed"
+
+    def forward(self, x: torch.Tensor, s_hip: torch.Tensor, s_wrist: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Compute alignment loss to pooled frozen latent targets."""
+        assert_shape(x, [None, None, self.num_joints, 3], "Stage2Model.x")
+        assert_shape(s_hip, [x.shape[0], x.shape[1], 6], "Stage2Model.s_hip")
+        assert_shape(s_wrist, [x.shape[0], x.shape[1], 6], "Stage2Model.s_wrist")
+        with torch.no_grad():
+            z0 = self.encoder(x)
+        target = z0.mean(dim=(1, 2))
+        assert_shape(target, [x.shape[0], self.latent_dim], "Stage2Model.target")
+        h = self.aligner(s_hip=s_hip, s_wrist=s_wrist)
+        loss_align = F.mse_loss(h, target)
+        return {"loss_align": loss_align, "h": h, "target": target}
+
+
+class Stage3Model(nn.Module):
+    """Stage 3 model: conditional latent diffusion and downstream classification."""
+
+    def __init__(
+        self,
+        encoder: GraphEncoder,
+        decoder: GraphDecoder,
+        denoiser: GraphDenoiserMasked,
+        latent_dim: int = 256,
+        num_joints: int = 32,
+        num_classes: int = 14,
+        timesteps: int = 500,
+        lambda_cls: float = DEFAULT_LAMBDA_CLS,
+    ) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_joints = num_joints
+        self.lambda_cls = lambda_cls
+        self.encoder = encoder
+        self.decoder = decoder
+        self.denoiser = denoiser
+        self.diffusion = DiffusionProcess(timesteps=timesteps)
+        self.classifier = SkeletonTransformerClassifier(num_joints=num_joints, num_classes=num_classes, d_model=latent_dim)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor, h: Optional[torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Compute stage-3 loss and outputs with optional conditioning h."""
+        assert_shape(x, [None, None, self.num_joints, 3], "Stage3Model.x")
+        assert_shape(y, [x.shape[0]], "Stage3Model.y")
+        if h is not None:
+            assert_shape(h, [x.shape[0], self.latent_dim], "Stage3Model.h")
+
+        with torch.no_grad():
+            z0 = self.encoder(x)
+        t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
+        loss_diff = self.diffusion.predict_noise_loss(self.denoiser, z0, t, h=h)
+
+        z0_gen = self.diffusion.p_sample_loop(
+            denoiser=self.denoiser,
+            shape=z0.shape,
+            device=x.device,
+            h=h,
+        )
+        x_hat = self.decoder(z0_gen)
+        logits = self.classifier(x_hat)
+        loss_cls = F.cross_entropy(logits, y)
+        loss_total = loss_diff + self.lambda_cls * loss_cls
+
+        return {
+            "loss_total": loss_total,
+            "loss_diff": loss_diff,
+            "loss_cls": loss_cls,
+            "x_hat": x_hat,
+            "logits": logits,
+            "z0_gen": z0_gen,
+        }

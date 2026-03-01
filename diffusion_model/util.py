@@ -1,4 +1,4 @@
-"""Utility functions and constants for joint-aware latent diffusion."""
+"""Utility functions and constants for joint-aware latent diffusion"""
 
 from __future__ import annotations
 

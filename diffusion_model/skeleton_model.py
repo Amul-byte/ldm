@@ -7,7 +7,13 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from diffusion_model.graph_modules import GraphBlock, build_edge_index, HAS_TORCH_GEOMETRIC, TemporalConvBlock
+from diffusion_model.graph_modules import (
+    CrossAttentionBlock,
+    GraphBlock,
+    TemporalConvBlock,
+    HAS_TORCH_GEOMETRIC,
+    build_edge_index,
+)
 from diffusion_model.util import assert_shape, build_adjacency_matrix, sinusoidal_timestep_embedding
 
 
@@ -67,7 +73,7 @@ class GraphDecoder(nn.Module):
 
 
 class GraphDenoiserMasked(nn.Module):
-    """Adjacency-masked graph denoiser with optional FiLM conditioning."""
+    """Adjacency-masked graph denoiser with cross-attention sensor conditioning."""
 
     def __init__(self, latent_dim: int = 256, num_joints: int = 32, depth: int = 6) -> None:
         super().__init__()
@@ -78,23 +84,32 @@ class GraphDenoiserMasked(nn.Module):
             nn.GELU(),
             nn.Linear(latent_dim, latent_dim),
         )
-        self.cond_mlp = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim * 2),
+        self.global_cond_proj = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
             nn.GELU(),
-            nn.Linear(latent_dim * 2, latent_dim * 2),
+            nn.Linear(latent_dim, latent_dim),
         )
         self.blocks = nn.ModuleList(
             [GraphBlock(dim=latent_dim, num_heads=8, num_joints=num_joints, use_pyg=True) for _ in range(depth)]
         )
+        self.cross_attn_blocks = nn.ModuleList([CrossAttentionBlock(dim=latent_dim, num_heads=8) for _ in range(depth)])
         self.temporal_blocks = nn.ModuleList([TemporalConvBlock(dim=latent_dim) for _ in range(depth)])
         self.out = nn.Linear(latent_dim, latent_dim)
 
-    def forward(self, z_t: torch.Tensor, t: torch.Tensor, h: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Predict epsilon for z_t using timestep t and optional global condition h."""
+    def forward(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        h_tokens: Optional[torch.Tensor] = None,
+        h_global: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Predict epsilon for z_t using timestep and optional sensor conditioning."""
         assert_shape(z_t, [None, None, self.num_joints, self.latent_dim], "GraphDenoiserMasked.z_t")
         assert_shape(t, [z_t.shape[0]], "GraphDenoiserMasked.t")
-        if h is not None:
-            assert_shape(h, [z_t.shape[0], self.latent_dim], "GraphDenoiserMasked.h")
+        if h_tokens is not None:
+            assert_shape(h_tokens, [z_t.shape[0], z_t.shape[1], self.latent_dim], "GraphDenoiserMasked.h_tokens")
+        if h_global is not None:
+            assert_shape(h_global, [z_t.shape[0], self.latent_dim], "GraphDenoiserMasked.h_global")
 
         adjacency = build_adjacency_matrix(num_joints=self.num_joints, device=z_t.device)
         edge_index = build_edge_index(self.num_joints, z_t.device) if HAS_TORCH_GEOMETRIC else None
@@ -103,15 +118,14 @@ class GraphDenoiserMasked(nn.Module):
         t_emb = self.time_mlp(t_emb).unsqueeze(1).unsqueeze(1)
         x = z_t + t_emb
 
-        if h is not None:
-            film = self.cond_mlp(h)
-            gamma, beta = film.chunk(2, dim=-1)
-            gamma = gamma.unsqueeze(1).unsqueeze(1)
-            beta = beta.unsqueeze(1).unsqueeze(1)
-            x = x * (1.0 + gamma) + beta
+        if h_global is not None:
+            g = self.global_cond_proj(h_global).unsqueeze(1).unsqueeze(1)
+            x = x + g
 
-        for g_block, t_block in zip(self.blocks, self.temporal_blocks):
+        for g_block, c_block, t_block in zip(self.blocks, self.cross_attn_blocks, self.temporal_blocks):
             x = g_block(x, adjacency=adjacency, edge_index=edge_index)
+            if h_tokens is not None:
+                x = c_block(x, h_tokens)
             x = t_block(x)
 
         eps = self.out(x)

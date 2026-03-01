@@ -63,7 +63,7 @@ class Stage1Model(nn.Module):
         assert_shape(x, [None, None, self.num_joints, 3], "Stage1Model.x")
         z0 = self.encoder(x)
         t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
-        loss_diff = self.diffusion.predict_noise_loss(self.denoiser, z0, t, h=None)
+        loss_diff = self.diffusion.predict_noise_loss(self.denoiser, z0, t, h_tokens=None, h_global=None)
         x_hat = self.decoder(z0)
         loss_recon = F.mse_loss(x_hat, x)
         return {"loss_diff": loss_diff, "loss_recon": loss_recon, "z0": z0, "x_hat": x_hat}
@@ -91,13 +91,20 @@ class Stage2Model(nn.Module):
         assert_shape(x, [None, None, self.num_joints, 3], "Stage2Model.x")
         assert_shape(s_hip, [x.shape[0], x.shape[1], 6], "Stage2Model.s_hip")
         assert_shape(s_wrist, [x.shape[0], x.shape[1], 6], "Stage2Model.s_wrist")
+
         with torch.no_grad():
             z0 = self.encoder(x)
-        target = z0.mean(dim=(1, 2))
-        assert_shape(target, [x.shape[0], self.latent_dim], "Stage2Model.target")
-        h = self.aligner(s_hip=s_hip, s_wrist=s_wrist)
-        loss_align = F.mse_loss(h, target)
-        return {"loss_align": loss_align, "h": h, "target": target}
+        z0_target = z0.mean(dim=(1, 2))
+        assert_shape(z0_target, [x.shape[0], self.latent_dim], "Stage2Model.z0_target")
+
+        h_global, h_tokens = self.aligner(s_hip=s_hip, s_wrist=s_wrist)
+        loss_align = F.mse_loss(h_global, z0_target)
+        return {
+            "loss_align": loss_align,
+            "h_global": h_global,
+            "h_tokens": h_tokens,
+            "z0_target": z0_target,
+        }
 
 
 class Stage3Model(nn.Module):
@@ -124,23 +131,39 @@ class Stage3Model(nn.Module):
         self.diffusion = DiffusionProcess(timesteps=timesteps)
         self.classifier = SkeletonTransformerClassifier(num_joints=num_joints, num_classes=num_classes, d_model=latent_dim)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor, h: Optional[torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Compute stage-3 loss and outputs with optional conditioning h."""
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        h_tokens: Optional[torch.Tensor] = None,
+        h_global: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute stage-3 loss and outputs with optional cross-attention conditioning."""
         assert_shape(x, [None, None, self.num_joints, 3], "Stage3Model.x")
         assert_shape(y, [x.shape[0]], "Stage3Model.y")
-        if h is not None:
-            assert_shape(h, [x.shape[0], self.latent_dim], "Stage3Model.h")
+        if h_tokens is not None:
+            assert_shape(h_tokens, [x.shape[0], x.shape[1], self.latent_dim], "Stage3Model.h_tokens")
+        if h_global is not None:
+            assert_shape(h_global, [x.shape[0], self.latent_dim], "Stage3Model.h_global")
 
         with torch.no_grad():
             z0 = self.encoder(x)
+
         t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
-        loss_diff = self.diffusion.predict_noise_loss(self.denoiser, z0, t, h=h)
+        loss_diff = self.diffusion.predict_noise_loss(
+            self.denoiser,
+            z0,
+            t,
+            h_tokens=h_tokens,
+            h_global=h_global,
+        )
 
         z0_gen = self.diffusion.p_sample_loop(
             denoiser=self.denoiser,
             shape=z0.shape,
             device=x.device,
-            h=h,
+            h_tokens=h_tokens,
+            h_global=h_global,
         )
         x_hat = self.decoder(z0_gen)
         logits = self.classifier(x_hat)

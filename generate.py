@@ -163,6 +163,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Run conditional sampling and optional classification."""
     args = parse_args()
+    if args.h_none:
+        raise ValueError("Strict proposal behavior requires sensor conditioning during generation. Remove --h_none.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     stage1 = Stage1Model(latent_dim=args.latent_dim, num_joints=args.joints, timesteps=args.timesteps).to(device)
@@ -212,11 +214,7 @@ def main() -> None:
         a_wrist_stream = batch["A_wrist"].to(device)
 
     def _sample_once() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if args.h_none:
-            h_global_local = None
-            sensor_tokens_local = None
-        else:
-            h_global_local, sensor_tokens_local = stage2.aligner(a_hip_stream, a_wrist_stream)
+        h_global_local, sensor_tokens_local = stage2.aligner(a_hip_stream, a_wrist_stream)
         shape = (skeleton.shape[0], skeleton.shape[1], skeleton.shape[2], args.latent_dim)
         z0_local = stage3.diffusion.p_sample_loop(
             stage3.denoiser,
@@ -227,11 +225,7 @@ def main() -> None:
         )
         x_local = stage3.decoder(z0_local)
         logits_local = stage3.classifier(x_local)
-        return x_local, logits_local, z0_local, (
-            torch.zeros((skeleton.shape[0], args.latent_dim), device=device)
-            if h_global_local is None
-            else h_global_local
-        )
+        return x_local, logits_local, z0_local, h_global_local
 
     if target_class is None:
         x_hat, logits, z0_gen, h_global = _sample_once()

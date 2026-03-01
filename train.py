@@ -322,6 +322,8 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
 
 def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bool, local_rank: int) -> None:
     """Train stage 2 model with frozen stage-1 encoder."""
+    if not args.stage1_ckpt:
+        raise ValueError("Stage 2 requires --stage1_ckpt (pretrained Stage 1 encoder).")
     stage1 = Stage1Model(latent_dim=args.latent_dim, num_joints=args.joints, timesteps=args.timesteps).to(device)
     if args.stage1_ckpt:
         load_checkpoint(args.stage1_ckpt, stage1, strict=True)
@@ -435,6 +437,12 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
 
 def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bool, local_rank: int) -> None:
     """Train stage 3 conditional diffusion + classification model."""
+    if not args.stage1_ckpt:
+        raise ValueError("Stage 3 requires --stage1_ckpt (pretrained Stage 1 model).")
+    if not args.stage2_ckpt:
+        raise ValueError("Stage 3 requires --stage2_ckpt (pretrained Stage 2 aligner).")
+    if args.use_h_none:
+        raise ValueError("Strict proposal behavior requires sensor conditioning in Stage 3. Remove --use_h_none.")
     stage1 = Stage1Model(latent_dim=args.latent_dim, num_joints=args.joints, timesteps=args.timesteps).to(device)
     if args.stage1_ckpt:
         load_checkpoint(args.stage1_ckpt, stage1, strict=True)
@@ -523,16 +531,12 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             a_hip_stream = batch["A_hip"].to(device)
             a_wrist_stream = batch["A_wrist"].to(device)
 
-            if args.use_h_none:
-                h_global = None
-                sensor_tokens = None
-            else:
-                # Stage2 is a fixed conditioner in stage3; avoid autograd through aligner.
-                with torch.no_grad():
-                    h_global, sensor_tokens = stage2.aligner(
-                        a_hip_stream=a_hip_stream,
-                        a_wrist_stream=a_wrist_stream,
-                    )
+            # Stage2 is a fixed conditioner in stage3; avoid autograd through aligner.
+            with torch.no_grad():
+                h_global, sensor_tokens = stage2.aligner(
+                    a_hip_stream=a_hip_stream,
+                    a_wrist_stream=a_wrist_stream,
+                )
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):

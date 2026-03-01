@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from diffusion_model.diffusion import DiffusionProcess, extract
+from diffusion_model.diffusion import DiffusionProcess
 from diffusion_model.sensor_model import IMULatentAligner
 from diffusion_model.skeleton_model import GraphDecoder, GraphDenoiserMasked, GraphEncoder
 from diffusion_model.util import DEFAULT_LAMBDA_CLS, assert_shape
@@ -93,11 +93,14 @@ class Stage2Model(nn.Module):
         with torch.no_grad():
             z0 = self.encoder(x)
         assert_shape(z0, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.z0")
+        z0_global = z0.mean(dim=(1, 2))
+        assert_shape(z0_global, [x.shape[0], self.latent_dim], "Stage2Model.z0_global")
 
         h_global, sensor_tokens = self.aligner(a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
-        h_latent = sensor_tokens.unsqueeze(2).expand(-1, -1, self.num_joints, -1)
+        # Proposal-aligned Stage 2 objective: regress global sensor embedding to skeleton latent embedding.
+        h_latent = h_global.unsqueeze(1).unsqueeze(1).expand(-1, x.shape[1], self.num_joints, -1)
         assert_shape(h_latent, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.h_latent")
-        loss_align = F.mse_loss(h_latent, z0)
+        loss_align = F.mse_loss(h_global, z0_global)
         return {
             "loss_align": loss_align,
             "h_global": h_global,
@@ -105,6 +108,7 @@ class Stage2Model(nn.Module):
             "sensor_tokens": sensor_tokens,
             "h_latent": h_latent,
             "z0_target": z0,
+            "z0_target_global": z0_global,
         }
 
 
@@ -140,20 +144,16 @@ class Stage3Model(nn.Module):
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Compute stage-3 training losses using one-step latent reconstruction.
-
-        Training avoids full reverse diffusion sampling for speed:
-        - Diffusion loss: predict epsilon at random timestep t.
-        - Classification path: reconstruct z0_hat from (zt, eps_hat), then decode/classify.
-        """
+        """Compute proposal-aligned stage-3 losses with conditional iterative denoising."""
         if h_tokens is None and sensor_tokens is not None:
             h_tokens = sensor_tokens
         assert_shape(x, [None, None, self.num_joints, 3], "Stage3Model.x")
         assert_shape(y, [x.shape[0]], "Stage3Model.y")
-        if h_tokens is not None:
-            assert_shape(h_tokens, [x.shape[0], x.shape[1], self.latent_dim], "Stage3Model.h_tokens")
-        if h_global is not None:
-            assert_shape(h_global, [x.shape[0], self.latent_dim], "Stage3Model.h_global")
+        # Strict proposal behavior: Stage 3 is sensor-conditioned.
+        if h_tokens is None or h_global is None:
+            raise ValueError("Stage3Model requires both h_tokens and h_global conditioning embeddings.")
+        assert_shape(h_tokens, [x.shape[0], x.shape[1], self.latent_dim], "Stage3Model.h_tokens")
+        assert_shape(h_global, [x.shape[0], self.latent_dim], "Stage3Model.h_global")
 
         with torch.no_grad():
             z0 = self.encoder(x)
@@ -164,15 +164,19 @@ class Stage3Model(nn.Module):
         pred_noise = self.denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
         loss_diff = F.mse_loss(pred_noise, noise)
 
-        # One-step estimate of clean latent z0 from noisy zt and predicted noise.
-        sqrt_alpha_t = extract(self.diffusion.sqrt_alphas_cumprod, t, z0.shape)
-        sqrt_one_minus_t = extract(self.diffusion.sqrt_one_minus_alphas_cumprod, t, z0.shape)
-        z0_hat = (zt - sqrt_one_minus_t * pred_noise) / torch.clamp(sqrt_alpha_t, min=1e-6)
-
-        x_hat = self.decoder(z0_hat)
+        z0_gen = self.diffusion.p_sample_loop(
+            self.denoiser,
+            shape=torch.Size(z0.shape),
+            device=x.device,
+            sensor_tokens=h_tokens,
+            h_tokens=h_tokens,
+            h_global=h_global,
+        )
+        x_hat = self.decoder(z0_gen)
         logits = self.classifier(x_hat)
         loss_cls = F.cross_entropy(logits, y)
         loss_total = loss_diff + self.lambda_cls * loss_cls
+        probs = torch.softmax(logits, dim=1)
 
         return {
             "loss_total": loss_total,
@@ -180,5 +184,6 @@ class Stage3Model(nn.Module):
             "loss_cls": loss_cls,
             "x_hat": x_hat,
             "logits": logits,
-            "z0_gen": z0_hat,
+            "probs": probs,
+            "z0_gen": z0_gen,
         }

@@ -7,7 +7,14 @@ from typing import Dict, Optional
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from diffusion_model.util import DEFAULT_JOINTS, DEFAULT_NUM_CLASSES, DEFAULT_WINDOW, assert_shape
+from diffusion_model.util import (
+    DEFAULT_JOINTS,
+    DEFAULT_NUM_CLASSES,
+    DEFAULT_WINDOW,
+    assert_shape,
+    get_joint_labels,
+    validate_joint_labels,
+)
 
 
 class SyntheticGaitDataset(Dataset):
@@ -46,6 +53,7 @@ class SyntheticGaitDataset(Dataset):
             "Omega": omega_stream,
             "label": label,
             "fps": torch.tensor(30, dtype=torch.long),
+            "joint_labels": list(get_joint_labels()),
         }
 
 
@@ -63,6 +71,8 @@ class TorchFileGaitDataset(Dataset):
         self.label = payload["label"].long()
         self.fps = int(payload["fps"])
         sensor_identity = payload["sensor_identity"]
+        joint_labels = payload["joint_labels"]
+        validate_joint_labels(joint_labels)
         assert sensor_identity["A"] == "right_hip", "A stream must correspond to right_hip"
         assert sensor_identity["Omega"] == "left_wrist", "Omega stream must correspond to left_wrist"
         assert self.fps == 30, f"SmartFallMM constraint violated: expected 30 FPS, got {self.fps}"
@@ -84,6 +94,7 @@ class TorchFileGaitDataset(Dataset):
             "Omega": self.Omega[idx],
             "label": self.label[idx],
             "fps": torch.tensor(self.fps, dtype=torch.long),
+            "joint_labels": list(get_joint_labels()),
         }
 
 

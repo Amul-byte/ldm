@@ -16,6 +16,76 @@ DEFAULT_JOINTS = 32
 DEFAULT_NUM_CLASSES = 14
 DEFAULT_LAMBDA_CLS = 0.1
 
+# Joint order provided from skeleton analysis notebook.
+JOINT_LABELS: Tuple[str, ...] = (
+    "PELVIS",
+    "SPINE_NAVAL",
+    "SPINE_CHEST",
+    "NECK",
+    "CLAVICLE_LEFT",
+    "SHOULDER_LEFT",
+    "ELBOW_LEFT",
+    "WRIST_LEFT",
+    "HAND_LEFT",
+    "HANDTIP_LEFT",
+    "THUMB_LEFT",
+    "CLAVICLE_RIGHT",
+    "SHOULDER_RIGHT",
+    "ELBOW_RIGHT",
+    "WRIST_RIGHT",
+    "HAND_RIGHT",
+    "HANDTIP_RIGHT",
+    "THUMB_RIGHT",
+    "HIP_LEFT",
+    "KNEE_LEFT",
+    "ANKLE_LEFT",
+    "FOOT_LEFT",
+    "HIP_RIGHT",
+    "KNEE_RIGHT",
+    "ANKLE_RIGHT",
+    "FOOT_RIGHT",
+    "HEAD",
+    "NOSE",
+    "EYE_LEFT",
+    "EAR_LEFT",
+    "EYE_RIGHT",
+    "EAR_RIGHT",
+)
+
+_SKELETON_CONNECTIONS_BY_NAME: Tuple[Tuple[str, str], ...] = (
+    ("PELVIS", "SPINE_NAVAL"),
+    ("SPINE_NAVAL", "SPINE_CHEST"),
+    ("SPINE_CHEST", "NECK"),
+    ("NECK", "HEAD"),
+    ("HEAD", "NOSE"),
+    ("NOSE", "EYE_LEFT"),
+    ("NOSE", "EYE_RIGHT"),
+    ("EYE_LEFT", "EAR_LEFT"),
+    ("EYE_RIGHT", "EAR_RIGHT"),
+    ("NECK", "CLAVICLE_LEFT"),
+    ("CLAVICLE_LEFT", "SHOULDER_LEFT"),
+    ("SHOULDER_LEFT", "ELBOW_LEFT"),
+    ("ELBOW_LEFT", "WRIST_LEFT"),
+    ("WRIST_LEFT", "HAND_LEFT"),
+    ("HAND_LEFT", "HANDTIP_LEFT"),
+    ("WRIST_LEFT", "THUMB_LEFT"),
+    ("NECK", "CLAVICLE_RIGHT"),
+    ("CLAVICLE_RIGHT", "SHOULDER_RIGHT"),
+    ("SHOULDER_RIGHT", "ELBOW_RIGHT"),
+    ("ELBOW_RIGHT", "WRIST_RIGHT"),
+    ("WRIST_RIGHT", "HAND_RIGHT"),
+    ("HAND_RIGHT", "HANDTIP_RIGHT"),
+    ("WRIST_RIGHT", "THUMB_RIGHT"),
+    ("PELVIS", "HIP_LEFT"),
+    ("HIP_LEFT", "KNEE_LEFT"),
+    ("KNEE_LEFT", "ANKLE_LEFT"),
+    ("ANKLE_LEFT", "FOOT_LEFT"),
+    ("PELVIS", "HIP_RIGHT"),
+    ("HIP_RIGHT", "KNEE_RIGHT"),
+    ("KNEE_RIGHT", "ANKLE_RIGHT"),
+    ("ANKLE_RIGHT", "FOOT_RIGHT"),
+)
+
 
 def set_seed(seed: int) -> None:
     """Set random seeds for reproducibility."""
@@ -26,41 +96,26 @@ def set_seed(seed: int) -> None:
 
 
 def get_skeleton_edges() -> List[Tuple[int, int]]:
-    """Return a fixed 32-joint undirected skeleton adjacency list."""
-    edges = [
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 4),
-        (0, 5),
-        (5, 6),
-        (6, 7),
-        (7, 8),
-        (0, 9),
-        (9, 10),
-        (10, 11),
-        (11, 12),
-        (12, 13),
-        (13, 14),
-        (14, 15),
-        (0, 16),
-        (16, 17),
-        (17, 18),
-        (18, 19),
-        (19, 20),
-        (20, 21),
-        (9, 22),
-        (22, 23),
-        (23, 24),
-        (24, 25),
-        (10, 26),
-        (26, 27),
-        (27, 28),
-        (28, 29),
-        (11, 30),
-        (12, 31),
-    ]
+    """Return adjacency edges derived from the fixed JOINT_LABELS ordering."""
+    label_to_index = {label: idx for idx, label in enumerate(JOINT_LABELS)}
+    edges = [(label_to_index[a], label_to_index[b]) for a, b in _SKELETON_CONNECTIONS_BY_NAME]
     return edges
+
+
+def get_joint_labels() -> Tuple[str, ...]:
+    """Return the exact expected joint label order."""
+    return JOINT_LABELS
+
+
+def validate_joint_labels(labels: Sequence[str]) -> None:
+    """Validate that dataset joint labels match the expected exact order."""
+    expected = list(JOINT_LABELS)
+    got = list(labels)
+    assert got == expected, (
+        "Joint label order mismatch.\n"
+        f"Expected: {expected}\n"
+        f"Got:      {got}"
+    )
 
 
 def build_adjacency_matrix(num_joints: int, device: torch.device | None = None) -> torch.Tensor:

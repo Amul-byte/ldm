@@ -59,14 +59,12 @@ class Stage1Model(nn.Module):
         self.diffusion = DiffusionProcess(timesteps=timesteps)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Compute stage-1 diffusion loss and reconstruction outputs."""
+        """Compute stage-1 diffusion loss and latent outputs."""
         assert_shape(x, [None, None, self.num_joints, 3], "Stage1Model.x")
         z0 = self.encoder(x)
         t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
         loss_diff = self.diffusion.predict_noise_loss(self.denoiser, z0, t, h_tokens=None, h_global=None)
-        x_hat = self.decoder(z0)
-        loss_recon = F.mse_loss(x_hat, x)
-        return {"loss_diff": loss_diff, "loss_recon": loss_recon, "z0": z0, "x_hat": x_hat}
+        return {"loss_diff": loss_diff, "z0": z0}
 
 
 class Stage2Model(nn.Module):
@@ -97,12 +95,13 @@ class Stage2Model(nn.Module):
         z0_target = z0.mean(dim=(1, 2))
         assert_shape(z0_target, [x.shape[0], self.latent_dim], "Stage2Model.z0_target")
 
-        h_global, h_tokens = self.aligner(s_hip=s_hip, s_wrist=s_wrist)
+        h_global, sensor_tokens = self.aligner(s_hip=s_hip, s_wrist=s_wrist)
         loss_align = F.mse_loss(h_global, z0_target)
         return {
             "loss_align": loss_align,
             "h_global": h_global,
-            "h_tokens": h_tokens,
+            "h_tokens": sensor_tokens,
+            "sensor_tokens": sensor_tokens,
             "z0_target": z0_target,
         }
 
@@ -135,10 +134,13 @@ class Stage3Model(nn.Module):
         self,
         x: torch.Tensor,
         y: torch.Tensor,
+        sensor_tokens: Optional[torch.Tensor] = None,
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Compute stage-3 loss and outputs with optional cross-attention conditioning."""
+        """Compute stage-3 loss with temporal sensor tokens [B,T,D] for cross-attention."""
+        if h_tokens is None and sensor_tokens is not None:
+            h_tokens = sensor_tokens
         assert_shape(x, [None, None, self.num_joints, 3], "Stage3Model.x")
         assert_shape(y, [x.shape[0]], "Stage3Model.y")
         if h_tokens is not None:

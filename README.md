@@ -73,7 +73,7 @@ python generate.py \
   --classify
 ```
 
-Use unconditional stage-3 path (`h_tokens=None`, `h_global=None`):
+Use unconditional stage-3 path (`sensor_tokens=None`, `h_global=None`):
 
 ```bash
 python train.py --stage 3 --stage1_ckpt checkpoints/stage1.pt --stage2_ckpt checkpoints/stage2.pt --use_h_none

@@ -64,6 +64,7 @@ class DiffusionProcess(nn.Module):
         denoiser: nn.Module,
         z0: torch.Tensor,
         t: torch.Tensor,
+        sensor_tokens: Optional[torch.Tensor] = None,
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
         h: Optional[torch.Tensor] = None,
@@ -72,9 +73,11 @@ class DiffusionProcess(nn.Module):
         assert_shape(z0, [None, None, None, None], "DiffusionProcess.predict_noise_loss.z0")
         if h_global is None and h is not None:
             h_global = h
+        if h_tokens is None and sensor_tokens is not None:
+            h_tokens = sensor_tokens
         noise = torch.randn_like(z0)
         zt = self.q_sample(z0=z0, t=t, noise=noise)
-        pred_noise = denoiser(zt, t, h_tokens=h_tokens, h_global=h_global)
+        pred_noise = denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
         assert pred_noise.shape == noise.shape, "predicted noise shape mismatch"
         return F.mse_loss(pred_noise, noise)
 
@@ -83,6 +86,7 @@ class DiffusionProcess(nn.Module):
         denoiser: nn.Module,
         zt: torch.Tensor,
         t: torch.Tensor,
+        sensor_tokens: Optional[torch.Tensor] = None,
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
         h: Optional[torch.Tensor] = None,
@@ -92,12 +96,14 @@ class DiffusionProcess(nn.Module):
         assert_shape(t, [zt.shape[0]], "DiffusionProcess.p_sample.t")
         if h_global is None and h is not None:
             h_global = h
+        if h_tokens is None and sensor_tokens is not None:
+            h_tokens = sensor_tokens
 
         betas_t = extract(self.betas, t, zt.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, zt.shape)
         sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t, zt.shape)
 
-        pred_noise = denoiser(zt, t, h_tokens=h_tokens, h_global=h_global)
+        pred_noise = denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
         model_mean = sqrt_recip_alphas_t * (zt - betas_t * pred_noise / sqrt_one_minus_alphas_cumprod_t)
 
         nonzero_mask = (t != 0).float().reshape(zt.shape[0], *([1] * (zt.ndim - 1)))
@@ -113,6 +119,7 @@ class DiffusionProcess(nn.Module):
         denoiser: nn.Module,
         shape: torch.Size,
         device: torch.device,
+        sensor_tokens: Optional[torch.Tensor] = None,
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
         h: Optional[torch.Tensor] = None,
@@ -121,6 +128,8 @@ class DiffusionProcess(nn.Module):
         assert len(shape) == 4, "shape must be [B,T,J,D]"
         if h_global is None and h is not None:
             h_global = h
+        if h_tokens is None and sensor_tokens is not None:
+            h_tokens = sensor_tokens
         z = torch.randn(shape, device=device)
 
         if h_tokens is not None:
@@ -130,6 +139,6 @@ class DiffusionProcess(nn.Module):
 
         for i in reversed(range(self.timesteps)):
             t = torch.full((shape[0],), i, device=device, dtype=torch.long)
-            z = self.p_sample(denoiser=denoiser, zt=z, t=t, h_tokens=h_tokens, h_global=h_global)
+            z = self.p_sample(denoiser=denoiser, zt=z, t=t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
         assert_shape(z, [shape[0], shape[1], shape[2], shape[3]], "DiffusionProcess.p_sample_loop.z")
         return z

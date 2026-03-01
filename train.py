@@ -151,11 +151,11 @@ def train_stage3(args: argparse.Namespace, device: torch.device) -> None:
 
             if args.use_h_none:
                 h_global = None
-                h_tokens = None
+                sensor_tokens = None
             else:
-                h_global, h_tokens = stage2.aligner(s_hip=s_hip, s_wrist=s_wrist)
+                h_global, sensor_tokens = stage2.aligner(s_hip=s_hip, s_wrist=s_wrist)
 
-            out = model(x=x, y=y, h_tokens=h_tokens, h_global=h_global)
+            out = model(x=x, y=y, sensor_tokens=sensor_tokens, h_global=h_global)
             loss = out["loss_total"]
             optimizer.zero_grad()
             loss.backward()

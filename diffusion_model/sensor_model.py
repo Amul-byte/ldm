@@ -62,7 +62,7 @@ class IMULatentAligner(nn.Module):
         )
 
     def forward(self, s_hip: torch.Tensor, s_wrist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return global embedding h_global [B,D] and temporal tokens h_tokens [B,T,D]."""
+        """Return global embedding h_global [B,D] and temporal sensor tokens [B,T,D]."""
         assert_shape(s_hip, [None, None, 6], "IMULatentAligner.s_hip")
         assert_shape(s_wrist, [None, None, 6], "IMULatentAligner.s_wrist")
         assert s_hip.shape[:2] == s_wrist.shape[:2], "hip and wrist must share [B,T]"
@@ -70,9 +70,9 @@ class IMULatentAligner(nn.Module):
         hip_tokens = self.hip_branch(s_hip)
         wrist_tokens = self.wrist_branch(s_wrist)
         fused = torch.cat([hip_tokens, wrist_tokens], dim=-1)
-        h_tokens = self.fuse_tokens(fused)
-        h_global = h_tokens.mean(dim=1)
+        sensor_tokens = self.fuse_tokens(fused)
+        h_global = sensor_tokens.mean(dim=1)
 
-        assert_shape(h_tokens, [s_hip.shape[0], s_hip.shape[1], self.latent_dim], "IMULatentAligner.h_tokens")
+        assert_shape(sensor_tokens, [s_hip.shape[0], s_hip.shape[1], self.latent_dim], "IMULatentAligner.sensor_tokens")
         assert_shape(h_global, [s_hip.shape[0], self.latent_dim], "IMULatentAligner.h_global")
-        return h_global, h_tokens
+        return h_global, sensor_tokens

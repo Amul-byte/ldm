@@ -101,14 +101,17 @@ class GraphDenoiserMasked(nn.Module):
         z_t: torch.Tensor,
         t: torch.Tensor,
         h: Optional[torch.Tensor] = None,
+        sensor_tokens: Optional[torch.Tensor] = None,
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Predict epsilon for z_t using timestep and optional sensor conditioning."""
+        """Predict epsilon for z_t with optional temporal sensor tokens [B,T,D]."""
         assert_shape(z_t, [None, None, self.num_joints, self.latent_dim], "GraphDenoiserMasked.z_t")
         assert_shape(t, [z_t.shape[0]], "GraphDenoiserMasked.t")
         if h_global is None and h is not None:
             h_global = h
+        if h_tokens is None and sensor_tokens is not None:
+            h_tokens = sensor_tokens
         if h_tokens is not None:
             assert_shape(h_tokens, [z_t.shape[0], z_t.shape[1], self.latent_dim], "GraphDenoiserMasked.h_tokens")
         if h_global is not None:

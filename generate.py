@@ -123,22 +123,22 @@ def main() -> None:
 
     if args.h_none:
         h_global = None
-        h_tokens = None
+        sensor_tokens = None
     else:
-        h_global, h_tokens = stage2.aligner(hip, wrist)
+        h_global, sensor_tokens = stage2.aligner(hip, wrist)
 
     shape = (skeleton.shape[0], skeleton.shape[1], skeleton.shape[2], args.latent_dim)
     z0_gen = stage3.diffusion.p_sample_loop(
         stage3.denoiser,
         shape=torch.Size(shape),
         device=device,
-        h_tokens=h_tokens,
+        sensor_tokens=sensor_tokens,
         h_global=h_global,
     )
     x_hat = stage3.decoder(z0_gen)
 
     print(f"h_global shape: {None if h_global is None else tuple(h_global.shape)}")
-    print(f"h_tokens shape: {None if h_tokens is None else tuple(h_tokens.shape)}")
+    print(f"sensor_tokens shape: {None if sensor_tokens is None else tuple(sensor_tokens.shape)}")
     print(f"z0_gen shape: {tuple(z0_gen.shape)}")
     print(f"x_hat shape: {tuple(x_hat.shape)}")
 

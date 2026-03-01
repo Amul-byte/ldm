@@ -48,7 +48,7 @@ class SensorTGNNBranch(nn.Module):
 
 
 class IMULatentAligner(nn.Module):
-    """Two-branch IMU aligner for A and Omega streams, each shaped [B, T, 3]."""
+    """Two-branch accelerometer aligner for hip and wrist streams, each [B, T, 3]."""
 
     def __init__(self, latent_dim: int = 256) -> None:
         super().__init__()
@@ -61,18 +61,22 @@ class IMULatentAligner(nn.Module):
             nn.Linear(latent_dim, latent_dim),
         )
 
-    def forward(self, a_stream: torch.Tensor, omega_stream: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, a_hip_stream: torch.Tensor, a_wrist_stream: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return global embedding h_global [B,D] and temporal sensor tokens [B,T,D]."""
-        assert_shape(a_stream, [None, None, 3], "IMULatentAligner.a_stream")
-        assert_shape(omega_stream, [None, None, 3], "IMULatentAligner.omega_stream")
-        assert a_stream.shape[:2] == omega_stream.shape[:2], "A and Omega must share [B,T]"
+        assert_shape(a_hip_stream, [None, None, 3], "IMULatentAligner.a_hip_stream")
+        assert_shape(a_wrist_stream, [None, None, 3], "IMULatentAligner.a_wrist_stream")
+        assert a_hip_stream.shape[:2] == a_wrist_stream.shape[:2], "Hip and wrist streams must share [B,T]"
 
-        a_tokens = self.a_branch(a_stream)
-        omega_tokens = self.omega_branch(omega_stream)
-        fused = torch.cat([a_tokens, omega_tokens], dim=-1)
+        hip_tokens = self.a_branch(a_hip_stream)
+        wrist_tokens = self.omega_branch(a_wrist_stream)
+        fused = torch.cat([hip_tokens, wrist_tokens], dim=-1)
         sensor_tokens = self.fuse_tokens(fused)
         h_global = sensor_tokens.mean(dim=1)
 
-        assert_shape(sensor_tokens, [a_stream.shape[0], a_stream.shape[1], self.latent_dim], "IMULatentAligner.sensor_tokens")
-        assert_shape(h_global, [a_stream.shape[0], self.latent_dim], "IMULatentAligner.h_global")
+        assert_shape(
+            sensor_tokens,
+            [a_hip_stream.shape[0], a_hip_stream.shape[1], self.latent_dim],
+            "IMULatentAligner.sensor_tokens",
+        )
+        assert_shape(h_global, [a_hip_stream.shape[0], self.latent_dim], "IMULatentAligner.h_global")
         return h_global, sensor_tokens

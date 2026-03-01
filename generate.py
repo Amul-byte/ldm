@@ -69,12 +69,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage2_ckpt", type=str, required=True)
     parser.add_argument("--stage3_ckpt", type=str, required=True)
     parser.add_argument("--dataset_path", type=str, default="")
+    parser.add_argument("--skeleton_folder", type=str, default="")
+    parser.add_argument("--hip_folder", type=str, default="")
+    parser.add_argument("--wrist_folder", type=str, default="")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW)
     parser.add_argument("--joints", type=int, default=DEFAULT_JOINTS)
     parser.add_argument("--latent_dim", type=int, default=DEFAULT_LATENT_DIM)
     parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument("--num_classes", type=int, default=DEFAULT_NUM_CLASSES)
+    parser.add_argument("--stride", type=int, default=30)
+    parser.add_argument("--disable_sensor_norm", action="store_true")
     parser.add_argument("--classify", action="store_true")
     parser.add_argument("--h_none", action="store_true")
     parser.add_argument("--save_gif", action="store_true")
@@ -113,19 +118,24 @@ def main() -> None:
         window=args.window,
         joints=args.joints,
         num_classes=args.num_classes,
+        skeleton_folder=args.skeleton_folder or None,
+        hip_folder=args.hip_folder or None,
+        wrist_folder=args.wrist_folder or None,
+        stride=args.stride,
+        normalize_sensors=not args.disable_sensor_norm,
         shuffle=False,
     )
 
     batch = next(iter(loader))
     skeleton = batch["skeleton"].to(device)
-    a_stream = batch["A"].to(device)
-    omega_stream = batch["Omega"].to(device)
+    a_hip_stream = batch["A_hip"].to(device)
+    a_wrist_stream = batch["A_wrist"].to(device)
 
     if args.h_none:
         h_global = None
         sensor_tokens = None
     else:
-        h_global, sensor_tokens = stage2.aligner(a_stream, omega_stream)
+        h_global, sensor_tokens = stage2.aligner(a_hip_stream, a_wrist_stream)
 
     shape = (skeleton.shape[0], skeleton.shape[1], skeleton.shape[2], args.latent_dim)
     z0_gen = stage3.diffusion.p_sample_loop(

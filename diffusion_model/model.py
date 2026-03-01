@@ -84,17 +84,17 @@ class Stage2Model(nn.Module):
             p.requires_grad = False
         assert all(not p.requires_grad for p in self.encoder.parameters()), "encoder freeze verification failed"
 
-    def forward(self, x: torch.Tensor, a_stream: torch.Tensor, omega_stream: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, a_hip_stream: torch.Tensor, a_wrist_stream: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Compute alignment loss to frozen latent target z0."""
         assert_shape(x, [None, None, self.num_joints, 3], "Stage2Model.x")
-        assert_shape(a_stream, [x.shape[0], x.shape[1], 3], "Stage2Model.a_stream")
-        assert_shape(omega_stream, [x.shape[0], x.shape[1], 3], "Stage2Model.omega_stream")
+        assert_shape(a_hip_stream, [x.shape[0], x.shape[1], 3], "Stage2Model.a_hip_stream")
+        assert_shape(a_wrist_stream, [x.shape[0], x.shape[1], 3], "Stage2Model.a_wrist_stream")
 
         with torch.no_grad():
             z0 = self.encoder(x)
         assert_shape(z0, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.z0")
 
-        h_global, sensor_tokens = self.aligner(a_stream=a_stream, omega_stream=omega_stream)
+        h_global, sensor_tokens = self.aligner(a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
         h_latent = sensor_tokens.unsqueeze(2).expand(-1, -1, self.num_joints, -1)
         assert_shape(h_latent, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.h_latent")
         loss_align = F.mse_loss(h_latent, z0)

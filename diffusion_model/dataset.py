@@ -9,7 +9,7 @@ from typing import Dict, Optional, Sequence
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from diffusion_model.util import (
     DEFAULT_JOINTS,
@@ -279,6 +279,44 @@ class CSVPairedGaitDataset(Dataset):
         }
 
 
+def create_dataset(
+    dataset_path: Optional[str],
+    synthetic_length: int = 128,
+    window: int = DEFAULT_WINDOW,
+    joints: int = DEFAULT_JOINTS,
+    num_classes: int = DEFAULT_NUM_CLASSES,
+    skeleton_folder: Optional[str] = None,
+    hip_folder: Optional[str] = None,
+    wrist_folder: Optional[str] = None,
+    stride: int = 30,
+    normalize_sensors: bool = True,
+) -> Dataset:
+    """Create dataset object from torch-file, CSV-folder, or synthetic fallback mode."""
+    if dataset_path:
+        return TorchFileGaitDataset(path=dataset_path, window=window, joints=joints)
+    if skeleton_folder and hip_folder and wrist_folder:
+        return CSVPairedGaitDataset(
+            skeleton_folder=skeleton_folder,
+            hip_folder=hip_folder,
+            wrist_folder=wrist_folder,
+            window=window,
+            joints=joints,
+            stride=stride,
+            num_classes=num_classes,
+            normalize_sensors=normalize_sensors,
+        )
+    if skeleton_folder or hip_folder or wrist_folder:
+        raise ValueError(
+            "CSV-folder mode requires --skeleton_folder, --hip_folder, and --wrist_folder together"
+        )
+    return SyntheticGaitDataset(
+        length=synthetic_length,
+        window=window,
+        joints=joints,
+        num_classes=num_classes,
+    )
+
+
 def create_dataloader(
     dataset_path: Optional[str],
     batch_size: int,
@@ -292,30 +330,33 @@ def create_dataloader(
     wrist_folder: Optional[str] = None,
     stride: int = 30,
     normalize_sensors: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    sampler: Optional[Sampler] = None,
+    dataset: Optional[Dataset] = None,
 ) -> DataLoader:
     """Create dataloader from torch-file, CSV-folder, or synthetic fallback mode."""
-    if dataset_path:
-        dataset = TorchFileGaitDataset(path=dataset_path, window=window, joints=joints)
-    elif skeleton_folder and hip_folder and wrist_folder:
-        dataset = CSVPairedGaitDataset(
+    if dataset is None:
+        dataset = create_dataset(
+            dataset_path=dataset_path,
+            synthetic_length=synthetic_length,
+            window=window,
+            joints=joints,
+            num_classes=num_classes,
             skeleton_folder=skeleton_folder,
             hip_folder=hip_folder,
             wrist_folder=wrist_folder,
-            window=window,
-            joints=joints,
             stride=stride,
-            num_classes=num_classes,
             normalize_sensors=normalize_sensors,
         )
-    elif skeleton_folder or hip_folder or wrist_folder:
-        raise ValueError(
-            "CSV-folder mode requires --skeleton_folder, --hip_folder, and --wrist_folder together"
-        )
-    else:
-        dataset = SyntheticGaitDataset(
-            length=synthetic_length,
-            window=window,
-            joints=joints,
-            num_classes=num_classes,
-        )
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=True)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle if sampler is None else False,
+        "drop_last": True,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "sampler": sampler,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+    return DataLoader(dataset, **loader_kwargs)

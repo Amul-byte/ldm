@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from diffusion_model.diffusion import DiffusionProcess
+from diffusion_model.diffusion import DiffusionProcess, extract
 from diffusion_model.sensor_model import IMULatentAligner
 from diffusion_model.skeleton_model import GraphDecoder, GraphDenoiserMasked, GraphEncoder
 from diffusion_model.util import DEFAULT_LAMBDA_CLS, assert_shape
@@ -140,7 +140,12 @@ class Stage3Model(nn.Module):
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Compute stage-3 loss with temporal sensor tokens [B,T,D] for cross-attention."""
+        """Compute stage-3 training losses using one-step latent reconstruction.
+
+        Training avoids full reverse diffusion sampling for speed:
+        - Diffusion loss: predict epsilon at random timestep t.
+        - Classification path: reconstruct z0_hat from (zt, eps_hat), then decode/classify.
+        """
         if h_tokens is None and sensor_tokens is not None:
             h_tokens = sensor_tokens
         assert_shape(x, [None, None, self.num_joints, 3], "Stage3Model.x")
@@ -154,22 +159,17 @@ class Stage3Model(nn.Module):
             z0 = self.encoder(x)
 
         t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
-        loss_diff = self.diffusion.predict_noise_loss(
-            self.denoiser,
-            z0,
-            t,
-            h_tokens=h_tokens,
-            h_global=h_global,
-        )
+        noise = torch.randn_like(z0)
+        zt = self.diffusion.q_sample(z0=z0, t=t, noise=noise)
+        pred_noise = self.denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
+        loss_diff = F.mse_loss(pred_noise, noise)
 
-        z0_gen = self.diffusion.p_sample_loop(
-            denoiser=self.denoiser,
-            shape=z0.shape,
-            device=x.device,
-            h_tokens=h_tokens,
-            h_global=h_global,
-        )
-        x_hat = self.decoder(z0_gen)
+        # One-step estimate of clean latent z0 from noisy zt and predicted noise.
+        sqrt_alpha_t = extract(self.diffusion.sqrt_alphas_cumprod, t, z0.shape)
+        sqrt_one_minus_t = extract(self.diffusion.sqrt_one_minus_alphas_cumprod, t, z0.shape)
+        z0_hat = (zt - sqrt_one_minus_t * pred_noise) / torch.clamp(sqrt_alpha_t, min=1e-6)
+
+        x_hat = self.decoder(z0_hat)
         logits = self.classifier(x_hat)
         loss_cls = F.cross_entropy(logits, y)
         loss_total = loss_diff + self.lambda_cls * loss_cls
@@ -180,5 +180,5 @@ class Stage3Model(nn.Module):
             "loss_cls": loss_cls,
             "x_hat": x_hat,
             "logits": logits,
-            "z0_gen": z0_gen,
+            "z0_gen": z0_hat,
         }

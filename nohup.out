@@ -1,0 +1,249 @@
+2026-03-01 16:15:29,936 | INFO | train | Run dir: /home/qsw26/smartfall/gait_loss/ldm/checkpoints/proposal
+2026-03-01 16:15:29,936 | INFO | train | Device: cuda
+2026-03-01 16:15:29,936 | INFO | train | Config: stage=3 epochs=20 batch_size=32 lr=0.0001 window=90 stride=45 joints=32 latent_dim=256 timesteps=500
+2026-03-01 16:15:29,936 | INFO | train | Data mode: csv-folders
+2026-03-01 16:15:29,936 | INFO | train | skeleton_folder=/home/qsw26/smartfall/gait_loss/SmartFallMM-Dataset/young/skeleton
+2026-03-01 16:15:29,936 | INFO | train | hip_folder=/home/qsw26/smartfall/gait_loss/SmartFallMM-Dataset/young/accelerometer/meta_hip
+2026-03-01 16:15:29,936 | INFO | train | wrist_folder=/home/qsw26/smartfall/gait_loss/SmartFallMM-Dataset/young/accelerometer/meta_wrist
+/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/model_loader.py:22: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  checkpoint = torch.load(path, map_location="cpu")
+Loaded checkpoint: /home/qsw26/smartfall/gait_loss/ldm/checkpoints/stage1.pt
+missing keys (0): []
+unexpected keys (0): []
+Loaded checkpoint: /home/qsw26/smartfall/gait_loss/ldm/checkpoints/proposal/stage2.pt
+missing keys (0): []
+unexpected keys (0): []
+[dataset] Skipped empty/unreadable file: S50A01T01.csv
+[dataset] Skipped empty/unreadable file: S50A01T02.csv
+[dataset] Skipped empty/unreadable file: S50A01T03.csv
+[dataset] Skipped empty/unreadable file: S50A02T04.csv
+[dataset] Skipped empty/unreadable file: S50A02T05.csv
+[dataset] Skipped empty/unreadable file: S50A05T02.csv
+[dataset] Skipped empty/unreadable file: S50A06T01.csv
+[dataset] Skipped empty/unreadable file: S50A10T05.csv
+[dataset] Skipped empty/unreadable file: S50A11T01.csv
+[dataset] Skipped empty/unreadable file: S50A11T03.csv
+[dataset] Skipped empty/unreadable file: S50A11T05.csv
+[dataset] Skipped empty/unreadable file: S50A12T03.csv
+[dataset] Skipped empty/unreadable file: S50A13T04.csv
+[dataset] Skipped empty/unreadable file: S51A13T02.csv
+[dataset] Skipped empty/unreadable file: S52A03T01.csv
+[dataset] Skipped empty/unreadable file: S52A05T03.csv
+[dataset] Skipped empty/unreadable file: S52A05T04.csv
+[dataset] Skipped empty/unreadable file: S52A05T05.csv
+[dataset] Skipped empty/unreadable file: S54A10T02.csv
+[dataset] Skipped empty/unreadable file: S56A10T02.csv
+[dataset] Skipped empty/unreadable file: S58A09T05.csv
+[dataset] Skipped empty/unreadable file: S60A02T02.csv
+[dataset] Skipped empty/unreadable file: S60A11T01.csv
+/home/qsw26/smartfall/gait_loss/ldm/train.py:298: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+2026-03-01 16:15:42,724 | INFO | train | Dataset: CSVPairedGaitDataset samples=5446 batches_per_epoch=170 drop_last=True
+Stage3 Epoch 1/20:   0%|          | 0/170 [00:00<?, ?it/s]Stage3 Epoch 1/20:   0%|          | 0/170 [01:01<?, ?it/s, loss=nan]Stage3 Epoch 1/20:   1%|          | 1/170 [01:01<2:54:11, 61.84s/it, loss=nan]Stage3 Epoch 1/20:   1%|          | 1/170 [02:03<2:54:11, 61.84s/it, loss=nan]Stage3 Epoch 1/20:   1%|          | 2/170 [02:03<2:52:34, 61.64s/it, loss=nan]Stage3 Epoch 1/20:   1%|          | 2/170 [03:05<2:52:34, 61.64s/it, loss=nan]Stage3 Epoch 1/20:   2%|▏         | 3/170 [03:05<2:51:45, 61.71s/it, loss=nan]Stage3 Epoch 1/20:   2%|▏         | 3/170 [04:07<2:51:45, 61.71s/it, loss=nan]Stage3 Epoch 1/20:   2%|▏         | 4/170 [04:07<2:50:56, 61.78s/it, loss=nan]Stage3 Epoch 1/20:   2%|▏         | 4/170 [05:08<2:50:56, 61.78s/it, loss=nan]Stage3 Epoch 1/20:   3%|▎         | 5/170 [05:08<2:50:01, 61.83s/it, loss=nan]Stage3 Epoch 1/20:   3%|▎         | 5/170 [06:10<2:50:01, 61.83s/it, loss=nan]Stage3 Epoch 1/20:   4%|▎         | 6/170 [06:10<2:49:04, 61.86s/it, loss=nan]Stage3 Epoch 1/20:   4%|▎         | 6/170 [07:12<2:49:04, 61.86s/it, loss=nan]Stage3 Epoch 1/20:   4%|▍         | 7/170 [07:12<2:48:05, 61.87s/it, loss=nan]Stage3 Epoch 1/20:   4%|▍         | 7/170 [08:14<2:48:05, 61.87s/it, loss=nan]Stage3 Epoch 1/20:   5%|▍         | 8/170 [08:14<2:47:06, 61.89s/it, loss=nan]Stage3 Epoch 1/20:   5%|▍         | 8/170 [09:16<2:47:06, 61.89s/it, loss=nan]Stage3 Epoch 1/20:   5%|▌         | 9/170 [09:16<2:46:05, 61.90s/it, loss=nan]                                                                              Traceback (most recent call last):
+  File "/home/qsw26/smartfall/gait_loss/ldm/train.py", line 397, in <module>
+    synthetic_length=args.synthetic_length,
+^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/train.py", line 391, in main
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/train.py", line 327, in train_stage3
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/model.py", line 165, in forward
+    z0_gen = self.diffusion.p_sample_loop(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/diffusion.py", line 142, in p_sample_loop
+    z = self.p_sample(denoiser=denoiser, zt=z, t=t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/diffusion.py", line 106, in p_sample
+    pred_noise = denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/skeleton_model.py", line 132, in forward
+    x = g_block(x, adjacency=adjacency, edge_index=edge_index)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/graph_modules.py", line 94, in forward
+    y = self.graph_op(h, edge_index)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/graph_modules.py", line 63, in forward
+    y = self.gat(x_flat, repeated_edge_index)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch_geometric/nn/conv/gat_conv.py", line 347, in forward
+    edge_index, edge_attr = remove_self_loops(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch_geometric/utils/loop.py", line 115, in remove_self_loops
+    if not torch.jit.is_scripting() and isinstance(edge_index, EdgeIndex):
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/_jit_internal.py", line 103, in is_scripting
+    def is_scripting() -> bool:
+    
+KeyboardInterrupt
+Exception ignored in atexit callback: <function dump_compile_times at 0x7f3452d549a0>
+Traceback (most recent call last):
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/_dynamo/utils.py", line 399, in dump_compile_times
+    log.info(compile_times(repr="str", aggregate=True))
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/_dynamo/utils.py", line 385, in compile_times
+    out += tabulate(rows, headers=("Function", "Runtimes (s)"))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/_dynamo/utils.py", line 148, in tabulate
+    import tabulate
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/tabulate/__init__.py", line 15, in <module>
+    import wcwidth  # optional wide-character (CJK) support
+    ^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/wcwidth/__init__.py", line 12, in <module>
+    from .wcwidth import ZERO_WIDTH  # noqa
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/wcwidth/wcwidth.py", line 73, in <module>
+    from .unicode_versions import list_versions
+  File "<frozen importlib._bootstrap>", line 1176, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1138, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1078, in _find_spec
+  File "<frozen importlib._bootstrap_external>", line 1507, in find_spec
+  File "<frozen importlib._bootstrap_external>", line 1479, in _get_spec
+  File "<frozen importlib._bootstrap_external>", line 1615, in find_spec
+  File "<frozen importlib._bootstrap_external>", line 147, in _path_stat
+KeyboardInterrupt: 
+2026-03-01 16:25:54,490 | INFO | train | DDP enabled: False (world_size=1)
+2026-03-01 16:25:54,490 | INFO | train | Run dir: /home/qsw26/smartfall/gait_loss/ldm/checkpoints/proposal
+2026-03-01 16:25:54,490 | INFO | train | Device: cuda
+2026-03-01 16:25:54,490 | INFO | train | Config: stage=3 epochs=20 batch_size=32 lr=0.0001 window=90 stride=45 joints=32 latent_dim=256 timesteps=500
+2026-03-01 16:25:54,490 | INFO | train | Data mode: csv-folders
+2026-03-01 16:25:54,490 | INFO | train | skeleton_folder=/home/qsw26/smartfall/gait_loss/SmartFallMM-Dataset/young/skeleton
+2026-03-01 16:25:54,490 | INFO | train | hip_folder=/home/qsw26/smartfall/gait_loss/SmartFallMM-Dataset/young/accelerometer/meta_hip
+2026-03-01 16:25:54,490 | INFO | train | wrist_folder=/home/qsw26/smartfall/gait_loss/SmartFallMM-Dataset/young/accelerometer/meta_wrist
+/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/model_loader.py:22: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  checkpoint = torch.load(path, map_location="cpu")
+Loaded checkpoint: /home/qsw26/smartfall/gait_loss/ldm/checkpoints/stage1.pt
+missing keys (0): []
+unexpected keys (0): []
+Loaded checkpoint: /home/qsw26/smartfall/gait_loss/ldm/checkpoints/proposal/stage2.pt
+missing keys (0): []
+unexpected keys (0): []
+[dataset] Skipped empty/unreadable file: S50A01T01.csv
+[dataset] Skipped empty/unreadable file: S50A01T02.csv
+[dataset] Skipped empty/unreadable file: S50A01T03.csv
+[dataset] Skipped empty/unreadable file: S50A02T04.csv
+[dataset] Skipped empty/unreadable file: S50A02T05.csv
+[dataset] Skipped empty/unreadable file: S50A05T02.csv
+[dataset] Skipped empty/unreadable file: S50A06T01.csv
+[dataset] Skipped empty/unreadable file: S50A10T05.csv
+[dataset] Skipped empty/unreadable file: S50A11T01.csv
+[dataset] Skipped empty/unreadable file: S50A11T03.csv
+[dataset] Skipped empty/unreadable file: S50A11T05.csv
+[dataset] Skipped empty/unreadable file: S50A12T03.csv
+[dataset] Skipped empty/unreadable file: S50A13T04.csv
+[dataset] Skipped empty/unreadable file: S51A13T02.csv
+[dataset] Skipped empty/unreadable file: S52A03T01.csv
+[dataset] Skipped empty/unreadable file: S52A05T03.csv
+[dataset] Skipped empty/unreadable file: S52A05T04.csv
+[dataset] Skipped empty/unreadable file: S52A05T05.csv
+[dataset] Skipped empty/unreadable file: S54A10T02.csv
+[dataset] Skipped empty/unreadable file: S56A10T02.csv
+[dataset] Skipped empty/unreadable file: S58A09T05.csv
+[dataset] Skipped empty/unreadable file: S60A02T02.csv
+[dataset] Skipped empty/unreadable file: S60A11T01.csv
+/home/qsw26/smartfall/gait_loss/ldm/train.py:436: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+2026-03-01 16:26:07,891 | INFO | train | Dataset: CSVPairedGaitDataset samples=5446 batches_per_epoch=170 drop_last=True
+Stage3 Epoch 1/20:   0%|          | 0/170 [00:00<?, ?it/s]Stage3 Epoch 1/20:   0%|          | 0/170 [01:02<?, ?it/s, loss=nan]Stage3 Epoch 1/20:   1%|          | 1/170 [01:02<2:55:48, 62.42s/it, loss=nan]                                                                              Traceback (most recent call last):
+  File "/home/qsw26/smartfall/gait_loss/ldm/train.py", line 552, in <module>
+    main()
+  File "/home/qsw26/smartfall/gait_loss/ldm/train.py", line 543, in main
+    train_stage3(args, device, distributed=distributed, local_rank=local_rank)
+  File "/home/qsw26/smartfall/gait_loss/ldm/train.py", line 468, in train_stage3
+    out = model(x=x, y=y, sensor_tokens=sensor_tokens, h_global=h_global)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/model.py", line 165, in forward
+    z0_gen = self.diffusion.p_sample_loop(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/diffusion.py", line 142, in p_sample_loop
+    z = self.p_sample(denoiser=denoiser, zt=z, t=t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/diffusion.py", line 106, in p_sample
+    pred_noise = denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/skeleton_model.py", line 132, in forward
+    x = g_block(x, adjacency=adjacency, edge_index=edge_index)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/graph_modules.py", line 94, in forward
+    y = self.graph_op(h, edge_index)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/smartfall/gait_loss/ldm/diffusion_model/graph_modules.py", line 63, in forward
+    y = self.gat(x_flat, repeated_edge_index)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch_geometric/nn/conv/gat_conv.py", line 347, in forward
+    edge_index, edge_attr = remove_self_loops(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch_geometric/utils/loop.py", line 115, in remove_self_loops
+    if not torch.jit.is_scripting() and isinstance(edge_index, EdgeIndex):
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qsw26/miniconda3/envs/smartfall_env_3.11/lib/python3.11/site-packages/torch/_jit_internal.py", line 103, in is_scripting
+    def is_scripting() -> bool:
+    
+KeyboardInterrupt

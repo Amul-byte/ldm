@@ -34,13 +34,19 @@ class SyntheticGaitDataset(Dataset):
         """Return one synthetic sample dictionary."""
         del idx
         skeleton = torch.randn(self.window, self.joints, 3)
-        hip = torch.randn(self.window, 6)
-        wrist = torch.randn(self.window, 6)
+        a_stream = torch.randn(self.window, 3)
+        omega_stream = torch.randn(self.window, 3)
         label = torch.randint(low=0, high=self.num_classes, size=(1,)).squeeze(0)
         assert_shape(skeleton, [self.window, self.joints, 3], "SyntheticGaitDataset.skeleton")
-        assert_shape(hip, [self.window, 6], "SyntheticGaitDataset.hip")
-        assert_shape(wrist, [self.window, 6], "SyntheticGaitDataset.wrist")
-        return {"skeleton": skeleton, "hip": hip, "wrist": wrist, "label": label}
+        assert_shape(a_stream, [self.window, 3], "SyntheticGaitDataset.A")
+        assert_shape(omega_stream, [self.window, 3], "SyntheticGaitDataset.Omega")
+        return {
+            "skeleton": skeleton,
+            "A": a_stream,
+            "Omega": omega_stream,
+            "label": label,
+            "fps": torch.tensor(30, dtype=torch.long),
+        }
 
 
 class TorchFileGaitDataset(Dataset):
@@ -52,13 +58,18 @@ class TorchFileGaitDataset(Dataset):
         self.joints = joints
         payload = torch.load(path, map_location="cpu")
         self.skeleton = payload["skeleton"].float()
-        self.hip = payload["hip"].float()
-        self.wrist = payload["wrist"].float()
+        self.A = payload["A"].float()
+        self.Omega = payload["Omega"].float()
         self.label = payload["label"].long()
+        self.fps = int(payload["fps"])
+        sensor_identity = payload["sensor_identity"]
+        assert sensor_identity["A"] == "right_hip", "A stream must correspond to right_hip"
+        assert sensor_identity["Omega"] == "left_wrist", "Omega stream must correspond to left_wrist"
+        assert self.fps == 30, f"SmartFallMM constraint violated: expected 30 FPS, got {self.fps}"
 
         assert_shape(self.skeleton, [None, window, joints, 3], "TorchFileGaitDataset.skeleton")
-        assert_shape(self.hip, [self.skeleton.shape[0], window, 6], "TorchFileGaitDataset.hip")
-        assert_shape(self.wrist, [self.skeleton.shape[0], window, 6], "TorchFileGaitDataset.wrist")
+        assert_shape(self.A, [self.skeleton.shape[0], window, 3], "TorchFileGaitDataset.A")
+        assert_shape(self.Omega, [self.skeleton.shape[0], window, 3], "TorchFileGaitDataset.Omega")
         assert_shape(self.label, [self.skeleton.shape[0]], "TorchFileGaitDataset.label")
 
     def __len__(self) -> int:
@@ -69,9 +80,10 @@ class TorchFileGaitDataset(Dataset):
         """Return one sample dictionary."""
         return {
             "skeleton": self.skeleton[idx],
-            "hip": self.hip[idx],
-            "wrist": self.wrist[idx],
+            "A": self.A[idx],
+            "Omega": self.Omega[idx],
             "label": self.label[idx],
+            "fps": torch.tensor(self.fps, dtype=torch.long),
         }
 
 

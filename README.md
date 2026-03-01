@@ -3,12 +3,14 @@
 Implementation aligned to the proposal architecture:
 
 1. Stage 1: Skeleton graph encoder latent diffusion pre-training.
-2. Stage 2: Two-branch IMU Temporal-GNN (T-GNN) alignment to pooled skeleton latent target.
+2. Stage 2: Two-branch IMU Temporal-GNN (T-GNN) over `A` and `Omega` streams, each `[T,3]`, aligned to skeleton latent `z0`.
 3. Stage 3: Conditional latent diffusion with graph denoiser + cross-attention from temporal sensor tokens.
 
 Notes:
 - Stage 1 optimization uses diffusion noise loss (`L_diff`) as proposal-exact objective.
 - GAT layers are mandatory (requires `torch_geometric`).
+- Stage 2 data contract for file datasets requires keys: `A`, `Omega`, `fps`, `sensor_identity`:
+  `sensor_identity["A"] == "right_hip"`, `sensor_identity["Omega"] == "left_wrist"`, and `fps == 30`.
 
 ## Structure
 

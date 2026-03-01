@@ -96,9 +96,9 @@ def train_stage2(args: argparse.Namespace, device: torch.device) -> None:
     for epoch in range(args.epochs):
         for batch in loader:
             x = batch["skeleton"].to(device)
-            s_hip = batch["hip"].to(device)
-            s_wrist = batch["wrist"].to(device)
-            out = model(x=x, s_hip=s_hip, s_wrist=s_wrist)
+            a_stream = batch["A"].to(device)
+            omega_stream = batch["Omega"].to(device)
+            out = model(x=x, a_stream=a_stream, omega_stream=omega_stream)
             loss = out["loss_align"]
             optimizer.zero_grad()
             loss.backward()
@@ -146,14 +146,14 @@ def train_stage3(args: argparse.Namespace, device: torch.device) -> None:
         for batch in loader:
             x = batch["skeleton"].to(device)
             y = batch["label"].to(device)
-            s_hip = batch["hip"].to(device)
-            s_wrist = batch["wrist"].to(device)
+            a_stream = batch["A"].to(device)
+            omega_stream = batch["Omega"].to(device)
 
             if args.use_h_none:
                 h_global = None
                 sensor_tokens = None
             else:
-                h_global, sensor_tokens = stage2.aligner(s_hip=s_hip, s_wrist=s_wrist)
+                h_global, sensor_tokens = stage2.aligner(a_stream=a_stream, omega_stream=omega_stream)
 
             out = model(x=x, y=y, sensor_tokens=sensor_tokens, h_global=h_global)
             loss = out["loss_total"]

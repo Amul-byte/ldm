@@ -22,9 +22,9 @@ def build_temporal_adjacency(length: int, device: torch.device) -> torch.Tensor:
 
 
 class SensorTGNNBranch(nn.Module):
-    """Temporal GNN branch for one IMU stream with input shape [B, T, 6]."""
+    """Temporal GNN branch for one IMU stream with input shape [B, T, 3]."""
 
-    def __init__(self, input_dim: int = 6, latent_dim: int = 256, depth: int = 3) -> None:
+    def __init__(self, input_dim: int = 3, latent_dim: int = 256, depth: int = 3) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
@@ -48,31 +48,31 @@ class SensorTGNNBranch(nn.Module):
 
 
 class IMULatentAligner(nn.Module):
-    """Two-branch IMU aligner for right-hip and left-wrist accel+gyro streams."""
+    """Two-branch IMU aligner for A and Omega streams, each shaped [B, T, 3]."""
 
     def __init__(self, latent_dim: int = 256) -> None:
         super().__init__()
         self.latent_dim = latent_dim
-        self.hip_branch = SensorTGNNBranch(input_dim=6, latent_dim=latent_dim)
-        self.wrist_branch = SensorTGNNBranch(input_dim=6, latent_dim=latent_dim)
+        self.a_branch = SensorTGNNBranch(input_dim=3, latent_dim=latent_dim)
+        self.omega_branch = SensorTGNNBranch(input_dim=3, latent_dim=latent_dim)
         self.fuse_tokens = nn.Sequential(
             nn.Linear(latent_dim * 2, latent_dim),
             nn.GELU(),
             nn.Linear(latent_dim, latent_dim),
         )
 
-    def forward(self, s_hip: torch.Tensor, s_wrist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, a_stream: torch.Tensor, omega_stream: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return global embedding h_global [B,D] and temporal sensor tokens [B,T,D]."""
-        assert_shape(s_hip, [None, None, 6], "IMULatentAligner.s_hip")
-        assert_shape(s_wrist, [None, None, 6], "IMULatentAligner.s_wrist")
-        assert s_hip.shape[:2] == s_wrist.shape[:2], "hip and wrist must share [B,T]"
+        assert_shape(a_stream, [None, None, 3], "IMULatentAligner.a_stream")
+        assert_shape(omega_stream, [None, None, 3], "IMULatentAligner.omega_stream")
+        assert a_stream.shape[:2] == omega_stream.shape[:2], "A and Omega must share [B,T]"
 
-        hip_tokens = self.hip_branch(s_hip)
-        wrist_tokens = self.wrist_branch(s_wrist)
-        fused = torch.cat([hip_tokens, wrist_tokens], dim=-1)
+        a_tokens = self.a_branch(a_stream)
+        omega_tokens = self.omega_branch(omega_stream)
+        fused = torch.cat([a_tokens, omega_tokens], dim=-1)
         sensor_tokens = self.fuse_tokens(fused)
         h_global = sensor_tokens.mean(dim=1)
 
-        assert_shape(sensor_tokens, [s_hip.shape[0], s_hip.shape[1], self.latent_dim], "IMULatentAligner.sensor_tokens")
-        assert_shape(h_global, [s_hip.shape[0], self.latent_dim], "IMULatentAligner.h_global")
+        assert_shape(sensor_tokens, [a_stream.shape[0], a_stream.shape[1], self.latent_dim], "IMULatentAligner.sensor_tokens")
+        assert_shape(h_global, [a_stream.shape[0], self.latent_dim], "IMULatentAligner.h_global")
         return h_global, sensor_tokens

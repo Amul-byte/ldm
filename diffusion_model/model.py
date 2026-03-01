@@ -84,25 +84,27 @@ class Stage2Model(nn.Module):
             p.requires_grad = False
         assert all(not p.requires_grad for p in self.encoder.parameters()), "encoder freeze verification failed"
 
-    def forward(self, x: torch.Tensor, s_hip: torch.Tensor, s_wrist: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Compute alignment loss to pooled frozen latent targets."""
+    def forward(self, x: torch.Tensor, a_stream: torch.Tensor, omega_stream: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Compute alignment loss to frozen latent target z0."""
         assert_shape(x, [None, None, self.num_joints, 3], "Stage2Model.x")
-        assert_shape(s_hip, [x.shape[0], x.shape[1], 6], "Stage2Model.s_hip")
-        assert_shape(s_wrist, [x.shape[0], x.shape[1], 6], "Stage2Model.s_wrist")
+        assert_shape(a_stream, [x.shape[0], x.shape[1], 3], "Stage2Model.a_stream")
+        assert_shape(omega_stream, [x.shape[0], x.shape[1], 3], "Stage2Model.omega_stream")
 
         with torch.no_grad():
             z0 = self.encoder(x)
-        z0_target = z0.mean(dim=(1, 2))
-        assert_shape(z0_target, [x.shape[0], self.latent_dim], "Stage2Model.z0_target")
+        assert_shape(z0, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.z0")
 
-        h_global, sensor_tokens = self.aligner(s_hip=s_hip, s_wrist=s_wrist)
-        loss_align = F.mse_loss(h_global, z0_target)
+        h_global, sensor_tokens = self.aligner(a_stream=a_stream, omega_stream=omega_stream)
+        h_latent = sensor_tokens.unsqueeze(2).expand(-1, -1, self.num_joints, -1)
+        assert_shape(h_latent, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.h_latent")
+        loss_align = F.mse_loss(h_latent, z0)
         return {
             "loss_align": loss_align,
             "h_global": h_global,
             "h_tokens": sensor_tokens,
             "sensor_tokens": sensor_tokens,
-            "z0_target": z0_target,
+            "h_latent": h_latent,
+            "z0_target": z0,
         }
 
 

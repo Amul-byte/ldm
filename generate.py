@@ -118,14 +118,14 @@ def main() -> None:
 
     batch = next(iter(loader))
     skeleton = batch["skeleton"].to(device)
-    hip = batch["hip"].to(device)
-    wrist = batch["wrist"].to(device)
+    a_stream = batch["A"].to(device)
+    omega_stream = batch["Omega"].to(device)
 
     if args.h_none:
         h_global = None
         sensor_tokens = None
     else:
-        h_global, sensor_tokens = stage2.aligner(hip, wrist)
+        h_global, sensor_tokens = stage2.aligner(a_stream, omega_stream)
 
     shape = (skeleton.shape[0], skeleton.shape[1], skeleton.shape[2], args.latent_dim)
     z0_gen = stage3.diffusion.p_sample_loop(

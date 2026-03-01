@@ -17,6 +17,9 @@ try:
 except Exception:
     HAS_TORCH_GEOMETRIC = False
 
+if not HAS_TORCH_GEOMETRIC:
+    raise ImportError("torch_geometric is required for proposal-exact GAT-only implementation.")
+
 
 class MaskedGraphAttention(nn.Module):
     """Adjacency-masked multi-head attention over joints."""
@@ -63,19 +66,17 @@ class PyGGraphLayer(nn.Module):
 
 
 class GraphBlock(nn.Module):
-    """Residual graph block with adjacency masking fallback."""
+    """Residual graph block using GAT over adjacency-defined graph."""
 
     def __init__(self, dim: int, num_heads: int, num_joints: int, use_pyg: bool = True) -> None:
         super().__init__()
         self.dim = dim
         self.num_joints = num_joints
         self.use_pyg = bool(use_pyg and HAS_TORCH_GEOMETRIC)
-        if self.use_pyg:
-            self.graph_op = PyGGraphLayer(dim=dim, num_joints=num_joints, heads=num_heads)
-            self.masked_attn = None
-        else:
-            self.masked_attn = MaskedGraphAttention(dim=dim, num_heads=num_heads, num_joints=num_joints)
-            self.graph_op = None
+        if not self.use_pyg:
+            raise RuntimeError("GraphBlock requires torch_geometric GATConv for proposal-exact mode.")
+        self.graph_op = PyGGraphLayer(dim=dim, num_joints=num_joints, heads=num_heads)
+        self.masked_attn = None
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.ff = nn.Sequential(
@@ -89,11 +90,8 @@ class GraphBlock(nn.Module):
         assert_shape(x, [None, None, self.num_joints, self.dim], "GraphBlock.x")
         assert_shape(adjacency, [self.num_joints, self.num_joints], "GraphBlock.adjacency")
         h = self.norm1(x)
-        if self.use_pyg:
-            assert edge_index is not None, "edge_index is required when torch_geometric path is used"
-            y = self.graph_op(h, edge_index)
-        else:
-            y = self.masked_attn(h, adjacency)
+        assert edge_index is not None, "edge_index is required when torch_geometric path is used"
+        y = self.graph_op(h, edge_index)
         x = x + y
         x = x + self.ff(self.norm2(x))
         return x
@@ -141,18 +139,16 @@ class TemporalPyGGraphLayer(nn.Module):
 
 
 class TemporalGraphBlock(nn.Module):
-    """Residual temporal graph block with PyG/fallback masked attention."""
+    """Residual temporal graph block using temporal GAT edges."""
 
     def __init__(self, dim: int, num_heads: int, use_pyg: bool = True) -> None:
         super().__init__()
         self.dim = dim
         self.use_pyg = bool(use_pyg and HAS_TORCH_GEOMETRIC)
-        if self.use_pyg:
-            self.graph_op = TemporalPyGGraphLayer(dim=dim, heads=num_heads)
-            self.masked_attn = None
-        else:
-            self.masked_attn = TemporalMaskedGraphAttention(dim=dim, num_heads=num_heads)
-            self.graph_op = None
+        if not self.use_pyg:
+            raise RuntimeError("TemporalGraphBlock requires torch_geometric GATConv for proposal-exact mode.")
+        self.graph_op = TemporalPyGGraphLayer(dim=dim, heads=num_heads)
+        self.masked_attn = None
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.ff = nn.Sequential(
@@ -167,11 +163,8 @@ class TemporalGraphBlock(nn.Module):
         assert_shape(x, [None, None, self.dim], "TemporalGraphBlock.x")
         assert_shape(adjacency, [t, t], "TemporalGraphBlock.adjacency")
         h = self.norm1(x)
-        if self.use_pyg:
-            assert edge_index is not None, "edge_index is required when torch_geometric path is used"
-            y = self.graph_op(h, edge_index)
-        else:
-            y = self.masked_attn(h, adjacency)
+        assert edge_index is not None, "edge_index is required when torch_geometric path is used"
+        y = self.graph_op(h, edge_index)
         x = x + y
         x = x + self.ff(self.norm2(x))
         assert_shape(x, [b, t, d], "TemporalGraphBlock.out")

@@ -63,11 +63,11 @@ def train_stage1(args: argparse.Namespace, device: torch.device) -> None:
         for batch in loader:
             x = batch["skeleton"].to(device)
             out = model(x)
-            loss = out["loss_diff"] + out["loss_recon"]
+            loss = out["loss_diff"]
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        print(f"[Stage1] epoch={epoch + 1} loss_diff={out['loss_diff'].item():.6f} loss_recon={out['loss_recon'].item():.6f}")
+        print(f"[Stage1] epoch={epoch + 1} loss_diff={out['loss_diff'].item():.6f}")
 
     os.makedirs(args.save_dir, exist_ok=True)
     save_checkpoint(os.path.join(args.save_dir, "stage1.pt"), model)
@@ -77,7 +77,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device) -> None:
     """Train stage 2 model with frozen stage-1 encoder."""
     stage1 = Stage1Model(latent_dim=args.latent_dim, num_joints=args.joints, timesteps=args.timesteps).to(device)
     if args.stage1_ckpt:
-        load_checkpoint(args.stage1_ckpt, stage1, strict=False)
+        load_checkpoint(args.stage1_ckpt, stage1, strict=True)
 
     model = Stage2Model(encoder=stage1.encoder, latent_dim=args.latent_dim, num_joints=args.joints).to(device)
     assert all(not p.requires_grad for p in model.encoder.parameters()), "stage2 encoder must be frozen"
@@ -113,11 +113,11 @@ def train_stage3(args: argparse.Namespace, device: torch.device) -> None:
     """Train stage 3 conditional diffusion + classification model."""
     stage1 = Stage1Model(latent_dim=args.latent_dim, num_joints=args.joints, timesteps=args.timesteps).to(device)
     if args.stage1_ckpt:
-        load_checkpoint(args.stage1_ckpt, stage1, strict=False)
+        load_checkpoint(args.stage1_ckpt, stage1, strict=True)
 
     stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=args.latent_dim, num_joints=args.joints).to(device)
     if args.stage2_ckpt:
-        load_checkpoint(args.stage2_ckpt, stage2, strict=False)
+        load_checkpoint(args.stage2_ckpt, stage2, strict=True)
 
     model = Stage3Model(
         encoder=stage1.encoder,

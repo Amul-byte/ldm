@@ -6,6 +6,10 @@ Implementation aligned to the proposal architecture:
 2. Stage 2: Two-branch IMU Temporal-GNN (T-GNN) alignment to pooled skeleton latent target.
 3. Stage 3: Conditional latent diffusion with graph denoiser + cross-attention from temporal sensor tokens.
 
+Notes:
+- Stage 1 optimization uses diffusion noise loss (`L_diff`) as proposal-exact objective.
+- GAT layers are mandatory (requires `torch_geometric`).
+
 ## Structure
 
 ```

@@ -93,7 +93,7 @@ def main() -> None:
     load_checkpoint(args.stage1_ckpt, stage1, strict=True)
 
     stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=args.latent_dim, num_joints=args.joints).to(device)
-    load_checkpoint(args.stage2_ckpt, stage2, strict=False)
+    load_checkpoint(args.stage2_ckpt, stage2, strict=True)
 
     stage3 = Stage3Model(
         encoder=stage1.encoder,

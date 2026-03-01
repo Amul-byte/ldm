@@ -47,7 +47,7 @@ class SkeletonTransformerClassifier(nn.Module):
 
 
 class Stage1Model(nn.Module):
-    """Stage 1 model: skeleton latent diffusion and decoder reconstruction sanity."""
+    """Stage 1 model: skeleton latent diffusion pre-training."""
 
     def __init__(self, latent_dim: int = 256, num_joints: int = 32, timesteps: int = 500) -> None:
         super().__init__()

@@ -109,7 +109,12 @@ class TorchFileGaitDataset(Dataset):
         # Prefer explicit accel naming and keep legacy fallback support.
         self.A_hip = payload["A_hip"].float() if "A_hip" in payload else payload["A"].float()
         self.A_wrist = payload["A_wrist"].float() if "A_wrist" in payload else payload["Omega"].float()
-        self.label = payload["label"].long()
+        if "label" in payload:
+            self.label = payload["label"].long()
+        else:
+            # Fallback for older synthetic/toy payloads without labels: treat as non-fall (0).
+            self.label = torch.zeros(self.skeleton.shape[0], dtype=torch.long)
+            print("[dataset] Missing 'label' in payload; using synthetic all-zero labels (non-fall).")
         self.fps = int(payload["fps"])
         sensor_identity = payload.get("sensor_identity", {})
         joint_labels = payload["joint_labels"]

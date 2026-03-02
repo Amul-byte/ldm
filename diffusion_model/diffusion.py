@@ -43,8 +43,6 @@ class DiffusionProcess(nn.Module):
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
         self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0 / alphas))
-        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
-        self.register_buffer("posterior_variance", posterior_variance)
 
     def q_sample(self, z0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Sample forward process q(z_t | z_0)."""
@@ -107,9 +105,9 @@ class DiffusionProcess(nn.Module):
         model_mean = sqrt_recip_alphas_t * (zt - betas_t * pred_noise / sqrt_one_minus_alphas_cumprod_t)
 
         nonzero_mask = (t != 0).float().reshape(zt.shape[0], *([1] * (zt.ndim - 1)))
-        posterior_var_t = extract(self.posterior_variance, t, zt.shape)
         noise = torch.randn_like(zt)
-        z_prev = model_mean + nonzero_mask * torch.sqrt(torch.clamp(posterior_var_t, min=1e-20)) * noise
+        sigma_t = torch.sqrt(torch.clamp(betas_t, min=1e-20))
+        z_prev = model_mean + nonzero_mask * sigma_t * noise
         assert z_prev.shape == zt.shape, "p_sample output shape mismatch"
         return z_prev
 

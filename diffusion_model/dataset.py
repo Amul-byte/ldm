@@ -1,4 +1,4 @@
-"""Dataset utilities with torch-file, CSV-folder, and synthetic fallback modes."""
+"""Dataset utilities with torch-file and paired CSV-folder modes."""
 
 from __future__ import annotations
 
@@ -74,15 +74,20 @@ def _skeleton_frame_to_joints(frame_block: np.ndarray, joints: int = DEFAULT_JOI
 
 
 def _extract_sensor_accel3(df: pd.DataFrame) -> np.ndarray:
-    """Extract 3D accelerometer stream from sensor CSV using the last 3 numeric columns."""
-    # SmartFall sensor CSVs include non-numeric timestamp columns (for example ISO datetime).
+    """Extract tri-axial accelerometer columns from sensor CSV."""
+    # SmartFallMM CSV schema: [timestamp_ms, iso_datetime, elapsed_s, acc_x, acc_y, acc_z].
+    if df.shape[1] >= 6:
+        accel_df = df.iloc[:, 3:6].apply(pd.to_numeric, errors="coerce")
+        return _fill_nan_with_column_mean(accel_df.values.astype(np.float32))
+
+    # Strict fallback: accept files containing only 3 accel columns.
     numeric_df = df.apply(pd.to_numeric, errors="coerce")
-    # Keep columns that contain at least one numeric value.
     numeric_df = numeric_df.loc[:, numeric_df.notna().any(axis=0)]
-    if numeric_df.shape[1] < 3:
-        raise ValueError(f"Sensor CSV requires at least 3 numeric columns, got {numeric_df.shape[1]}")
-    values = _fill_nan_with_column_mean(numeric_df.values.astype(np.float32))
-    return values[:, -3:]
+    if numeric_df.shape[1] == 3:
+        return _fill_nan_with_column_mean(numeric_df.values.astype(np.float32))
+    raise ValueError(
+        f"Sensor CSV schema mismatch: expected >=6 columns with accel at [3:6] or exactly 3 accel columns, got {df.shape[1]}"
+    )
 
 
 def _windowed(arr: np.ndarray, window: int, stride: int) -> Sequence[np.ndarray]:
@@ -90,46 +95,6 @@ def _windowed(arr: np.ndarray, window: int, stride: int) -> Sequence[np.ndarray]
     if arr.shape[0] < window:
         return []
     return [arr[s : s + window] for s in range(0, arr.shape[0] - window + 1, stride)]
-
-
-class SyntheticGaitDataset(Dataset):
-    """Synthetic dataset producing skeleton, dual-accelerometer streams, and labels."""
-
-    def __init__(
-        self,
-        length: int = 128,
-        window: int = DEFAULT_WINDOW,
-        joints: int = DEFAULT_JOINTS,
-        num_classes: int = DEFAULT_NUM_CLASSES,
-    ) -> None:
-        super().__init__()
-        self.length = length
-        self.window = window
-        self.joints = joints
-        self.num_classes = num_classes
-
-    def __len__(self) -> int:
-        """Return dataset length."""
-        return self.length
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Return one synthetic sample dictionary."""
-        del idx
-        skeleton = torch.randn(self.window, self.joints, 3)
-        a_hip_stream = torch.randn(self.window, 3)
-        a_wrist_stream = torch.randn(self.window, 3)
-        label = torch.randint(low=0, high=self.num_classes, size=(1,)).squeeze(0)
-        assert_shape(skeleton, [self.window, self.joints, 3], "SyntheticGaitDataset.skeleton")
-        assert_shape(a_hip_stream, [self.window, 3], "SyntheticGaitDataset.A_hip")
-        assert_shape(a_wrist_stream, [self.window, 3], "SyntheticGaitDataset.A_wrist")
-        return {
-            "skeleton": skeleton,
-            "A_hip": a_hip_stream,
-            "A_wrist": a_wrist_stream,
-            "label": label,
-            "fps": torch.tensor(30, dtype=torch.long),
-            "joint_labels": list(get_joint_labels()),
-        }
 
 
 class TorchFileGaitDataset(Dataset):
@@ -281,7 +246,6 @@ class CSVPairedGaitDataset(Dataset):
 
 def create_dataset(
     dataset_path: Optional[str],
-    synthetic_length: int = 128,
     window: int = DEFAULT_WINDOW,
     joints: int = DEFAULT_JOINTS,
     num_classes: int = DEFAULT_NUM_CLASSES,
@@ -291,7 +255,7 @@ def create_dataset(
     stride: int = 30,
     normalize_sensors: bool = True,
 ) -> Dataset:
-    """Create dataset object from torch-file, CSV-folder, or synthetic fallback mode."""
+    """Create dataset object from torch-file or paired CSV folders."""
     if dataset_path:
         return TorchFileGaitDataset(path=dataset_path, window=window, joints=joints)
     if skeleton_folder and hip_folder and wrist_folder:
@@ -305,15 +269,9 @@ def create_dataset(
             num_classes=num_classes,
             normalize_sensors=normalize_sensors,
         )
-    if skeleton_folder or hip_folder or wrist_folder:
-        raise ValueError(
-            "CSV-folder mode requires --skeleton_folder, --hip_folder, and --wrist_folder together"
-        )
-    return SyntheticGaitDataset(
-        length=synthetic_length,
-        window=window,
-        joints=joints,
-        num_classes=num_classes,
+    raise ValueError(
+        "Strict proposal mode requires either --dataset_path or all CSV folders: "
+        "--skeleton_folder, --hip_folder, --wrist_folder."
     )
 
 
@@ -321,7 +279,6 @@ def create_dataloader(
     dataset_path: Optional[str],
     batch_size: int,
     shuffle: bool = True,
-    synthetic_length: int = 128,
     window: int = DEFAULT_WINDOW,
     joints: int = DEFAULT_JOINTS,
     num_classes: int = DEFAULT_NUM_CLASSES,
@@ -334,12 +291,12 @@ def create_dataloader(
     pin_memory: bool = True,
     sampler: Optional[Sampler] = None,
     dataset: Optional[Dataset] = None,
+    drop_last: bool = True,
 ) -> DataLoader:
-    """Create dataloader from torch-file, CSV-folder, or synthetic fallback mode."""
+    """Create dataloader from torch-file or paired CSV folders."""
     if dataset is None:
         dataset = create_dataset(
             dataset_path=dataset_path,
-            synthetic_length=synthetic_length,
             window=window,
             joints=joints,
             num_classes=num_classes,
@@ -352,7 +309,7 @@ def create_dataloader(
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": shuffle if sampler is None else False,
-        "drop_last": True,
+        "drop_last": drop_last,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
         "sampler": sampler,

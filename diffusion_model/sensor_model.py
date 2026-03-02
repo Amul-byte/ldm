@@ -62,7 +62,7 @@ class IMULatentAligner(nn.Module):
         )
 
     def forward(self, a_hip_stream: torch.Tensor, a_wrist_stream: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return global embedding h_global [B,D] and temporal sensor tokens [B,T,D]."""
+        """Return proposal-style temporal/global embeddings: (h_tokens [B,T,D], h_global [B,D])."""
         assert_shape(a_hip_stream, [None, None, 3], "IMULatentAligner.a_hip_stream")
         assert_shape(a_wrist_stream, [None, None, 3], "IMULatentAligner.a_wrist_stream")
         assert a_hip_stream.shape[:2] == a_wrist_stream.shape[:2], "Hip and wrist streams must share [B,T]"
@@ -79,4 +79,4 @@ class IMULatentAligner(nn.Module):
             "IMULatentAligner.sensor_tokens",
         )
         assert_shape(h_global, [a_hip_stream.shape[0], self.latent_dim], "IMULatentAligner.h_global")
-        return h_global, sensor_tokens
+        return sensor_tokens, h_global

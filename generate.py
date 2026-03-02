@@ -139,7 +139,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=30)
     parser.add_argument("--disable_sensor_norm", action="store_true")
     parser.add_argument("--classify", action="store_true")
-    parser.add_argument("--h_none", action="store_true")
     parser.add_argument("--save_gif", action="store_true")
     parser.add_argument("--gif_dir", type=str, default="outputs/gifs")
     parser.add_argument("--gif_prefix", type=str, default="sample")
@@ -163,8 +162,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Run conditional sampling and optional classification."""
     args = parse_args()
-    if args.h_none:
-        raise ValueError("Strict proposal behavior requires sensor conditioning during generation. Remove --h_none.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     stage1 = Stage1Model(latent_dim=args.latent_dim, num_joints=args.joints, timesteps=args.timesteps).to(device)
@@ -187,7 +184,6 @@ def main() -> None:
     loader = create_dataloader(
         dataset_path=args.dataset_path or None,
         batch_size=args.batch_size,
-        synthetic_length=args.batch_size,
         window=args.window,
         joints=args.joints,
         num_classes=args.num_classes,
@@ -214,18 +210,19 @@ def main() -> None:
         a_wrist_stream = batch["A_wrist"].to(device)
 
     def _sample_once() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        h_global_local, sensor_tokens_local = stage2.aligner(a_hip_stream, a_wrist_stream)
+        sensor_tokens_local, h_local = stage2.aligner(a_hip_stream, a_wrist_stream)
         shape = (skeleton.shape[0], skeleton.shape[1], skeleton.shape[2], args.latent_dim)
         z0_local = stage3.diffusion.p_sample_loop(
             stage3.denoiser,
             shape=torch.Size(shape),
             device=device,
             sensor_tokens=sensor_tokens_local,
-            h_global=h_global_local,
+            h_tokens=sensor_tokens_local,
+            h_global=h_local,
         )
         x_local = stage3.decoder(z0_local)
         logits_local = stage3.classifier(x_local)
-        return x_local, logits_local, z0_local, h_global_local
+        return x_local, logits_local, z0_local, h_local
 
     if target_class is None:
         x_hat, logits, z0_gen, h_global = _sample_once()

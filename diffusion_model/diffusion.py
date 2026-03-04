@@ -35,11 +35,14 @@ class DiffusionProcess(nn.Module):
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]], dim=0)
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / torch.clamp(1.0 - alphas_cumprod, min=1e-20)
 
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alphas_cumprod", alphas_cumprod)
         self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
+        # Kept for backward compatibility with older checkpoints that stored this buffer.
+        self.register_buffer("posterior_variance", posterior_variance)
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
         self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0 / alphas))
@@ -139,4 +142,82 @@ class DiffusionProcess(nn.Module):
             t = torch.full((shape[0],), i, device=device, dtype=torch.long)
             z = self.p_sample(denoiser=denoiser, zt=z, t=t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
         assert_shape(z, [shape[0], shape[1], shape[2], shape[3]], "DiffusionProcess.p_sample_loop.z")
+        return z
+
+    def _build_sampling_schedule(self, sample_steps: int, device: torch.device) -> torch.Tensor:
+        """Build descending timestep schedule for accelerated sampling."""
+        if sample_steps < 1 or sample_steps > self.timesteps:
+            raise ValueError(f"sample_steps must be in [1, {self.timesteps}], got {sample_steps}.")
+        if sample_steps == self.timesteps:
+            return torch.arange(self.timesteps - 1, -1, -1, device=device, dtype=torch.long)
+        times = torch.linspace(self.timesteps - 1, 0, sample_steps, device=device, dtype=torch.float32)
+        schedule = torch.round(times).long()
+        schedule = torch.unique_consecutive(schedule, dim=0)
+        if schedule[0].item() != self.timesteps - 1:
+            schedule = torch.cat([torch.tensor([self.timesteps - 1], device=device, dtype=torch.long), schedule], dim=0)
+        if schedule[-1].item() != 0:
+            schedule = torch.cat([schedule, torch.tensor([0], device=device, dtype=torch.long)], dim=0)
+        return schedule
+
+    @torch.no_grad()
+    def p_sample_loop_ddim(
+        self,
+        denoiser: nn.Module,
+        shape: torch.Size,
+        device: torch.device,
+        sample_steps: int = 50,
+        eta: float = 0.0,
+        sensor_tokens: Optional[torch.Tensor] = None,
+        h_tokens: Optional[torch.Tensor] = None,
+        h_global: Optional[torch.Tensor] = None,
+        h: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run DDIM sampling with configurable number of reverse steps.
+
+        `eta=0` gives deterministic DDIM sampling.
+        """
+        assert len(shape) == 4, "shape must be [B,T,J,D]"
+        if eta < 0.0:
+            raise ValueError(f"eta must be >= 0, got {eta}")
+        if h_global is None and h is not None:
+            h_global = h
+        if h_tokens is None and sensor_tokens is not None:
+            h_tokens = sensor_tokens
+        z = torch.randn(shape, device=device)
+
+        if h_tokens is not None:
+            assert_shape(h_tokens, [shape[0], shape[1], shape[3]], "DiffusionProcess.p_sample_loop_ddim.h_tokens")
+        if h_global is not None:
+            assert_shape(h_global, [shape[0], shape[3]], "DiffusionProcess.p_sample_loop_ddim.h_global")
+
+        schedule = self._build_sampling_schedule(sample_steps=sample_steps, device=device)
+        next_schedule = torch.cat([schedule[1:], torch.tensor([-1], device=device, dtype=torch.long)], dim=0)
+
+        for t_scalar, t_next_scalar in zip(schedule, next_schedule):
+            t = torch.full((shape[0],), int(t_scalar.item()), device=device, dtype=torch.long)
+            pred_noise = denoiser(z, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
+
+            alpha_bar_t = extract(self.alphas_cumprod, t, z.shape)
+            sqrt_alpha_bar_t = torch.sqrt(torch.clamp(alpha_bar_t, min=1e-20))
+            sqrt_one_minus_alpha_bar_t = torch.sqrt(torch.clamp(1.0 - alpha_bar_t, min=1e-20))
+            x0_pred = (z - sqrt_one_minus_alpha_bar_t * pred_noise) / sqrt_alpha_bar_t
+
+            if int(t_next_scalar.item()) < 0:
+                alpha_bar_next = torch.ones_like(alpha_bar_t)
+            else:
+                t_next = torch.full((shape[0],), int(t_next_scalar.item()), device=device, dtype=torch.long)
+                alpha_bar_next = extract(self.alphas_cumprod, t_next, z.shape)
+
+            sigma = eta * torch.sqrt(
+                torch.clamp((1.0 - alpha_bar_next) / (1.0 - alpha_bar_t), min=0.0)
+                * torch.clamp(1.0 - alpha_bar_t / torch.clamp(alpha_bar_next, min=1e-20), min=0.0)
+            )
+            direction = torch.sqrt(torch.clamp(1.0 - alpha_bar_next - sigma * sigma, min=0.0)) * pred_noise
+            if eta > 0.0 and int(t_next_scalar.item()) >= 0:
+                noise = torch.randn_like(z)
+            else:
+                noise = torch.zeros_like(z)
+            z = torch.sqrt(torch.clamp(alpha_bar_next, min=1e-20)) * x0_pred + direction + sigma * noise
+
+        assert_shape(z, [shape[0], shape[1], shape[2], shape[3]], "DiffusionProcess.p_sample_loop_ddim.z")
         return z

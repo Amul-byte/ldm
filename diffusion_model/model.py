@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from diffusion_model.diffusion import DiffusionProcess
+from diffusion_model.diffusion import DiffusionProcess, extract
 from diffusion_model.sensor_model import IMULatentAligner
 from diffusion_model.skeleton_model import GraphDecoder, GraphDenoiserMasked, GraphEncoder
 from diffusion_model.util import assert_shape
@@ -137,7 +138,12 @@ class Stage3Model(nn.Module):
         h_tokens: torch.Tensor,
         h_global: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """Compute proposal-aligned stage-3 losses with conditional iterative denoising."""
+        """Compute stage-3 losses.
+
+        Training uses closed-form x0 reconstruction from one noisy sample (z_t, pred_noise),
+        instead of a full reverse sampling loop. Full iterative sampling remains available
+        through generation code paths.
+        """
         assert_shape(x, [None, None, self.num_joints, 3], "Stage3Model.x")
         assert_shape(y, [x.shape[0]], "Stage3Model.y")
 
@@ -153,16 +159,20 @@ class Stage3Model(nn.Module):
         pred_noise = self.denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
         loss_diff = F.mse_loss(pred_noise, noise)
 
-        z0_gen = self.diffusion.p_sample_loop(
-            self.denoiser,
-            shape=torch.Size(z0.shape),
-            device=x.device,
-            sensor_tokens=h_tokens,
-            h_tokens=h_tokens,
-            h_global=h_global,
+        # Closed-form z0 estimate avoids expensive iterative reverse diffusion during training.
+        sqrt_alpha_bar_t = extract(self.diffusion.sqrt_alphas_cumprod, t, zt.shape)
+        sqrt_one_minus_alpha_bar_t = extract(self.diffusion.sqrt_one_minus_alphas_cumprod, t, zt.shape)
+        z0_gen = (zt - sqrt_one_minus_alpha_bar_t * pred_noise) / torch.clamp(sqrt_alpha_bar_t, min=1e-20)
+
+        # Keep decode/classification in fp32 for numerical stability under AMP training.
+        amp_off_ctx = (
+            torch.autocast(device_type=x.device.type, enabled=False)
+            if x.device.type in {"cuda", "cpu"}
+            else nullcontext()
         )
-        x_hat = self.decoder(z0_gen)
-        logits = self.classifier(x_hat)
+        with amp_off_ctx:
+            x_hat = self.decoder(z0_gen.float())
+            logits = self.classifier(x_hat.float())
         loss_cls = F.cross_entropy(logits, y)
         loss_total = loss_diff + loss_cls
         probs = torch.softmax(logits, dim=1)

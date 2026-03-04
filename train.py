@@ -24,12 +24,27 @@ from diffusion_model.dataset import create_dataloader, create_dataset
 from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model
 from diffusion_model.model_loader import load_checkpoint, save_checkpoint
 from diffusion_model.util import (
+    DEFAULT_BONES,
+    DEFAULT_FPS,
     DEFAULT_JOINTS,
     DEFAULT_LATENT_DIM,
     DEFAULT_NUM_CLASSES,
     DEFAULT_TIMESTEPS,
     DEFAULT_WINDOW,
+    bone_length_loss,
+    compute_bos_proxy,
+    compute_com,
+    foot_skating_loss,
+    infer_binary_fall_labels,
+    instability_loss,
+    JointIndexConfig,
+    make_joint_index_config,
+    run_biomech_sanity_checks,
     set_seed,
+    smoothness_loss,
+    soft_contact_prob,
+    stability_margin_soft,
+    temporal_derivatives,
 )
 
 
@@ -160,6 +175,16 @@ def _print_run_summary(args: argparse.Namespace, device: torch.device) -> None:
         LOGGER.info("skeleton_folder=%s", args.skeleton_folder)
         LOGGER.info("hip_folder=%s", args.hip_folder)
         LOGGER.info("wrist_folder=%s", args.wrist_folder)
+    if args.stage == 3:
+        LOGGER.info(
+            "Stage3 biomech: lambda_bone=%s lambda_skate=%s lambda_smooth=%s lambda_instab=%s window_sec=%s fps=%s",
+            args.lambda_bone,
+            args.lambda_skate,
+            args.lambda_smooth,
+            args.lambda_instab,
+            args.instab_window_sec,
+            args.fps,
+        )
 
 
 def _print_loader_summary(loader: torch.utils.data.DataLoader) -> None:
@@ -269,6 +294,45 @@ def _print_epoch_summary(stage_name: str, epoch: int, total_epochs: int, metrics
     LOGGER.info("[%s] epoch=%s/%s %s epoch_time=%.1fs", stage_name, epoch, total_epochs, items, sec)
 
 
+def _parse_index_list(raw: str) -> Optional[Tuple[int, ...]]:
+    """Parse comma-separated integer list from CLI."""
+    if raw.strip() == "":
+        return None
+    return tuple(int(part.strip()) for part in raw.split(",") if part.strip() != "")
+
+
+def _validate_joint_override(idx: Optional[int], name: str, joints: int) -> None:
+    if idx is None:
+        return
+    if idx < 0 or idx >= joints:
+        raise ValueError(
+            f"Invalid {name}={idx} for joints={joints}. "
+            "Override with valid indices via --left-ankle-idx / --right-ankle-idx / --left-foot-idx / --right-foot-idx / --pelvis-idx."
+        )
+
+
+def _resolve_joint_config_from_args(args: argparse.Namespace) -> JointIndexConfig:
+    """Build joint index config from defaults + optional CLI overrides."""
+    torso_indices = _parse_index_list(args.torso_indices)
+    config = make_joint_index_config(
+        left_ankle_idx=args.left_ankle_idx,
+        right_ankle_idx=args.right_ankle_idx,
+        left_foot_idx=args.left_foot_idx,
+        right_foot_idx=args.right_foot_idx,
+        pelvis_idx=args.pelvis_idx,
+        torso_indices=torso_indices,
+    )
+    _validate_joint_override(config.left_ankle_idx, "left_ankle_idx", args.joints)
+    _validate_joint_override(config.right_ankle_idx, "right_ankle_idx", args.joints)
+    _validate_joint_override(config.left_foot_idx, "left_foot_idx", args.joints)
+    _validate_joint_override(config.right_foot_idx, "right_foot_idx", args.joints)
+    _validate_joint_override(config.pelvis_idx, "pelvis_idx", args.joints)
+    if config.torso_indices is not None:
+        for idx in config.torso_indices:
+            _validate_joint_override(idx, "torso_indices", args.joints)
+    return config
+
+
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description="Train 3-stage joint-aware latent diffusion")
@@ -277,11 +341,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skeleton_folder", type=str, default="")
     parser.add_argument("--hip_folder", type=str, default="")
     parser.add_argument("--wrist_folder", type=str, default="")
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--ddp", action="store_true", help="Enable DistributedDataParallel (or auto-enabled under torchrun).")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--no_pin_memory", action="store_true")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default="checkpoints")
@@ -297,6 +361,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--val_split", type=float, default=0.1, help="Fraction of data used for validation (0 disables validation).")
     parser.add_argument("--log_every", type=int, default=20, help="Plain progress print interval (steps) when tqdm is not interactive.")
+    parser.add_argument("--lambda-bone", type=float, default=0.0, help="Weight for bone-length consistency loss (Stage-3 only).")
+    parser.add_argument("--lambda-skate", type=float, default=0.0, help="Weight for soft foot skating loss (Stage-3 only).")
+    parser.add_argument("--lambda-smooth", type=float, default=0.0, help="Weight for smoothness/acceleration loss (Stage-3 only).")
+    parser.add_argument("--lambda-instab", type=float, default=0.0, help="Weight for activity-aware instability loss (Stage-3 only).")
+    parser.add_argument("--instab-window-sec", type=float, default=3.0, help="Instability window length in seconds (recommended 2.0-4.0).")
+    parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="Skeleton frame-rate for temporal losses (Stage-3 only).")
+    parser.add_argument("--left-ankle-idx", type=int, default=None, help="Optional override for left ankle joint index.")
+    parser.add_argument("--right-ankle-idx", type=int, default=None, help="Optional override for right ankle joint index.")
+    parser.add_argument("--left-foot-idx", type=int, default=None, help="Optional override for left foot joint index.")
+    parser.add_argument("--right-foot-idx", type=int, default=None, help="Optional override for right foot joint index.")
+    parser.add_argument("--pelvis-idx", type=int, default=None, help="Optional override for pelvis joint index.")
+    parser.add_argument(
+        "--torso-indices",
+        type=str,
+        default="",
+        help="Optional comma-separated torso joint indices for CoM weighting (e.g., '0,1,2,3,26').",
+    )
+    parser.add_argument("--debug-losses", action="store_true", help="Run one Stage-3 batch and print biomechanics diagnostics.")
     return parser.parse_args()
 
 
@@ -589,6 +671,10 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
     use_amp = (not args.no_amp) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+    joint_config = _resolve_joint_config_from_args(args)
+    use_biomech_losses = any(
+        v > 0.0 for v in (args.lambda_bone, args.lambda_skate, args.lambda_smooth, args.lambda_instab)
+    ) or args.debug_losses
     _print_loader_summary(train_loader)
     if val_loader is not None and _is_main_process():
         LOGGER.info(
@@ -599,12 +685,17 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         )
     os.makedirs(args.save_dir, exist_ok=True)
     best_loss = float("inf")
+    debug_printed = False
 
     for epoch in range(args.epochs):
         t0 = time.time()
         sum_total = 0.0
         sum_diff = 0.0
         sum_cls = 0.0
+        sum_bone = 0.0
+        sum_skate = 0.0
+        sum_smooth = 0.0
+        sum_instab = 0.0
         n_batches = 0
         total_steps = len(train_loader)
         progress_enabled = _is_main_process() and sys.stdout.isatty()
@@ -626,17 +717,62 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                out = model(x=x, y=y, h_tokens=h_tokens, h_global=h_global)
-                loss = out["loss_total"]
+                out = model(
+                    x=x,
+                    y=y,
+                    h_tokens=h_tokens,
+                    h_global=h_global,
+                )
+                x_gen = out["x_hat"].float()
+                x_gt = x.float() if x is not None else None
+                if use_biomech_losses:
+                    contact_prob = soft_contact_prob(x_gen, joint_config=joint_config, fps=args.fps)
+                    loss_bone = bone_length_loss(x_gen, bones=DEFAULT_BONES)
+                    loss_skate = foot_skating_loss(x_gen, contact_prob=contact_prob, joint_config=joint_config, fps=args.fps)
+                    loss_smooth = smoothness_loss(x_gen, fps=args.fps)
+                    loss_instab = instability_loss(
+                        x_gen=x_gen,
+                        x_gt=x_gt,
+                        y=y,
+                        fps=args.fps,
+                        window_sec=args.instab_window_sec,
+                        joint_config=joint_config,
+                    )
+                else:
+                    z = x.new_zeros(())
+                    loss_bone = z
+                    loss_skate = z
+                    loss_smooth = z
+                    loss_instab = z
+
+                loss = (
+                    out["loss_total"]
+                    + args.lambda_bone * loss_bone
+                    + args.lambda_skate * loss_skate
+                    + args.lambda_smooth * loss_smooth
+                    + args.lambda_instab * loss_instab
+                )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            sum_total += float(out["loss_total"].item())
+            sum_total += float(loss.item())
             sum_diff += float(out["loss_diff"].item())
             sum_cls += float(out["loss_cls"].item())
+            sum_bone += float(loss_bone.item())
+            sum_skate += float(loss_skate.item())
+            sum_smooth += float(loss_smooth.item())
+            sum_instab += float(loss_instab.item())
             n_batches += 1
             if tqdm is not None and progress_enabled:
-                pbar.set_postfix(loss=f"{(sum_total / n_batches):.4f}")
+                pbar.set_postfix(
+                    total=f"{(sum_total / n_batches):.4f}",
+                    diff=f"{(sum_diff / n_batches):.4f}",
+                    cls=f"{(sum_cls / n_batches):.4f}",
+                    bone=f"{(sum_bone / n_batches):.4f}",
+                    skate=f"{(sum_skate / n_batches):.4f}",
+                    smooth=f"{(sum_smooth / n_batches):.4f}",
+                    instab=f"{(sum_instab / n_batches):.4f}",
+                )
             elif _is_main_process() and (
                 n_batches == 1
                 or n_batches % max(1, args.log_every) == 0
@@ -648,25 +784,102 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     args.epochs,
                     n_batches,
                     total_steps,
-                    "loss",
+                    "loss_total",
                     sum_total / n_batches,
                     t0,
                 )
+                LOGGER.info(
+                    "[Stage3] step_losses diff=%.6f cls=%.6f bone=%.6f skate=%.6f smooth=%.6f instab=%.6f",
+                    sum_diff / n_batches,
+                    sum_cls / n_batches,
+                    sum_bone / n_batches,
+                    sum_skate / n_batches,
+                    sum_smooth / n_batches,
+                    sum_instab / n_batches,
+                )
+
+            if args.debug_losses and not debug_printed and _is_main_process():
+                with torch.no_grad():
+                    y_bin = infer_binary_fall_labels(y).to(device=x_gen.device)
+                    com = compute_com(x_gen, joint_config=joint_config)
+                    bos_center_xz, bos_radius = compute_bos_proxy(x_gen, joint_config=joint_config)
+                    margin = stability_margin_soft(com, bos_center_xz, bos_radius)
+                    vel, acc = temporal_derivatives(com, dt=1.0 / max(args.fps, 1e-6))
+                    sanity = run_biomech_sanity_checks(device=device)
+
+                LOGGER.info(
+                    "[debug-losses] shapes X_gen=%s X_gt=%s y=%s y_bin=%s",
+                    tuple(x_gen.shape),
+                    tuple(x.shape),
+                    tuple(y.shape),
+                    tuple(y_bin.shape),
+                )
+                LOGGER.info(
+                    "[debug-losses] com[min,max]=[%.6f,%.6f] margin[min,max]=[%.6f,%.6f] vel[min,max]=[%.6f,%.6f] acc[min,max]=[%.6f,%.6f]",
+                    float(com.min().item()),
+                    float(com.max().item()),
+                    float(margin.min().item()),
+                    float(margin.max().item()),
+                    float(vel.min().item()),
+                    float(vel.max().item()),
+                    float(acc.min().item()),
+                    float(acc.max().item()),
+                )
+                LOGGER.info(
+                    "[debug-losses] components diff=%.6f cls=%.6f bone=%.6f skate=%.6f smooth=%.6f instab=%.6f total=%.6f",
+                    float(out["loss_diff"].item()),
+                    float(out["loss_cls"].item()),
+                    float(loss_bone.item()),
+                    float(loss_skate.item()),
+                    float(loss_smooth.item()),
+                    float(loss_instab.item()),
+                    float(loss.item()),
+                )
+                LOGGER.info(
+                    "[debug-losses] sanity const_vel_max=%.6f const_acc_max=%.6f const_smooth=%.6f const_instab=%.6f skate_const=%.6f skate_slide=%.6f check_const_ok=%.0f check_skate_ok=%.0f",
+                    sanity["const_vel_max"],
+                    sanity["const_acc_max"],
+                    sanity["const_smooth_loss"],
+                    sanity["const_instability_mean"],
+                    sanity["skating_loss_const"],
+                    sanity["skating_loss_slide"],
+                    sanity["check_const_stationary_ok"],
+                    sanity["check_skate_response_ok"],
+                )
+                LOGGER.info("[debug-losses] Completed one debug batch, exiting Stage-3 training early.")
+                debug_printed = True
+                return
         avg_train_total = sum_total / max(n_batches, 1)
         avg_train_diff = sum_diff / max(n_batches, 1)
         avg_train_cls = sum_cls / max(n_batches, 1)
+        avg_train_bone = sum_bone / max(n_batches, 1)
+        avg_train_skate = sum_skate / max(n_batches, 1)
+        avg_train_smooth = sum_smooth / max(n_batches, 1)
+        avg_train_instab = sum_instab / max(n_batches, 1)
         avg_train_total = _sync_mean(avg_train_total, device)
         avg_train_diff = _sync_mean(avg_train_diff, device)
         avg_train_cls = _sync_mean(avg_train_cls, device)
+        avg_train_bone = _sync_mean(avg_train_bone, device)
+        avg_train_skate = _sync_mean(avg_train_skate, device)
+        avg_train_smooth = _sync_mean(avg_train_smooth, device)
+        avg_train_instab = _sync_mean(avg_train_instab, device)
 
         avg_val_total = None
         avg_val_diff = None
         avg_val_cls = None
+        avg_val_bone = None
+        avg_val_skate = None
+        avg_val_smooth = None
+        avg_val_instab = None
         if val_loader is not None:
             model.eval()
             val_total_sum = 0.0
             val_diff_sum = 0.0
             val_cls_sum = 0.0
+            val_bone_sum = 0.0
+            val_skate_sum = 0.0
+            val_smooth_sum = 0.0
+            val_instab_sum = 0.0
             val_n = 0
             with torch.no_grad():
                 for batch in val_loader:
@@ -676,25 +889,87 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     a_wrist_stream = batch["A_wrist"].to(device)
                     h_tokens, h_global = stage2.aligner(a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                        out = model(x=x, y=y, h_tokens=h_tokens, h_global=h_global)
-                    val_total_sum += float(out["loss_total"].item())
+                        out = model(
+                            x=x,
+                            y=y,
+                            h_tokens=h_tokens,
+                            h_global=h_global,
+                        )
+                        x_gen = out["x_hat"].float()
+                        x_gt = x.float() if x is not None else None
+                        if use_biomech_losses:
+                            contact_prob = soft_contact_prob(x_gen, joint_config=joint_config, fps=args.fps)
+                            val_loss_bone = bone_length_loss(x_gen, bones=DEFAULT_BONES)
+                            val_loss_skate = foot_skating_loss(
+                                x_gen,
+                                contact_prob=contact_prob,
+                                joint_config=joint_config,
+                                fps=args.fps,
+                            )
+                            val_loss_smooth = smoothness_loss(x_gen, fps=args.fps)
+                            val_loss_instab = instability_loss(
+                                x_gen=x_gen,
+                                x_gt=x_gt,
+                                y=y,
+                                fps=args.fps,
+                                window_sec=args.instab_window_sec,
+                                joint_config=joint_config,
+                            )
+                        else:
+                            z = x.new_zeros(())
+                            val_loss_bone = z
+                            val_loss_skate = z
+                            val_loss_smooth = z
+                            val_loss_instab = z
+                        val_total = (
+                            out["loss_total"]
+                            + args.lambda_bone * val_loss_bone
+                            + args.lambda_skate * val_loss_skate
+                            + args.lambda_smooth * val_loss_smooth
+                            + args.lambda_instab * val_loss_instab
+                        )
+                    val_total_sum += float(val_total.item())
                     val_diff_sum += float(out["loss_diff"].item())
                     val_cls_sum += float(out["loss_cls"].item())
+                    val_bone_sum += float(val_loss_bone.item())
+                    val_skate_sum += float(val_loss_skate.item())
+                    val_smooth_sum += float(val_loss_smooth.item())
+                    val_instab_sum += float(val_loss_instab.item())
                     val_n += 1
             model.train()
             avg_val_total = _sync_mean(val_total_sum / max(val_n, 1), device)
             avg_val_diff = _sync_mean(val_diff_sum / max(val_n, 1), device)
             avg_val_cls = _sync_mean(val_cls_sum / max(val_n, 1), device)
+            avg_val_bone = _sync_mean(val_bone_sum / max(val_n, 1), device)
+            avg_val_skate = _sync_mean(val_skate_sum / max(val_n, 1), device)
+            avg_val_smooth = _sync_mean(val_smooth_sum / max(val_n, 1), device)
+            avg_val_instab = _sync_mean(val_instab_sum / max(val_n, 1), device)
 
         metrics = {
             "train_loss_total": avg_train_total,
             "train_loss_diff": avg_train_diff,
             "train_loss_cls": avg_train_cls,
+            "train_loss_bone": avg_train_bone,
+            "train_loss_skate": avg_train_skate,
+            "train_loss_smooth": avg_train_smooth,
+            "train_loss_instab": avg_train_instab,
         }
-        if avg_val_total is not None and avg_val_diff is not None and avg_val_cls is not None:
+        if (
+            avg_val_total is not None
+            and avg_val_diff is not None
+            and avg_val_cls is not None
+            and avg_val_bone is not None
+            and avg_val_skate is not None
+            and avg_val_smooth is not None
+            and avg_val_instab is not None
+        ):
             metrics["val_loss_total"] = avg_val_total
             metrics["val_loss_diff"] = avg_val_diff
             metrics["val_loss_cls"] = avg_val_cls
+            metrics["val_loss_bone"] = avg_val_bone
+            metrics["val_loss_skate"] = avg_val_skate
+            metrics["val_loss_smooth"] = avg_val_smooth
+            metrics["val_loss_instab"] = avg_val_instab
         _print_epoch_summary(
             "Stage3",
             epoch + 1,
@@ -715,9 +990,17 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     "best_train_loss_total": avg_train_total,
                     "best_train_loss_diff": avg_train_diff,
                     "best_train_loss_cls": avg_train_cls,
+                    "best_train_loss_bone": avg_train_bone,
+                    "best_train_loss_skate": avg_train_skate,
+                    "best_train_loss_smooth": avg_train_smooth,
+                    "best_train_loss_instab": avg_train_instab,
                     "best_val_loss_total": avg_val_total,
                     "best_val_loss_diff": avg_val_diff,
                     "best_val_loss_cls": avg_val_cls,
+                    "best_val_loss_bone": avg_val_bone,
+                    "best_val_loss_skate": avg_val_skate,
+                    "best_val_loss_smooth": avg_val_smooth,
+                    "best_val_loss_instab": avg_val_instab,
                     "best_epoch": epoch + 1,
                 },
             )
@@ -734,6 +1017,10 @@ def main() -> None:
     args = parse_args()
     if args.val_split < 0.0 or args.val_split >= 1.0:
         raise ValueError("--val_split must be in [0.0, 1.0).")
+    if args.stage == 3 and args.fps <= 0:
+        raise ValueError("--fps must be positive.")
+    if args.stage == 3 and (args.instab_window_sec < 2.0 or args.instab_window_sec > 4.0):
+        raise ValueError("--instab-window-sec must be in [2.0, 4.0].")
     distributed, local_rank, world_size = _init_distributed(args)
     _setup_logging()
     set_seed(args.seed)

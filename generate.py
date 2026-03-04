@@ -140,7 +140,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_sensor_norm", action="store_true")
     parser.add_argument("--classify", action="store_true")
     parser.add_argument("--save_gif", action="store_true")
-    parser.add_argument("--gif_dir", type=str, default="outputs/gifs")
+    parser.add_argument("--gif_dir", type=str, default="outputs/results")
     parser.add_argument("--gif_prefix", type=str, default="sample")
     parser.add_argument("--gif_fps", type=int, default=12)
     parser.add_argument("--gif_index", type=int, default=0, help="Batch index to save as a single GIF.")

@@ -20,23 +20,45 @@ from diffusion_model.util import assert_shape, build_adjacency_matrix, sinusoida
 class GraphEncoder(nn.Module):
     """Graph encoder mapping skeleton coordinates to joint-aware latent tokens."""
 
-    def __init__(self, input_dim: int = 3, latent_dim: int = 256, num_joints: int = 32, depth: int = 4) -> None:
+    def __init__(
+        self,
+        input_dim: int = 3,
+        latent_dim: int = 256,
+        num_joints: int = 32,
+        depth: int = 4,
+        gait_metrics_dim: int = 0,
+    ) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.num_joints = num_joints
+        self.gait_metrics_dim = gait_metrics_dim
         self.in_proj = nn.Linear(input_dim, latent_dim)
+        if gait_metrics_dim > 0:
+            self.gait_proj = nn.Sequential(
+                nn.Linear(gait_metrics_dim, latent_dim),
+                nn.GELU(),
+                nn.Linear(latent_dim, latent_dim),
+            )
+        else:
+            self.gait_proj = None
         self.graph_blocks = nn.ModuleList(
             [GraphBlock(dim=latent_dim, num_heads=8, num_joints=num_joints, use_pyg=True) for _ in range(depth)]
         )
         self.temporal_blocks = nn.ModuleList([TemporalConvBlock(dim=latent_dim) for _ in range(depth)])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, gait_metrics: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Encode x with shape [B, T, J, 3] into z0 with shape [B, T, J, latent_dim]."""
         assert_shape(x, [None, None, self.num_joints, self.input_dim], "GraphEncoder.x")
         adjacency = build_adjacency_matrix(num_joints=self.num_joints, device=x.device)
         edge_index = build_edge_index(self.num_joints, x.device) if HAS_TORCH_GEOMETRIC else None
         z = self.in_proj(x)
+        if self.gait_proj is not None:
+            if gait_metrics is None:
+                raise ValueError("gait_metrics must be provided when gait_metrics_dim > 0")
+            assert_shape(gait_metrics, [x.shape[0], self.gait_metrics_dim], "GraphEncoder.gait_metrics")
+            gait_bias = self.gait_proj(gait_metrics).unsqueeze(1).unsqueeze(1)
+            z = z + gait_bias
         for g_block, t_block in zip(self.graph_blocks, self.temporal_blocks):
             z = g_block(z, adjacency=adjacency, edge_index=edge_index)
             z = t_block(z)
@@ -75,10 +97,11 @@ class GraphDecoder(nn.Module):
 class GraphDenoiserMasked(nn.Module):
     """Adjacency-masked graph denoiser with cross-attention sensor conditioning."""
 
-    def __init__(self, latent_dim: int = 256, num_joints: int = 32, depth: int = 6) -> None:
+    def __init__(self, latent_dim: int = 256, num_joints: int = 32, depth: int = 6, gait_metrics_dim: int = 0) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.num_joints = num_joints
+        self.gait_metrics_dim = gait_metrics_dim
         self.time_mlp = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.GELU(),
@@ -89,6 +112,14 @@ class GraphDenoiserMasked(nn.Module):
             nn.GELU(),
             nn.Linear(latent_dim, latent_dim),
         )
+        if gait_metrics_dim > 0:
+            self.gait_proj = nn.Sequential(
+                nn.Linear(gait_metrics_dim, latent_dim),
+                nn.GELU(),
+                nn.Linear(latent_dim, latent_dim),
+            )
+        else:
+            self.gait_proj = None
         self.blocks = nn.ModuleList(
             [GraphBlock(dim=latent_dim, num_heads=8, num_joints=num_joints, use_pyg=True) for _ in range(depth)]
         )
@@ -104,6 +135,7 @@ class GraphDenoiserMasked(nn.Module):
         sensor_tokens: Optional[torch.Tensor] = None,
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
+        gait_metrics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict epsilon for z_t with optional temporal sensor tokens [B,T,D]."""
         assert_shape(z_t, [None, None, self.num_joints, self.latent_dim], "GraphDenoiserMasked.z_t")
@@ -116,6 +148,10 @@ class GraphDenoiserMasked(nn.Module):
             assert_shape(h_tokens, [z_t.shape[0], z_t.shape[1], self.latent_dim], "GraphDenoiserMasked.h_tokens")
         if h_global is not None:
             assert_shape(h_global, [z_t.shape[0], self.latent_dim], "GraphDenoiserMasked.h_global")
+        if self.gait_proj is not None:
+            if gait_metrics is None:
+                raise ValueError("gait_metrics must be provided when gait_metrics_dim > 0")
+            assert_shape(gait_metrics, [z_t.shape[0], self.gait_metrics_dim], "GraphDenoiserMasked.gait_metrics")
 
         adjacency = build_adjacency_matrix(num_joints=self.num_joints, device=z_t.device)
         edge_index = build_edge_index(self.num_joints, z_t.device) if HAS_TORCH_GEOMETRIC else None
@@ -123,6 +159,13 @@ class GraphDenoiserMasked(nn.Module):
         t_emb = sinusoidal_timestep_embedding(t, self.latent_dim)
         t_emb = self.time_mlp(t_emb).unsqueeze(1).unsqueeze(1)
         x = z_t + t_emb
+
+        gait_tokens = None
+        if self.gait_proj is not None and gait_metrics is not None:
+            gait_embed = self.gait_proj(gait_metrics)
+            gait_tokens = gait_embed.unsqueeze(1).expand(-1, z_t.shape[1], -1)
+            h_global = gait_embed if h_global is None else (h_global + gait_embed)
+            h_tokens = gait_tokens if h_tokens is None else (h_tokens + gait_tokens)
 
         if h_global is not None:
             g = self.global_cond_proj(h_global).unsqueeze(1).unsqueeze(1)

@@ -7,48 +7,33 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 try:
     from tqdm.auto import tqdm
 except Exception:
     tqdm = None
 
-from diffusion_model.dataset import create_dataloader, create_dataset
+from diffusion_model.dataset import create_dataloader, create_dataset, parse_subject_list, split_train_val_dataset
+from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM, GAIT_METRIC_NAMES
 from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model
 from diffusion_model.model_loader import load_checkpoint, save_checkpoint
-from diffusion_model.util import (
-    DEFAULT_BONES,
-    DEFAULT_FPS,
-    DEFAULT_JOINTS,
-    DEFAULT_LATENT_DIM,
-    DEFAULT_NUM_CLASSES,
-    DEFAULT_TIMESTEPS,
-    DEFAULT_WINDOW,
-    bone_length_loss,
-    compute_bos_proxy,
-    compute_com,
-    foot_skating_loss,
-    infer_binary_fall_labels,
-    instability_loss,
-    JointIndexConfig,
-    make_joint_index_config,
-    run_biomech_sanity_checks,
-    set_seed,
-    smoothness_loss,
-    soft_contact_prob,
-    stability_margin_soft,
-    temporal_derivatives,
-)
+from diffusion_model.sensor_model import IMU_FEATURE_NAMES
+from diffusion_model.training_eval import evaluate_stage1, evaluate_stage2, evaluate_stage3, save_run_manifest, write_history
+from diffusion_model.util import DEFAULT_FPS, DEFAULT_JOINTS, DEFAULT_LATENT_DIM, DEFAULT_NUM_CLASSES, DEFAULT_TIMESTEPS, DEFAULT_WINDOW, set_seed
 
 
 LOGGER = logging.getLogger("train")
+DEFAULT_TRAIN_SUBJECTS = [
+    28, 29, 30, 31, 33, 35, 38, 39, 32, 36, 37, 43, 44, 45, 46, 49, 51, 56, 57, 58, 59, 61, 62
+]
 
 
 def _is_distributed() -> bool:
@@ -69,6 +54,8 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 def _sync_mean(value: float, device: torch.device) -> float:
     """Average scalar across ranks when DDP is active."""
+    ''''Suppose GPU 0 gets train loss 0.9 and GPU 1 gets 1.1.
+    Then this function averages them to 1.0.'''
     if not _is_distributed():
         return value
     t = torch.tensor([value], dtype=torch.float32, device=device)
@@ -175,15 +162,18 @@ def _print_run_summary(args: argparse.Namespace, device: torch.device) -> None:
         LOGGER.info("skeleton_folder=%s", args.skeleton_folder)
         LOGGER.info("hip_folder=%s", args.hip_folder)
         LOGGER.info("wrist_folder=%s", args.wrist_folder)
+        LOGGER.info("gait_cache_dir=%s", args.gait_cache_dir)
+    LOGGER.info("Gait metrics dim: %s", args.gait_metrics_dim)
+    LOGGER.info("Gait metric names: %s", ", ".join(GAIT_METRIC_NAMES))
+    LOGGER.info("IMU feature names: %s", ", ".join(IMU_FEATURE_NAMES))
     if args.stage == 3:
         LOGGER.info(
-            "Stage3 biomech: lambda_bone=%s lambda_skate=%s lambda_smooth=%s lambda_instab=%s window_sec=%s fps=%s",
-            args.lambda_bone,
-            args.lambda_skate,
-            args.lambda_smooth,
-            args.lambda_instab,
-            args.instab_window_sec,
+            "Stage3 objective: lambda_cls=%s lambda_motion=%s lambda_gait=%s fps=%s sample_steps=%s",
+            args.lambda_cls,
+            args.lambda_motion,
+            args.lambda_gait,
             args.fps,
+            args.sample_steps,
         )
 
 
@@ -201,20 +191,12 @@ def _print_loader_summary(loader: torch.utils.data.DataLoader) -> None:
     )
 
 
-def _split_train_val_dataset(dataset: Dataset, val_split: float, seed: int) -> Tuple[Dataset, Optional[Dataset]]:
-    """Deterministically split dataset into train/val subsets."""
-    if val_split <= 0.0:
-        return dataset, None
-    total = len(dataset)
-    if total < 2:
-        raise ValueError("Validation split requires at least 2 samples.")
-    n_val = max(1, int(round(total * val_split)))
-    n_val = min(n_val, total - 1)
-    g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(total, generator=g).tolist()
-    train_idx = perm[:-n_val]
-    val_idx = perm[-n_val:]
-    return Subset(dataset, train_idx), Subset(dataset, val_idx)
+def _make_run_dir(args: argparse.Namespace) -> Path:
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    run_name = args.run_name or f"stage{args.stage}_{stamp}"
+    run_dir = Path(args.report_dir) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 
 def _build_train_val_loaders(
@@ -223,7 +205,14 @@ def _build_train_val_loaders(
     distributed: bool,
 ) -> Tuple[torch.utils.data.DataLoader, Optional[torch.utils.data.DataLoader]]:
     """Create train/val dataloaders from one dataset using deterministic split."""
-    train_dataset, val_dataset = _split_train_val_dataset(dataset, val_split=args.val_split, seed=args.seed)
+    train_subjects = parse_subject_list(args.train_subjects) if args.train_subjects else None
+    train_dataset, val_dataset = split_train_val_dataset(
+        dataset,
+        val_split=args.val_split,
+        seed=args.seed,
+        train_subjects=train_subjects,
+        logger=LOGGER if _is_main_process() else None,
+    )
 
     train_sampler = None
     if distributed:
@@ -245,6 +234,8 @@ def _build_train_val_loaders(
         wrist_folder=args.wrist_folder or None,
         stride=args.stride,
         normalize_sensors=not args.disable_sensor_norm,
+        gait_cache_dir=args.gait_cache_dir or None,
+        disable_gait_cache=args.disable_gait_cache,
         num_workers=args.num_workers,
         pin_memory=not args.no_pin_memory,
         sampler=train_sampler,
@@ -276,6 +267,8 @@ def _build_train_val_loaders(
         wrist_folder=args.wrist_folder or None,
         stride=args.stride,
         normalize_sensors=not args.disable_sensor_norm,
+        gait_cache_dir=args.gait_cache_dir or None,
+        disable_gait_cache=args.disable_gait_cache,
         num_workers=args.num_workers,
         pin_memory=not args.no_pin_memory,
         sampler=val_sampler,
@@ -294,45 +287,6 @@ def _print_epoch_summary(stage_name: str, epoch: int, total_epochs: int, metrics
     LOGGER.info("[%s] epoch=%s/%s %s epoch_time=%.1fs", stage_name, epoch, total_epochs, items, sec)
 
 
-def _parse_index_list(raw: str) -> Optional[Tuple[int, ...]]:
-    """Parse comma-separated integer list from CLI."""
-    if raw.strip() == "":
-        return None
-    return tuple(int(part.strip()) for part in raw.split(",") if part.strip() != "")
-
-
-def _validate_joint_override(idx: Optional[int], name: str, joints: int) -> None:
-    if idx is None:
-        return
-    if idx < 0 or idx >= joints:
-        raise ValueError(
-            f"Invalid {name}={idx} for joints={joints}. "
-            "Override with valid indices via --left-ankle-idx / --right-ankle-idx / --left-foot-idx / --right-foot-idx / --pelvis-idx."
-        )
-
-
-def _resolve_joint_config_from_args(args: argparse.Namespace) -> JointIndexConfig:
-    """Build joint index config from defaults + optional CLI overrides."""
-    torso_indices = _parse_index_list(args.torso_indices)
-    config = make_joint_index_config(
-        left_ankle_idx=args.left_ankle_idx,
-        right_ankle_idx=args.right_ankle_idx,
-        left_foot_idx=args.left_foot_idx,
-        right_foot_idx=args.right_foot_idx,
-        pelvis_idx=args.pelvis_idx,
-        torso_indices=torso_indices,
-    )
-    _validate_joint_override(config.left_ankle_idx, "left_ankle_idx", args.joints)
-    _validate_joint_override(config.right_ankle_idx, "right_ankle_idx", args.joints)
-    _validate_joint_override(config.left_foot_idx, "left_foot_idx", args.joints)
-    _validate_joint_override(config.right_foot_idx, "right_foot_idx", args.joints)
-    _validate_joint_override(config.pelvis_idx, "pelvis_idx", args.joints)
-    if config.torso_indices is not None:
-        for idx in config.torso_indices:
-            _validate_joint_override(idx, "torso_indices", args.joints)
-    return config
-
-
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description="Train 3-stage joint-aware latent diffusion")
@@ -341,6 +295,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skeleton_folder", type=str, default="")
     parser.add_argument("--hip_folder", type=str, default="")
     parser.add_argument("--wrist_folder", type=str, default="")
+    parser.add_argument("--gait_cache_dir", type=str, default="")
+    parser.add_argument("--disable_gait_cache", action="store_true")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--ddp", action="store_true", help="Enable DistributedDataParallel (or auto-enabled under torchrun).")
     parser.add_argument("--num_workers", type=int, default=4)
@@ -349,42 +305,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default="checkpoints")
+    parser.add_argument("--report_dir", type=str, default="outputs/training_reports")
+    parser.add_argument("--run_name", type=str, default="")
     parser.add_argument("--stage1_ckpt", type=str, default="")
     parser.add_argument("--stage2_ckpt", type=str, default="")
     parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW)
     parser.add_argument("--joints", type=int, default=DEFAULT_JOINTS)
     parser.add_argument("--latent_dim", type=int, default=DEFAULT_LATENT_DIM)
+    parser.add_argument(
+        "--gait_metrics_dim",
+        type=int,
+        default=DEFAULT_GAIT_METRICS_DIM,
+        help="Number of scalar gait metrics provided per sample. Defaults to the fixed auto-computed gait-summary size.",
+    )
     parser.add_argument("--num_classes", type=int, default=DEFAULT_NUM_CLASSES)
     parser.add_argument("--stride", type=int, default=30)
     parser.add_argument("--disable_sensor_norm", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--val_split", type=float, default=0.1, help="Fraction of data used for validation (0 disables validation).")
-    parser.add_argument("--log_every", type=int, default=20, help="Plain progress print interval (steps) when tqdm is not interactive.")
-    parser.add_argument("--lambda-bone", type=float, default=0.0, help="Weight for bone-length consistency loss (Stage-3 only).")
-    parser.add_argument("--lambda-skate", type=float, default=0.0, help="Weight for soft foot skating loss (Stage-3 only).")
-    parser.add_argument("--lambda-smooth", type=float, default=0.0, help="Weight for smoothness/acceleration loss (Stage-3 only).")
-    parser.add_argument("--lambda-instab", type=float, default=0.0, help="Weight for activity-aware instability loss (Stage-3 only).")
-    parser.add_argument("--instab-window-sec", type=float, default=3.0, help="Instability window length in seconds (recommended 2.0-4.0).")
-    parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="Skeleton frame-rate for temporal losses (Stage-3 only).")
-    parser.add_argument("--left-ankle-idx", type=int, default=None, help="Optional override for left ankle joint index.")
-    parser.add_argument("--right-ankle-idx", type=int, default=None, help="Optional override for right ankle joint index.")
-    parser.add_argument("--left-foot-idx", type=int, default=None, help="Optional override for left foot joint index.")
-    parser.add_argument("--right-foot-idx", type=int, default=None, help="Optional override for right foot joint index.")
-    parser.add_argument("--pelvis-idx", type=int, default=None, help="Optional override for pelvis joint index.")
     parser.add_argument(
-        "--torso-indices",
+        "--train_subjects",
         type=str,
-        default="",
-        help="Optional comma-separated torso joint indices for CoM weighting (e.g., '0,1,2,3,26').",
+        default=",".join(str(item) for item in DEFAULT_TRAIN_SUBJECTS),
+        help="Comma-separated subject ids used for training; all other subjects go to validation.",
     )
-    parser.add_argument("--debug-losses", action="store_true", help="Run one Stage-3 batch and print biomechanics diagnostics.")
+    parser.add_argument("--log_every", type=int, default=20, help="Plain progress print interval (steps) when tqdm is not interactive.")
+    parser.add_argument("--lambda_cls", type=float, default=0.1, help="Weight for classification loss (Stage-3 only).")
+    parser.add_argument("--lambda_motion", type=float, default=1.0, help="Weight for motion regularization loss (Stage-3 only).")
+    parser.add_argument("--lambda-gait", type=float, default=1.0, help="Weight for generated-vs-real gait-summary MSE loss (Stage-3 only).")
+    parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="Skeleton frame-rate for temporal losses (Stage-3 only).")
+    parser.add_argument("--sample_steps", type=int, default=50, help="DDIM sampling steps for evaluation/generation.")
+    parser.add_argument("--sampler", type=str, default="ddpm", choices=["ddim", "ddpm"], help="Reverse-process sampler for evaluation/generation.")
+    parser.add_argument("--eval_every_stage1", type=int, default=5, help="Epoch interval for Stage-1 evaluation artifacts.")
+    parser.add_argument("--eval_every_stage2", type=int, default=10, help="Epoch interval for Stage-2 evaluation artifacts.")
+    parser.add_argument("--eval_every_stage3", type=int, default=5, help="Epoch interval for Stage-3 evaluation artifacts.")
+    parser.add_argument("--max_train_batches", type=int, default=0, help="Cap batches per training epoch for smoke runs (0 disables).")
+    parser.add_argument("--max_val_batches", type=int, default=0, help="Cap batches per validation epoch for smoke runs (0 disables).")
     return parser.parse_args()
 
 
 def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bool, local_rank: int) -> None:
     """Train stage 1 model."""
-    model = Stage1Model(latent_dim=args.latent_dim, num_joints=args.joints, timesteps=args.timesteps).to(device)
+    model = Stage1Model(
+        latent_dim=args.latent_dim,
+        num_joints=args.joints,
+        timesteps=args.timesteps,
+        gait_metrics_dim=args.gait_metrics_dim,
+    ).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     dataset = create_dataset(
@@ -397,9 +365,23 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         wrist_folder=args.wrist_folder or None,
         stride=args.stride,
         normalize_sensors=not args.disable_sensor_norm,
+        gait_cache_dir=args.gait_cache_dir or None,
+        disable_gait_cache=args.disable_gait_cache,
     )
     train_loader, val_loader = _build_train_val_loaders(args, dataset=dataset, distributed=distributed)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    if _is_main_process():
+        save_run_manifest(
+            Path(args.run_dir),
+            args,
+            device,
+            runtime={
+                "optimizer": optimizer.__class__.__name__,
+                "scheduler": "none",
+                "sensor_modality": "accelerometer only",
+                "sensor_locations": [Path(args.hip_folder).name if args.hip_folder else "", Path(args.wrist_folder).name if args.wrist_folder else ""],
+            },
+        )
     model.train()
     use_amp = (not args.no_amp) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -414,6 +396,8 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         )
     os.makedirs(args.save_dir, exist_ok=True)
     best_loss = float("inf")
+    history: list[dict[str, float]] = []
+    run_dir = Path(args.run_dir)
 
     for epoch in range(args.epochs):
         t0 = time.time()
@@ -424,11 +408,14 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         if distributed and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
         pbar = _iter_with_progress(train_loader, f"Stage1 Epoch {epoch + 1}/{args.epochs}", enabled=progress_enabled)
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            if args.max_train_batches > 0 and batch_idx >= args.max_train_batches:
+                break
             x = batch["skeleton"].to(device)
+            gait_metrics = batch["gait_metrics"].to(device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                out = model(x)
+                out = model(x, gait_metrics=gait_metrics)
                 loss = out["loss_diff"]
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -461,10 +448,13 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
             val_sum = 0.0
             val_n = 0
             with torch.no_grad():
-                for batch in val_loader:
+                for batch_idx, batch in enumerate(val_loader):
+                    if args.max_val_batches > 0 and batch_idx >= args.max_val_batches:
+                        break
                     x = batch["skeleton"].to(device)
+                    gait_metrics = batch["gait_metrics"].to(device)
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                        out = model(x)
+                        out = model(x, gait_metrics=gait_metrics)
                         loss = out["loss_diff"]
                     val_sum += float(loss.item())
                     val_n += 1
@@ -475,7 +465,22 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         metrics = {"train_loss_diff": avg_train_loss}
         if avg_val_loss is not None:
             metrics["val_loss_diff"] = avg_val_loss
+        history.append({"epoch": float(epoch + 1), **metrics})
+        if _is_main_process():
+            write_history(run_dir, "stage1", history)
         _print_epoch_summary("Stage1", epoch + 1, args.epochs, metrics, time.time() - t0)
+
+        if _is_main_process() and (epoch + 1) % max(1, args.eval_every_stage1) == 0:
+            model.eval()
+            eval_loader = val_loader or train_loader
+            evaluate_stage1(
+                _unwrap_model(model),
+                eval_loader,
+                device,
+                run_dir / "stage1" / f"epoch_{epoch + 1:03d}",
+                timestep_values=[0, 50, 100, 200, 300, 400, args.timesteps - 1],
+            )
+            model.train()
 
         monitor_loss = avg_val_loss if avg_val_loss is not None else avg_train_loss
         if _is_main_process() and monitor_loss < best_loss:
@@ -488,6 +493,9 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
                     "best_monitor_loss": best_loss,
                     "best_monitor_name": "val_loss_diff" if avg_val_loss is not None else "train_loss_diff",
                     "best_epoch": epoch + 1,
+                    "gait_metric_names": list(GAIT_METRIC_NAMES),
+                    "imu_feature_names": list(IMU_FEATURE_NAMES),
+                    "run_dir": args.run_dir,
                 },
             )
             LOGGER.info("[Stage1] new best checkpoint: %s (epoch=%s monitor_loss=%.6f)", best_ckpt, epoch + 1, best_loss)
@@ -502,11 +510,21 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
     """Train stage 2 model with frozen stage-1 encoder."""
     if not args.stage1_ckpt:
         raise ValueError("Stage 2 requires --stage1_ckpt (pretrained Stage 1 encoder).")
-    stage1 = Stage1Model(latent_dim=args.latent_dim, num_joints=args.joints, timesteps=args.timesteps).to(device)
+    stage1 = Stage1Model(
+        latent_dim=args.latent_dim,
+        num_joints=args.joints,
+        timesteps=args.timesteps,
+        gait_metrics_dim=args.gait_metrics_dim,
+    ).to(device)
     if args.stage1_ckpt:
         load_checkpoint(args.stage1_ckpt, stage1, strict=True)
 
-    model = Stage2Model(encoder=stage1.encoder, latent_dim=args.latent_dim, num_joints=args.joints).to(device)
+    model = Stage2Model(
+        encoder=stage1.encoder,
+        latent_dim=args.latent_dim,
+        num_joints=args.joints,
+        gait_metrics_dim=args.gait_metrics_dim,
+    ).to(device)
     assert all(not p.requires_grad for p in model.encoder.parameters()), "stage2 encoder must be frozen"
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -520,10 +538,24 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         wrist_folder=args.wrist_folder or None,
         stride=args.stride,
         normalize_sensors=not args.disable_sensor_norm,
+        gait_cache_dir=args.gait_cache_dir or None,
+        disable_gait_cache=args.disable_gait_cache,
     )
     train_loader, val_loader = _build_train_val_loaders(args, dataset=dataset, distributed=distributed)
     trainable_params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
     optimizer = optim.Adam(trainable_params, lr=args.lr)
+    if _is_main_process():
+        save_run_manifest(
+            Path(args.run_dir),
+            args,
+            device,
+            runtime={
+                "optimizer": optimizer.__class__.__name__,
+                "scheduler": "none",
+                "sensor_modality": "accelerometer only",
+                "sensor_locations": [Path(args.hip_folder).name if args.hip_folder else "", Path(args.wrist_folder).name if args.wrist_folder else ""],
+            },
+        )
     model.train()
     use_amp = (not args.no_amp) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -538,6 +570,8 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         )
     os.makedirs(args.save_dir, exist_ok=True)
     best_loss = float("inf")
+    history: list[dict[str, float]] = []
+    run_dir = Path(args.run_dir)
 
     for epoch in range(args.epochs):
         t0 = time.time()
@@ -548,13 +582,21 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         if distributed and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
         pbar = _iter_with_progress(train_loader, f"Stage2 Epoch {epoch + 1}/{args.epochs}", enabled=progress_enabled)
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            if args.max_train_batches > 0 and batch_idx >= args.max_train_batches:
+                break
             x = batch["skeleton"].to(device)
             a_hip_stream = batch["A_hip"].to(device)
             a_wrist_stream = batch["A_wrist"].to(device)
+            gait_metrics = batch["gait_metrics"].to(device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                out = model(x=x, a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
+                out = model(
+                    x=x,
+                    a_hip_stream=a_hip_stream,
+                    a_wrist_stream=a_wrist_stream,
+                    gait_metrics=gait_metrics,
+                )
                 loss = out["loss_align"]
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -587,12 +629,20 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
             val_sum = 0.0
             val_n = 0
             with torch.no_grad():
-                for batch in val_loader:
+                for batch_idx, batch in enumerate(val_loader):
+                    if args.max_val_batches > 0 and batch_idx >= args.max_val_batches:
+                        break
                     x = batch["skeleton"].to(device)
                     a_hip_stream = batch["A_hip"].to(device)
                     a_wrist_stream = batch["A_wrist"].to(device)
+                    gait_metrics = batch["gait_metrics"].to(device)
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                        out = model(x=x, a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
+                        out = model(
+                            x=x,
+                            a_hip_stream=a_hip_stream,
+                            a_wrist_stream=a_wrist_stream,
+                            gait_metrics=gait_metrics,
+                        )
                         loss = out["loss_align"]
                     val_sum += float(loss.item())
                     val_n += 1
@@ -603,7 +653,22 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         metrics = {"train_loss_align": avg_train_loss}
         if avg_val_loss is not None:
             metrics["val_loss_align"] = avg_val_loss
+        history.append({"epoch": float(epoch + 1), **metrics})
+        if _is_main_process():
+            write_history(run_dir, "stage2", history)
         _print_epoch_summary("Stage2", epoch + 1, args.epochs, metrics, time.time() - t0)
+
+        if _is_main_process() and (epoch + 1) % max(1, args.eval_every_stage2) == 0:
+            model.eval()
+            evaluate_stage2(
+                stage1,
+                _unwrap_model(model),
+                val_loader or train_loader,
+                device,
+                run_dir / "stage2" / f"epoch_{epoch + 1:03d}",
+                epoch=epoch + 1,
+            )
+            model.train()
 
         monitor_loss = avg_val_loss if avg_val_loss is not None else avg_train_loss
         if _is_main_process() and monitor_loss < best_loss:
@@ -616,6 +681,9 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
                     "best_monitor_loss": best_loss,
                     "best_monitor_name": "val_loss_align" if avg_val_loss is not None else "train_loss_align",
                     "best_epoch": epoch + 1,
+                    "gait_metric_names": list(GAIT_METRIC_NAMES),
+                    "imu_feature_names": list(IMU_FEATURE_NAMES),
+                    "run_dir": args.run_dir,
                 },
             )
             LOGGER.info("[Stage2] new best checkpoint: %s (epoch=%s monitor_loss=%.6f)", best_ckpt, epoch + 1, best_loss)
@@ -632,11 +700,21 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         raise ValueError("Stage 3 requires --stage1_ckpt (pretrained Stage 1 model).")
     if not args.stage2_ckpt:
         raise ValueError("Stage 3 requires --stage2_ckpt (pretrained Stage 2 aligner).")
-    stage1 = Stage1Model(latent_dim=args.latent_dim, num_joints=args.joints, timesteps=args.timesteps).to(device)
+    stage1 = Stage1Model(
+        latent_dim=args.latent_dim,
+        num_joints=args.joints,
+        timesteps=args.timesteps,
+        gait_metrics_dim=args.gait_metrics_dim,
+    ).to(device)
     if args.stage1_ckpt:
         load_checkpoint(args.stage1_ckpt, stage1, strict=True)
 
-    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=args.latent_dim, num_joints=args.joints).to(device)
+    stage2 = Stage2Model(
+        encoder=stage1.encoder,
+        latent_dim=args.latent_dim,
+        num_joints=args.joints,
+        gait_metrics_dim=args.gait_metrics_dim,
+    ).to(device)
     if args.stage2_ckpt:
         load_checkpoint(args.stage2_ckpt, stage2, strict=True)
     stage2.eval()
@@ -649,12 +727,25 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         num_joints=args.joints,
         num_classes=args.num_classes,
         timesteps=args.timesteps,
+        gait_metrics_dim=args.gait_metrics_dim,
     ).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     trainable_params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
     optimizer = optim.Adam(trainable_params, lr=args.lr)
+    if _is_main_process():
+        save_run_manifest(
+            Path(args.run_dir),
+            args,
+            device,
+            runtime={
+                "optimizer": optimizer.__class__.__name__,
+                "scheduler": "none",
+                "sensor_modality": "accelerometer only",
+                "sensor_locations": [Path(args.hip_folder).name if args.hip_folder else "", Path(args.wrist_folder).name if args.wrist_folder else ""],
+            },
+        )
     dataset = create_dataset(
         dataset_path=args.dataset_path or None,
         window=args.window,
@@ -665,16 +756,14 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         wrist_folder=args.wrist_folder or None,
         stride=args.stride,
         normalize_sensors=not args.disable_sensor_norm,
+        gait_cache_dir=args.gait_cache_dir or None,
+        disable_gait_cache=args.disable_gait_cache,
     )
     train_loader, val_loader = _build_train_val_loaders(args, dataset=dataset, distributed=distributed)
     model.train()
     use_amp = (not args.no_amp) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
-    joint_config = _resolve_joint_config_from_args(args)
-    use_biomech_losses = any(
-        v > 0.0 for v in (args.lambda_bone, args.lambda_skate, args.lambda_smooth, args.lambda_instab)
-    ) or args.debug_losses
     _print_loader_summary(train_loader)
     if val_loader is not None and _is_main_process():
         LOGGER.info(
@@ -685,13 +774,15 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         )
     os.makedirs(args.save_dir, exist_ok=True)
     best_loss = float("inf")
-    debug_printed = False
-
+    history: list[dict[str, float]] = []
+    run_dir = Path(args.run_dir)
     for epoch in range(args.epochs):
         t0 = time.time()
         sum_total = 0.0
         sum_diff = 0.0
         sum_cls = 0.0
+        sum_gait = 0.0
+        sum_motion = 0.0
         sum_bone = 0.0
         sum_skate = 0.0
         sum_smooth = 0.0
@@ -702,17 +793,21 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         if distributed and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
         pbar = _iter_with_progress(train_loader, f"Stage3 Epoch {epoch + 1}/{args.epochs}", enabled=progress_enabled)
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            if args.max_train_batches > 0 and batch_idx >= args.max_train_batches:
+                break
             x = batch["skeleton"].to(device)
             y = batch["label"].to(device)
             a_hip_stream = batch["A_hip"].to(device)
             a_wrist_stream = batch["A_wrist"].to(device)
+            gait_metrics = batch["gait_metrics"].to(device)
 
             # Stage2 is a fixed conditioner in stage3; avoid autograd through aligner.
             with torch.no_grad():
                 h_tokens, h_global = stage2.aligner(
                     a_hip_stream=a_hip_stream,
                     a_wrist_stream=a_wrist_stream,
+                    gait_metrics=gait_metrics,
                 )
 
             optimizer.zero_grad(set_to_none=True)
@@ -722,56 +817,32 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     y=y,
                     h_tokens=h_tokens,
                     h_global=h_global,
+                    gait_metrics=gait_metrics,
+                    fps=args.fps,
                 )
-                x_gen = out["x_hat"].float()
-                x_gt = x.float() if x is not None else None
-                if use_biomech_losses:
-                    contact_prob = soft_contact_prob(x_gen, joint_config=joint_config, fps=args.fps)
-                    loss_bone = bone_length_loss(x_gen, bones=DEFAULT_BONES)
-                    loss_skate = foot_skating_loss(x_gen, contact_prob=contact_prob, joint_config=joint_config, fps=args.fps)
-                    loss_smooth = smoothness_loss(x_gen, fps=args.fps)
-                    loss_instab = instability_loss(
-                        x_gen=x_gen,
-                        x_gt=x_gt,
-                        y=y,
-                        fps=args.fps,
-                        window_sec=args.instab_window_sec,
-                        joint_config=joint_config,
-                    )
-                else:
-                    z = x.new_zeros(())
-                    loss_bone = z
-                    loss_skate = z
-                    loss_smooth = z
-                    loss_instab = z
-
-                loss = (
-                    out["loss_total"]
-                    + args.lambda_bone * loss_bone
-                    + args.lambda_skate * loss_skate
-                    + args.lambda_smooth * loss_smooth
-                    + args.lambda_instab * loss_instab
-                )
+                loss_diff = out["loss_diff"]
+                loss_cls = out["loss_cls"]
+                loss_gait = torch.nn.functional.mse_loss(out["gait_gen"], gait_metrics)
+                loss_motion = out["loss_motion"]
+                loss = loss_diff + args.lambda_cls * loss_cls + args.lambda_motion * loss_motion + args.lambda_gait * loss_gait
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             sum_total += float(loss.item())
-            sum_diff += float(out["loss_diff"].item())
-            sum_cls += float(out["loss_cls"].item())
-            sum_bone += float(loss_bone.item())
-            sum_skate += float(loss_skate.item())
-            sum_smooth += float(loss_smooth.item())
-            sum_instab += float(loss_instab.item())
+            sum_diff += float(loss_diff.item())
+            sum_cls += float(loss_cls.item())
+            sum_gait += float(loss_gait.item())
+            sum_motion += float(loss_motion.item())
+            sum_bone += float(out["loss_bone"].item())
+            sum_skate += float(out["loss_skate"].item())
+            sum_smooth += float(out["loss_smooth"].item())
+            sum_instab += float(out["loss_instab"].item())
             n_batches += 1
             if tqdm is not None and progress_enabled:
                 pbar.set_postfix(
                     total=f"{(sum_total / n_batches):.4f}",
                     diff=f"{(sum_diff / n_batches):.4f}",
-                    cls=f"{(sum_cls / n_batches):.4f}",
-                    bone=f"{(sum_bone / n_batches):.4f}",
-                    skate=f"{(sum_skate / n_batches):.4f}",
-                    smooth=f"{(sum_smooth / n_batches):.4f}",
-                    instab=f"{(sum_instab / n_batches):.4f}",
+                    gait=f"{(sum_gait / n_batches):.4f}",
                 )
             elif _is_main_process() and (
                 n_batches == 1
@@ -789,69 +860,17 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     t0,
                 )
                 LOGGER.info(
-                    "[Stage3] step_losses diff=%.6f cls=%.6f bone=%.6f skate=%.6f smooth=%.6f instab=%.6f",
+                    "[Stage3] step_losses diff=%.6f cls=%.6f gait=%.6f motion=%.6f",
                     sum_diff / n_batches,
                     sum_cls / n_batches,
-                    sum_bone / n_batches,
-                    sum_skate / n_batches,
-                    sum_smooth / n_batches,
-                    sum_instab / n_batches,
+                    sum_gait / n_batches,
+                    sum_motion / n_batches,
                 )
-
-            if args.debug_losses and not debug_printed and _is_main_process():
-                with torch.no_grad():
-                    y_bin = infer_binary_fall_labels(y).to(device=x_gen.device)
-                    com = compute_com(x_gen, joint_config=joint_config)
-                    bos_center_xz, bos_radius = compute_bos_proxy(x_gen, joint_config=joint_config)
-                    margin = stability_margin_soft(com, bos_center_xz, bos_radius)
-                    vel, acc = temporal_derivatives(com, dt=1.0 / max(args.fps, 1e-6))
-                    sanity = run_biomech_sanity_checks(device=device)
-
-                LOGGER.info(
-                    "[debug-losses] shapes X_gen=%s X_gt=%s y=%s y_bin=%s",
-                    tuple(x_gen.shape),
-                    tuple(x.shape),
-                    tuple(y.shape),
-                    tuple(y_bin.shape),
-                )
-                LOGGER.info(
-                    "[debug-losses] com[min,max]=[%.6f,%.6f] margin[min,max]=[%.6f,%.6f] vel[min,max]=[%.6f,%.6f] acc[min,max]=[%.6f,%.6f]",
-                    float(com.min().item()),
-                    float(com.max().item()),
-                    float(margin.min().item()),
-                    float(margin.max().item()),
-                    float(vel.min().item()),
-                    float(vel.max().item()),
-                    float(acc.min().item()),
-                    float(acc.max().item()),
-                )
-                LOGGER.info(
-                    "[debug-losses] components diff=%.6f cls=%.6f bone=%.6f skate=%.6f smooth=%.6f instab=%.6f total=%.6f",
-                    float(out["loss_diff"].item()),
-                    float(out["loss_cls"].item()),
-                    float(loss_bone.item()),
-                    float(loss_skate.item()),
-                    float(loss_smooth.item()),
-                    float(loss_instab.item()),
-                    float(loss.item()),
-                )
-                LOGGER.info(
-                    "[debug-losses] sanity const_vel_max=%.6f const_acc_max=%.6f const_smooth=%.6f const_instab=%.6f skate_const=%.6f skate_slide=%.6f check_const_ok=%.0f check_skate_ok=%.0f",
-                    sanity["const_vel_max"],
-                    sanity["const_acc_max"],
-                    sanity["const_smooth_loss"],
-                    sanity["const_instability_mean"],
-                    sanity["skating_loss_const"],
-                    sanity["skating_loss_slide"],
-                    sanity["check_const_stationary_ok"],
-                    sanity["check_skate_response_ok"],
-                )
-                LOGGER.info("[debug-losses] Completed one debug batch, exiting Stage-3 training early.")
-                debug_printed = True
-                return
         avg_train_total = sum_total / max(n_batches, 1)
         avg_train_diff = sum_diff / max(n_batches, 1)
         avg_train_cls = sum_cls / max(n_batches, 1)
+        avg_train_gait = sum_gait / max(n_batches, 1)
+        avg_train_motion = sum_motion / max(n_batches, 1)
         avg_train_bone = sum_bone / max(n_batches, 1)
         avg_train_skate = sum_skate / max(n_batches, 1)
         avg_train_smooth = sum_smooth / max(n_batches, 1)
@@ -859,6 +878,8 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         avg_train_total = _sync_mean(avg_train_total, device)
         avg_train_diff = _sync_mean(avg_train_diff, device)
         avg_train_cls = _sync_mean(avg_train_cls, device)
+        avg_train_gait = _sync_mean(avg_train_gait, device)
+        avg_train_motion = _sync_mean(avg_train_motion, device)
         avg_train_bone = _sync_mean(avg_train_bone, device)
         avg_train_skate = _sync_mean(avg_train_skate, device)
         avg_train_smooth = _sync_mean(avg_train_smooth, device)
@@ -867,6 +888,8 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         avg_val_total = None
         avg_val_diff = None
         avg_val_cls = None
+        avg_val_gait = None
+        avg_val_motion = None
         avg_val_bone = None
         avg_val_skate = None
         avg_val_smooth = None
@@ -876,70 +899,57 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             val_total_sum = 0.0
             val_diff_sum = 0.0
             val_cls_sum = 0.0
+            val_gait_sum = 0.0
+            val_motion_sum = 0.0
             val_bone_sum = 0.0
             val_skate_sum = 0.0
             val_smooth_sum = 0.0
             val_instab_sum = 0.0
             val_n = 0
             with torch.no_grad():
-                for batch in val_loader:
+                for batch_idx, batch in enumerate(val_loader):
+                    if args.max_val_batches > 0 and batch_idx >= args.max_val_batches:
+                        break
                     x = batch["skeleton"].to(device)
                     y = batch["label"].to(device)
                     a_hip_stream = batch["A_hip"].to(device)
                     a_wrist_stream = batch["A_wrist"].to(device)
-                    h_tokens, h_global = stage2.aligner(a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
+                    gait_metrics = batch["gait_metrics"].to(device)
+                    h_tokens, h_global = stage2.aligner(
+                        a_hip_stream=a_hip_stream,
+                        a_wrist_stream=a_wrist_stream,
+                        gait_metrics=gait_metrics,
+                    )
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                         out = model(
                             x=x,
                             y=y,
                             h_tokens=h_tokens,
                             h_global=h_global,
+                            gait_metrics=gait_metrics,
+                            fps=args.fps,
                         )
-                        x_gen = out["x_hat"].float()
-                        x_gt = x.float() if x is not None else None
-                        if use_biomech_losses:
-                            contact_prob = soft_contact_prob(x_gen, joint_config=joint_config, fps=args.fps)
-                            val_loss_bone = bone_length_loss(x_gen, bones=DEFAULT_BONES)
-                            val_loss_skate = foot_skating_loss(
-                                x_gen,
-                                contact_prob=contact_prob,
-                                joint_config=joint_config,
-                                fps=args.fps,
-                            )
-                            val_loss_smooth = smoothness_loss(x_gen, fps=args.fps)
-                            val_loss_instab = instability_loss(
-                                x_gen=x_gen,
-                                x_gt=x_gt,
-                                y=y,
-                                fps=args.fps,
-                                window_sec=args.instab_window_sec,
-                                joint_config=joint_config,
-                            )
-                        else:
-                            z = x.new_zeros(())
-                            val_loss_bone = z
-                            val_loss_skate = z
-                            val_loss_smooth = z
-                            val_loss_instab = z
-                        val_total = (
-                            out["loss_total"]
-                            + args.lambda_bone * val_loss_bone
-                            + args.lambda_skate * val_loss_skate
-                            + args.lambda_smooth * val_loss_smooth
-                            + args.lambda_instab * val_loss_instab
-                        )
+                        val_loss_diff = out["loss_diff"]
+                        val_loss_cls = out["loss_cls"]
+                        val_loss_gait = torch.nn.functional.mse_loss(out["gait_gen"], gait_metrics)
+                        val_loss_motion = out["loss_motion"]
+                        val_total = val_loss_diff + args.lambda_cls * val_loss_cls + args.lambda_motion * val_loss_motion + args.lambda_gait * val_loss_gait
                     val_total_sum += float(val_total.item())
-                    val_diff_sum += float(out["loss_diff"].item())
-                    val_cls_sum += float(out["loss_cls"].item())
-                    val_bone_sum += float(val_loss_bone.item())
-                    val_skate_sum += float(val_loss_skate.item())
-                    val_smooth_sum += float(val_loss_smooth.item())
-                    val_instab_sum += float(val_loss_instab.item())
+                    val_diff_sum += float(val_loss_diff.item())
+                    val_cls_sum += float(val_loss_cls.item())
+                    val_gait_sum += float(val_loss_gait.item())
+                    val_motion_sum += float(val_loss_motion.item())
+                    val_bone_sum += float(out["loss_bone"].item())
+                    val_skate_sum += float(out["loss_skate"].item())
+                    val_smooth_sum += float(out["loss_smooth"].item())
+                    val_instab_sum += float(out["loss_instab"].item())
                     val_n += 1
             model.train()
             avg_val_total = _sync_mean(val_total_sum / max(val_n, 1), device)
             avg_val_diff = _sync_mean(val_diff_sum / max(val_n, 1), device)
             avg_val_cls = _sync_mean(val_cls_sum / max(val_n, 1), device)
+            avg_val_gait = _sync_mean(val_gait_sum / max(val_n, 1), device)
+            avg_val_motion = _sync_mean(val_motion_sum / max(val_n, 1), device)
             avg_val_bone = _sync_mean(val_bone_sum / max(val_n, 1), device)
             avg_val_skate = _sync_mean(val_skate_sum / max(val_n, 1), device)
             avg_val_smooth = _sync_mean(val_smooth_sum / max(val_n, 1), device)
@@ -949,27 +959,26 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             "train_loss_total": avg_train_total,
             "train_loss_diff": avg_train_diff,
             "train_loss_cls": avg_train_cls,
+            "train_loss_gait": avg_train_gait,
+            "train_loss_motion": avg_train_motion,
             "train_loss_bone": avg_train_bone,
             "train_loss_skate": avg_train_skate,
             "train_loss_smooth": avg_train_smooth,
             "train_loss_instab": avg_train_instab,
         }
-        if (
-            avg_val_total is not None
-            and avg_val_diff is not None
-            and avg_val_cls is not None
-            and avg_val_bone is not None
-            and avg_val_skate is not None
-            and avg_val_smooth is not None
-            and avg_val_instab is not None
-        ):
+        if avg_val_total is not None and avg_val_gait is not None:
             metrics["val_loss_total"] = avg_val_total
             metrics["val_loss_diff"] = avg_val_diff
             metrics["val_loss_cls"] = avg_val_cls
+            metrics["val_loss_gait"] = avg_val_gait
+            metrics["val_loss_motion"] = avg_val_motion
             metrics["val_loss_bone"] = avg_val_bone
             metrics["val_loss_skate"] = avg_val_skate
             metrics["val_loss_smooth"] = avg_val_smooth
             metrics["val_loss_instab"] = avg_val_instab
+        history.append({"epoch": float(epoch + 1), **metrics})
+        if _is_main_process():
+            write_history(run_dir, "stage3", history)
         _print_epoch_summary(
             "Stage3",
             epoch + 1,
@@ -977,6 +986,20 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             metrics,
             time.time() - t0,
         )
+        if _is_main_process() and (epoch + 1) % max(1, args.eval_every_stage3) == 0:
+            model.eval()
+            evaluate_stage3(
+                stage2,
+                _unwrap_model(model),
+                val_loader or train_loader,
+                device,
+                run_dir / "stage3" / f"epoch_{epoch + 1:03d}",
+                args.sample_steps,
+                fps=args.fps,
+                epoch=epoch + 1,
+                sampler=args.sampler,
+            )
+            model.train()
         monitor_loss = avg_val_total if avg_val_total is not None else avg_train_total
         if _is_main_process() and monitor_loss < best_loss:
             best_loss = monitor_loss
@@ -990,18 +1013,17 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     "best_train_loss_total": avg_train_total,
                     "best_train_loss_diff": avg_train_diff,
                     "best_train_loss_cls": avg_train_cls,
-                    "best_train_loss_bone": avg_train_bone,
-                    "best_train_loss_skate": avg_train_skate,
-                    "best_train_loss_smooth": avg_train_smooth,
-                    "best_train_loss_instab": avg_train_instab,
+                    "best_train_loss_gait": avg_train_gait,
+                    "best_train_loss_motion": avg_train_motion,
                     "best_val_loss_total": avg_val_total,
                     "best_val_loss_diff": avg_val_diff,
                     "best_val_loss_cls": avg_val_cls,
-                    "best_val_loss_bone": avg_val_bone,
-                    "best_val_loss_skate": avg_val_skate,
-                    "best_val_loss_smooth": avg_val_smooth,
-                    "best_val_loss_instab": avg_val_instab,
+                    "best_val_loss_gait": avg_val_gait,
+                    "best_val_loss_motion": avg_val_motion,
                     "best_epoch": epoch + 1,
+                    "gait_metric_names": list(GAIT_METRIC_NAMES),
+                    "imu_feature_names": list(IMU_FEATURE_NAMES),
+                    "run_dir": args.run_dir,
                 },
             )
             LOGGER.info("[Stage3] new best checkpoint: %s (epoch=%s monitor_loss=%.6f)", best_ckpt, epoch + 1, best_loss)
@@ -1017,10 +1039,12 @@ def main() -> None:
     args = parse_args()
     if args.val_split < 0.0 or args.val_split >= 1.0:
         raise ValueError("--val_split must be in [0.0, 1.0).")
+    if args.gait_metrics_dim != DEFAULT_GAIT_METRICS_DIM:
+        raise ValueError(
+            f"--gait_metrics_dim must equal the fixed auto-computed gait-summary size ({DEFAULT_GAIT_METRICS_DIM})."
+        )
     if args.stage == 3 and args.fps <= 0:
         raise ValueError("--fps must be positive.")
-    if args.stage == 3 and (args.instab_window_sec < 2.0 or args.instab_window_sec > 4.0):
-        raise ValueError("--instab-window-sec must be in [2.0, 4.0].")
     distributed, local_rank, world_size = _init_distributed(args)
     _setup_logging()
     set_seed(args.seed)
@@ -1037,6 +1061,7 @@ def main() -> None:
             torch.set_float32_matmul_precision("high")
     if _is_main_process():
         LOGGER.info("DDP enabled: %s (world_size=%s)", distributed, world_size)
+    args.run_dir = str(_make_run_dir(args))
     _print_run_summary(args, device)
 
     if args.stage == 1:

@@ -10,6 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from diffusion_model.diffusion import DiffusionProcess, extract
+from diffusion_model.gait_metrics import compute_gait_metrics_torch
+from diffusion_model.losses import motion_losses
 from diffusion_model.sensor_model import IMULatentAligner
 from diffusion_model.skeleton_model import GraphDecoder, GraphDenoiserMasked, GraphEncoder
 from diffusion_model.util import assert_shape
@@ -50,33 +52,51 @@ class SkeletonTransformerClassifier(nn.Module):
 class Stage1Model(nn.Module):
     """Stage 1 model: skeleton latent diffusion pre-training."""
 
-    def __init__(self, latent_dim: int = 256, num_joints: int = 32, timesteps: int = 500) -> None:
+    def __init__(self, latent_dim: int = 256, num_joints: int = 32, timesteps: int = 500, gait_metrics_dim: int = 0) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.num_joints = num_joints
-        self.encoder = GraphEncoder(input_dim=3, latent_dim=latent_dim, num_joints=num_joints)
-        self.denoiser = GraphDenoiserMasked(latent_dim=latent_dim, num_joints=num_joints)
+        self.gait_metrics_dim = gait_metrics_dim
+        self.encoder = GraphEncoder(input_dim=3, latent_dim=latent_dim, num_joints=num_joints, gait_metrics_dim=gait_metrics_dim)
+        self.denoiser = GraphDenoiserMasked(latent_dim=latent_dim, num_joints=num_joints, gait_metrics_dim=gait_metrics_dim)
         self.decoder = GraphDecoder(latent_dim=latent_dim, output_dim=3, num_joints=num_joints)
         self.diffusion = DiffusionProcess(timesteps=timesteps)
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, gait_metrics: torch.Tensor | None = None) -> Dict[str, torch.Tensor]:
         """Compute stage-1 diffusion loss and latent outputs."""
         assert_shape(x, [None, None, self.num_joints, 3], "Stage1Model.x")
-        z0 = self.encoder(x)
+        if self.gait_metrics_dim > 0:
+            assert gait_metrics is not None, "gait_metrics are required when gait_metrics_dim > 0"
+            assert_shape(gait_metrics, [x.shape[0], self.gait_metrics_dim], "Stage1Model.gait_metrics")
+        z0 = self.encoder(x, gait_metrics=gait_metrics)
         t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
-        loss_diff = self.diffusion.predict_noise_loss(self.denoiser, z0, t, h_tokens=None, h_global=None)
+        loss_diff = self.diffusion.predict_noise_loss(
+            self.denoiser,
+            z0,
+            t,
+            h_tokens=None,
+            h_global=None,
+            gait_metrics=gait_metrics,
+        )
         return {"loss_diff": loss_diff, "z0": z0}
 
 
 class Stage2Model(nn.Module):
     """Stage 2 model: IMU to latent embedding alignment with frozen encoder."""
 
-    def __init__(self, encoder: GraphEncoder, latent_dim: int = 256, num_joints: int = 32) -> None:
+    def __init__(
+        self,
+        encoder: GraphEncoder,
+        latent_dim: int = 256,
+        num_joints: int = 32,
+        gait_metrics_dim: int = 0,
+    ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.num_joints = num_joints
+        self.gait_metrics_dim = gait_metrics_dim
         self.encoder = encoder
-        self.aligner = IMULatentAligner(latent_dim=latent_dim)
+        self.aligner = IMULatentAligner(latent_dim=latent_dim, gait_metrics_dim=gait_metrics_dim)
         self.freeze_encoder()
 
     def freeze_encoder(self) -> None:
@@ -85,17 +105,30 @@ class Stage2Model(nn.Module):
             p.requires_grad = False
         assert all(not p.requires_grad for p in self.encoder.parameters()), "encoder freeze verification failed"
 
-    def forward(self, x: torch.Tensor, a_hip_stream: torch.Tensor, a_wrist_stream: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        a_hip_stream: torch.Tensor,
+        a_wrist_stream: torch.Tensor,
+        gait_metrics: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
         """Compute alignment loss to frozen latent target z0."""
         assert_shape(x, [None, None, self.num_joints, 3], "Stage2Model.x")
         assert_shape(a_hip_stream, [x.shape[0], x.shape[1], 3], "Stage2Model.a_hip_stream")
         assert_shape(a_wrist_stream, [x.shape[0], x.shape[1], 3], "Stage2Model.a_wrist_stream")
+        if self.gait_metrics_dim > 0:
+            assert gait_metrics is not None, "gait_metrics are required when gait_metrics_dim > 0"
+            assert_shape(gait_metrics, [x.shape[0], self.gait_metrics_dim], "Stage2Model.gait_metrics")
 
         with torch.no_grad():
-            z0 = self.encoder(x)
+            z0 = self.encoder(x, gait_metrics=gait_metrics)
         assert_shape(z0, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.z0")
 
-        h_tokens, h_global = self.aligner(a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
+        h_tokens, h_global = self.aligner(
+            a_hip_stream=a_hip_stream,
+            a_wrist_stream=a_wrist_stream,
+            gait_metrics=gait_metrics,
+        )
         h = h_tokens.unsqueeze(2).expand(-1, -1, self.num_joints, -1)
         assert_shape(h, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.h")
         loss_align = F.mse_loss(h, z0)
@@ -121,15 +154,33 @@ class Stage3Model(nn.Module):
         num_joints: int = 32,
         num_classes: int = 14,
         timesteps: int = 500,
+        gait_metrics_dim: int = 0,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.num_joints = num_joints
+        self.gait_metrics_dim = gait_metrics_dim
+        self.num_classes = num_classes
         self.encoder = encoder
         self.decoder = decoder
         self.denoiser = denoiser
         self.diffusion = DiffusionProcess(timesteps=timesteps)
+        self.class_embed = nn.Embedding(num_classes, latent_dim)
         self.classifier = SkeletonTransformerClassifier(num_joints=num_joints, num_classes=num_classes, d_model=latent_dim)
+
+    def condition_with_labels(
+        self,
+        h_tokens: torch.Tensor,
+        h_global: torch.Tensor,
+        y: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse class labels into the temporal/global conditioning streams."""
+        assert_shape(h_tokens, [None, None, self.latent_dim], "Stage3Model.condition_with_labels.h_tokens")
+        assert_shape(h_global, [h_tokens.shape[0], self.latent_dim], "Stage3Model.condition_with_labels.h_global")
+        assert_shape(y, [h_tokens.shape[0]], "Stage3Model.condition_with_labels.y")
+        class_global = self.class_embed(y)
+        class_tokens = class_global.unsqueeze(1).expand(-1, h_tokens.shape[1], -1)
+        return h_tokens + class_tokens, h_global + class_global
 
     def forward(
         self,
@@ -137,34 +188,39 @@ class Stage3Model(nn.Module):
         y: torch.Tensor,
         h_tokens: torch.Tensor,
         h_global: torch.Tensor,
+        gait_metrics: torch.Tensor | None = None,
+        fps: float = 30.0,
     ) -> Dict[str, torch.Tensor]:
-        """Compute stage-3 losses.
-
-        Training uses closed-form x0 reconstruction from one noisy sample (z_t, pred_noise),
-        instead of a full reverse sampling loop. Full iterative sampling remains available
-        through generation code paths.
-        """
+        """Run Stage 3 forward pass and return all loss-ready tensors."""
         assert_shape(x, [None, None, self.num_joints, 3], "Stage3Model.x")
         assert_shape(y, [x.shape[0]], "Stage3Model.y")
 
         assert_shape(h_tokens, [x.shape[0], x.shape[1], self.latent_dim], "Stage3Model.h_tokens")
         assert_shape(h_global, [x.shape[0], self.latent_dim], "Stage3Model.h_global")
+        if self.gait_metrics_dim > 0:
+            assert gait_metrics is not None, "gait_metrics are required when gait_metrics_dim > 0"
+            assert_shape(gait_metrics, [x.shape[0], self.gait_metrics_dim], "Stage3Model.gait_metrics")
+        cond_tokens, cond_global = self.condition_with_labels(h_tokens=h_tokens, h_global=h_global, y=y)
 
         with torch.no_grad():
-            z0 = self.encoder(x)
+            z0 = self.encoder(x, gait_metrics=gait_metrics)
 
         t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
         noise = torch.randn_like(z0)
         zt = self.diffusion.q_sample(z0=z0, t=t, noise=noise)
-        pred_noise = self.denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
-        loss_diff = F.mse_loss(pred_noise, noise)
+        pred_noise = self.denoiser(
+            zt,
+            t,
+            sensor_tokens=cond_tokens,
+            h_tokens=cond_tokens,
+            h_global=cond_global,
+            gait_metrics=gait_metrics,
+        )
 
-        # Closed-form z0 estimate avoids expensive iterative reverse diffusion during training.
         sqrt_alpha_bar_t = extract(self.diffusion.sqrt_alphas_cumprod, t, zt.shape)
         sqrt_one_minus_alpha_bar_t = extract(self.diffusion.sqrt_one_minus_alphas_cumprod, t, zt.shape)
         z0_gen = (zt - sqrt_one_minus_alpha_bar_t * pred_noise) / torch.clamp(sqrt_alpha_bar_t, min=1e-20)
 
-        # Keep decode/classification in fp32 for numerical stability under AMP training.
         amp_off_ctx = (
             torch.autocast(device_type=x.device.type, enabled=False)
             if x.device.type in {"cuda", "cpu"}
@@ -172,17 +228,20 @@ class Stage3Model(nn.Module):
         )
         with amp_off_ctx:
             x_hat = self.decoder(z0_gen.float())
-            logits = self.classifier(x_hat.float())
+        gait_gen = compute_gait_metrics_torch(x_hat.float(), fps=fps)
+        logits = self.classifier(x_hat)
+        loss_diff = F.mse_loss(pred_noise, noise)
         loss_cls = F.cross_entropy(logits, y)
-        loss_total = loss_diff + loss_cls
-        probs = torch.softmax(logits, dim=1)
+        loss_terms = motion_losses(x_hat.float())
 
         return {
-            "loss_total": loss_total,
+            "x_hat": x_hat,
+            "z0_gen": z0_gen,
+            "gait_gen": gait_gen,
+            "logits": logits,
+            "pred_noise": pred_noise,
+            "noise": noise,
             "loss_diff": loss_diff,
             "loss_cls": loss_cls,
-            "x_hat": x_hat,
-            "logits": logits,
-            "probs": probs,
-            "z0_gen": z0_gen,
+            **loss_terms,
         }

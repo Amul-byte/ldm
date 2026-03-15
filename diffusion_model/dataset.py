@@ -9,9 +9,17 @@ from typing import Dict, Optional, Sequence
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 
+from diffusion_model.gait_metrics import (
+    DEFAULT_GAIT_METRICS_DIM,
+    GAIT_CACHE_VERSION,
+    compute_gait_metrics_numpy,
+    load_gait_metrics_csv,
+    save_gait_metrics_csv,
+)
 from diffusion_model.util import (
+    DEFAULT_FPS,
     DEFAULT_JOINTS,
     DEFAULT_NUM_CLASSES,
     DEFAULT_WINDOW,
@@ -21,6 +29,7 @@ from diffusion_model.util import (
 )
 
 ACTIVITY_RE = re.compile(r"A(\d{2})", re.IGNORECASE)
+SUBJECT_RE = re.compile(r"S(\d+)", re.IGNORECASE)
 
 
 def _parse_label_14(fname: str, num_classes: int = DEFAULT_NUM_CLASSES) -> int:
@@ -30,6 +39,79 @@ def _parse_label_14(fname: str, num_classes: int = DEFAULT_NUM_CLASSES) -> int:
         return 0
     activity = int(match.group(1))
     return max(0, min(num_classes - 1, activity - 1))
+
+
+def _parse_subject_id(name: str) -> int:
+    """Parse subject code Sxx from filename-like strings."""
+    match = SUBJECT_RE.search(str(name))
+    if match is None:
+        raise ValueError(f"Could not parse subject id from: {name}")
+    return int(match.group(1))
+
+
+def parse_subject_list(raw: str) -> list[int]:
+    """Parse a comma-separated subject list like '28,29,30'."""
+    items = [item.strip() for item in str(raw).split(",") if item.strip()]
+    return [int(item) for item in items]
+
+
+def extract_subject_ids(dataset: Dataset) -> Optional[list[int]]:
+    """Return per-sample subject ids when available on a dataset or subset."""
+    if isinstance(dataset, Subset):
+        base_subject_ids = extract_subject_ids(dataset.dataset)
+        if base_subject_ids is None:
+            return None
+        return [base_subject_ids[idx] for idx in dataset.indices]
+    subject_ids = getattr(dataset, "subject_ids", None)
+    if subject_ids is None:
+        return None
+    if isinstance(subject_ids, torch.Tensor):
+        return [int(x) for x in subject_ids.tolist()]
+    return [int(x) for x in subject_ids]
+
+
+def split_train_val_dataset(
+    dataset: Dataset,
+    val_split: float,
+    seed: int,
+    train_subjects: Optional[list[int]] = None,
+    logger=None,
+) -> tuple[Dataset, Optional[Dataset]]:
+    """Split dataset into train/val subsets, using subject-wise partitioning when requested."""
+    subject_ids = extract_subject_ids(dataset)
+    if train_subjects:
+        if subject_ids is None:
+            raise ValueError("Subject-wise split requested, but dataset does not expose per-sample subject_ids.")
+        train_subject_set = {int(sid) for sid in train_subjects}
+        all_subjects = sorted(set(subject_ids))
+        train_idx = [idx for idx, sid in enumerate(subject_ids) if sid in train_subject_set]
+        val_idx = [idx for idx, sid in enumerate(subject_ids) if sid not in train_subject_set]
+        missing_subjects = sorted(train_subject_set.difference(all_subjects))
+        if missing_subjects and logger is not None:
+            logger.warning("Requested train subjects not present in dataset: %s", missing_subjects)
+        if not train_idx:
+            raise ValueError("Subject-wise split produced an empty training set.")
+        if not val_idx:
+            raise ValueError("Subject-wise split produced an empty validation set.")
+        if logger is not None:
+            logger.info("Subject-wise split enabled.")
+            logger.info("Train subjects: %s", sorted(set(subject_ids[idx] for idx in train_idx)))
+            logger.info("Val subjects: %s", sorted(set(subject_ids[idx] for idx in val_idx)))
+            logger.info("Train samples=%s Val samples=%s", len(train_idx), len(val_idx))
+        return Subset(dataset, train_idx), Subset(dataset, val_idx)
+
+    if val_split <= 0.0:
+        return dataset, None
+    total = len(dataset)
+    if total < 2:
+        raise ValueError("Validation split requires at least 2 samples.")
+    n_val = max(1, int(round(total * val_split)))
+    n_val = min(n_val, total - 1)
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(total, generator=g).tolist()
+    train_idx = perm[:-n_val]
+    val_idx = perm[-n_val:]
+    return Subset(dataset, train_idx), Subset(dataset, val_idx)
 
 
 def _fill_nan_with_column_mean(arr: np.ndarray) -> np.ndarray:
@@ -70,7 +152,7 @@ def _skeleton_frame_to_joints(frame_block: np.ndarray, joints: int = DEFAULT_JOI
         frame_block = frame_block[:, 1:]
     if frame_block.shape[1] != joints * 3:
         raise ValueError(f"Expected {joints * 3} skeleton columns, got {frame_block.shape[1]}")
-    return frame_block.reshape(frame_block.shape[0], joints, 3).astype(np.float32)
+    return frame_block.reshape(frame_block.shape[0], joints, 3).astype(np.float32) / 1000.0
 
 
 def _extract_sensor_accel3(df: pd.DataFrame) -> np.ndarray:
@@ -97,24 +179,108 @@ def _windowed(arr: np.ndarray, window: int, stride: int) -> Sequence[np.ndarray]
     return [arr[s : s + window] for s in range(0, arr.shape[0] - window + 1, stride)]
 
 
+def _default_gait_cache_dir(dataset_path: Optional[str], skeleton_folder: Optional[str]) -> str:
+    if dataset_path:
+        root = os.path.dirname(os.path.abspath(dataset_path)) or "."
+        stem = os.path.splitext(os.path.basename(dataset_path))[0]
+        return os.path.join(root, f"{stem}_gait_cache_{GAIT_CACHE_VERSION}")
+    if skeleton_folder:
+        return os.path.join(os.path.abspath(skeleton_folder), f"_gait_cache_{GAIT_CACHE_VERSION}")
+    return os.path.abspath(f"gait_cache_{GAIT_CACHE_VERSION}")
+
+
+def _cached_or_compute_gait_metrics(
+    skeleton: np.ndarray,
+    cache_path: Optional[str],
+    fps: float = DEFAULT_FPS,
+    disable_cache: bool = False,
+) -> np.ndarray:
+    if cache_path and not disable_cache and os.path.isfile(cache_path):
+        try:
+            return load_gait_metrics_csv(cache_path)
+        except Exception:
+            pass
+    vector, named = compute_gait_metrics_numpy(skeleton, fps=fps)
+    if cache_path and not disable_cache:
+        save_gait_metrics_csv(cache_path, named)
+    return vector.astype(np.float32)
+
+
 class TorchFileGaitDataset(Dataset):
     """Dataset reading `.pt`/`.pth` files containing tensor dictionaries."""
 
-    def __init__(self, path: str, window: int = DEFAULT_WINDOW, joints: int = DEFAULT_JOINTS) -> None:
+    def __init__(
+        self,
+        path: str,
+        window: int = DEFAULT_WINDOW,
+        joints: int = DEFAULT_JOINTS,
+        gait_cache_dir: Optional[str] = None,
+        disable_gait_cache: bool = False,
+    ) -> None:
         super().__init__()
         self.window = window
         self.joints = joints
+        self.gait_cache_dir = gait_cache_dir or _default_gait_cache_dir(dataset_path=path, skeleton_folder=None)
+        self.disable_gait_cache = disable_gait_cache
         payload = torch.load(path, map_location="cpu")
-        self.skeleton = payload["skeleton"].float()
+        self.skeleton = payload["skeleton"].float() / 1000.0
         # Prefer explicit accel naming and keep legacy fallback support.
         self.A_hip = payload["A_hip"].float() if "A_hip" in payload else payload["A"].float()
         self.A_wrist = payload["A_wrist"].float() if "A_wrist" in payload else payload["Omega"].float()
+        gait_metrics = payload.get("gait_metrics", None)
+        if gait_metrics is None:
+            metrics = []
+            os.makedirs(self.gait_cache_dir, exist_ok=True)
+            for idx in range(self.skeleton.shape[0]):
+                cache_path = os.path.join(self.gait_cache_dir, f"{os.path.splitext(os.path.basename(path))[0]}_{idx:06d}.csv")
+                vector = _cached_or_compute_gait_metrics(
+                    self.skeleton[idx].cpu().numpy(),
+                    cache_path=cache_path,
+                    fps=float(payload.get("fps", DEFAULT_FPS)),
+                    disable_cache=disable_gait_cache,
+                )
+                metrics.append(vector)
+            self.gait_metrics = torch.tensor(np.stack(metrics), dtype=torch.float32)
+        else:
+            gait_metrics = torch.as_tensor(gait_metrics, dtype=torch.float32)
+            if gait_metrics.ndim == 1:
+                gait_metrics = gait_metrics.unsqueeze(0).expand(self.skeleton.shape[0], -1).contiguous()
+            elif gait_metrics.ndim != 2:
+                raise ValueError(f"Expected gait_metrics to have shape [N,G] or [G], got {tuple(gait_metrics.shape)}")
+            if gait_metrics.shape[0] != self.skeleton.shape[0]:
+                raise ValueError(
+                    "gait_metrics sample count must match skeleton sample count: "
+                    f"{gait_metrics.shape[0]} vs {self.skeleton.shape[0]}"
+                )
+            if gait_metrics.shape[1] != DEFAULT_GAIT_METRICS_DIM:
+                raise ValueError(
+                    f"Expected gait_metrics dim {DEFAULT_GAIT_METRICS_DIM}, got {gait_metrics.shape[1]}"
+                )
+            self.gait_metrics = gait_metrics
         if "label" in payload:
             self.label = payload["label"].long()
         else:
-            # Fallback for older synthetic/toy payloads without labels: treat as non-fall (0).
-            self.label = torch.zeros(self.skeleton.shape[0], dtype=torch.long)
-            print("[dataset] Missing 'label' in payload; using synthetic all-zero labels (non-fall).")
+            raise ValueError("Missing required 'label' in dataset payload.")
+        subject_ids = payload.get("subject_ids", None)
+        if subject_ids is None:
+            for candidate_key in ("filenames", "file_names", "sample_names", "sample_ids"):
+                names = payload.get(candidate_key, None)
+                if names is None:
+                    continue
+                try:
+                    subject_ids = [_parse_subject_id(name) for name in names]
+                    break
+                except Exception:
+                    subject_ids = None
+        if subject_ids is None:
+            self.subject_ids = None
+        else:
+            self.subject_ids = torch.as_tensor(subject_ids, dtype=torch.long)
+            if self.subject_ids.ndim != 1 or self.subject_ids.shape[0] != self.skeleton.shape[0]:
+                raise ValueError(
+                    "subject_ids must have shape [N] matching skeleton sample count: "
+                    f"{tuple(self.subject_ids.shape)} vs {self.skeleton.shape[0]}"
+                )
         self.fps = int(payload["fps"])
         sensor_identity = payload.get("sensor_identity", {})
         joint_labels = payload["joint_labels"]
@@ -129,6 +295,7 @@ class TorchFileGaitDataset(Dataset):
         assert_shape(self.skeleton, [None, window, joints, 3], "TorchFileGaitDataset.skeleton")
         assert_shape(self.A_hip, [self.skeleton.shape[0], window, 3], "TorchFileGaitDataset.A_hip")
         assert_shape(self.A_wrist, [self.skeleton.shape[0], window, 3], "TorchFileGaitDataset.A_wrist")
+        assert_shape(self.gait_metrics, [self.skeleton.shape[0], None], "TorchFileGaitDataset.gait_metrics")
         assert_shape(self.label, [self.skeleton.shape[0]], "TorchFileGaitDataset.label")
 
     def __len__(self) -> int:
@@ -141,6 +308,7 @@ class TorchFileGaitDataset(Dataset):
             "skeleton": self.skeleton[idx],
             "A_hip": self.A_hip[idx],
             "A_wrist": self.A_wrist[idx],
+            "gait_metrics": self.gait_metrics[idx],
             "label": self.label[idx],
             "fps": torch.tensor(self.fps, dtype=torch.long),
             "joint_labels": list(get_joint_labels()),
@@ -161,11 +329,16 @@ class CSVPairedGaitDataset(Dataset):
         num_classes: int = DEFAULT_NUM_CLASSES,
         normalize_sensors: bool = True,
         eps: float = 1e-6,
+        gait_cache_dir: Optional[str] = None,
+        disable_gait_cache: bool = False,
     ) -> None:
         super().__init__()
         self.window = window
         self.joints = joints
         self.fps = 30
+        self.gait_cache_dir = gait_cache_dir or _default_gait_cache_dir(dataset_path=None, skeleton_folder=skeleton_folder)
+        self.disable_gait_cache = disable_gait_cache
+        os.makedirs(self.gait_cache_dir, exist_ok=True)
 
         skeleton_map = read_csv_files(skeleton_folder)
         hip_map = read_csv_files(hip_folder)
@@ -177,7 +350,9 @@ class CSVPairedGaitDataset(Dataset):
         x_windows = []
         hip_windows = []
         wrist_windows = []
+        gait_metric_windows = []
         labels = []
+        subject_ids = []
         skipped_parse = 0
         skipped_short = 0
 
@@ -186,6 +361,17 @@ class CSVPairedGaitDataset(Dataset):
                 skel = _skeleton_frame_to_joints(_fill_nan_with_column_mean(skeleton_map[fname].values), joints=joints)
                 hip = _extract_sensor_accel3(hip_map[fname])
                 wrist = _extract_sensor_accel3(wrist_map[fname])
+                cache_path = os.path.join(self.gait_cache_dir, fname)
+                gait_metrics = _cached_or_compute_gait_metrics(
+                    skel,
+                    cache_path=cache_path,
+                    fps=float(self.fps),
+                    disable_cache=disable_gait_cache,
+                )
+                if gait_metrics.shape[0] != DEFAULT_GAIT_METRICS_DIM:
+                    raise ValueError(
+                        f"Expected auto-computed gait_metrics dim {DEFAULT_GAIT_METRICS_DIM}, got {gait_metrics.shape[0]}"
+                    )
             except Exception:
                 print(f"[dataset] Skipped invalid paired sample: {fname}")
                 skipped_parse += 1
@@ -206,7 +392,9 @@ class CSVPairedGaitDataset(Dataset):
                 x_windows.append(skel_w[i])
                 hip_windows.append(hip_w[i])
                 wrist_windows.append(wrist_w[i])
+                gait_metric_windows.append(gait_metrics)
                 labels.append(_parse_label_14(fname, num_classes=num_classes))
+                subject_ids.append(_parse_subject_id(fname))
 
         if len(x_windows) == 0:
             raise ValueError(
@@ -218,20 +406,25 @@ class CSVPairedGaitDataset(Dataset):
         self.skeleton = torch.tensor(np.stack(x_windows), dtype=torch.float32)
         self.A_hip = torch.tensor(np.stack(hip_windows), dtype=torch.float32)
         self.A_wrist = torch.tensor(np.stack(wrist_windows), dtype=torch.float32)
+        self.gait_metrics = torch.tensor(np.stack(gait_metric_windows), dtype=torch.float32)
         self.label = torch.tensor(labels, dtype=torch.long)
+        self.subject_ids = torch.tensor(subject_ids, dtype=torch.long)
 
         if normalize_sensors:
-            hip_mean = self.A_hip.mean(dim=(0, 1), keepdim=True)
-            hip_std = self.A_hip.std(dim=(0, 1), keepdim=True).clamp_min(eps)
-            wrist_mean = self.A_wrist.mean(dim=(0, 1), keepdim=True)
-            wrist_std = self.A_wrist.std(dim=(0, 1), keepdim=True).clamp_min(eps)
-            self.A_hip = (self.A_hip - hip_mean) / hip_std
-            self.A_wrist = (self.A_wrist - wrist_mean) / wrist_std
+            # hip_mean = self.A_hip.mean(dim=(0, 1), keepdim=True)
+            # hip_std = self.A_hip.std(dim=(0, 1), keepdim=True).clamp_min(eps)
+            # wrist_mean = self.A_wrist.mean(dim=(0, 1), keepdim=True)
+            # wrist_std = self.A_wrist.std(dim=(0, 1), keepdim=True).clamp_min(eps)
+            # self.A_hip = (self.A_hip - hip_mean) / hip_std
+            # self.A_wrist = (self.A_wrist - wrist_mean) / wrist_std
+            pass
 
         assert_shape(self.skeleton, [None, window, joints, 3], "CSVPairedGaitDataset.skeleton")
         assert_shape(self.A_hip, [self.skeleton.shape[0], window, 3], "CSVPairedGaitDataset.A_hip")
         assert_shape(self.A_wrist, [self.skeleton.shape[0], window, 3], "CSVPairedGaitDataset.A_wrist")
+        assert_shape(self.gait_metrics, [self.skeleton.shape[0], None], "CSVPairedGaitDataset.gait_metrics")
         assert_shape(self.label, [self.skeleton.shape[0]], "CSVPairedGaitDataset.label")
+        assert_shape(self.subject_ids, [self.skeleton.shape[0]], "CSVPairedGaitDataset.subject_ids")
 
     def __len__(self) -> int:
         """Return number of samples."""
@@ -243,6 +436,7 @@ class CSVPairedGaitDataset(Dataset):
             "skeleton": self.skeleton[idx],
             "A_hip": self.A_hip[idx],
             "A_wrist": self.A_wrist[idx],
+            "gait_metrics": self.gait_metrics[idx],
             "label": self.label[idx],
             "fps": torch.tensor(self.fps, dtype=torch.long),
             "joint_labels": list(get_joint_labels()),
@@ -259,10 +453,18 @@ def create_dataset(
     wrist_folder: Optional[str] = None,
     stride: int = 30,
     normalize_sensors: bool = True,
+    gait_cache_dir: Optional[str] = None,
+    disable_gait_cache: bool = False,
 ) -> Dataset:
     """Create dataset object from torch-file or paired CSV folders."""
     if dataset_path:
-        return TorchFileGaitDataset(path=dataset_path, window=window, joints=joints)
+        return TorchFileGaitDataset(
+            path=dataset_path,
+            window=window,
+            joints=joints,
+            gait_cache_dir=gait_cache_dir,
+            disable_gait_cache=disable_gait_cache,
+        )
     if skeleton_folder and hip_folder and wrist_folder:
         return CSVPairedGaitDataset(
             skeleton_folder=skeleton_folder,
@@ -273,6 +475,8 @@ def create_dataset(
             stride=stride,
             num_classes=num_classes,
             normalize_sensors=normalize_sensors,
+            gait_cache_dir=gait_cache_dir,
+            disable_gait_cache=disable_gait_cache,
         )
     raise ValueError(
         "Strict proposal mode requires either --dataset_path or all CSV folders: "
@@ -297,6 +501,8 @@ def create_dataloader(
     sampler: Optional[Sampler] = None,
     dataset: Optional[Dataset] = None,
     drop_last: bool = True,
+    gait_cache_dir: Optional[str] = None,
+    disable_gait_cache: bool = False,
 ) -> DataLoader:
     """Create dataloader from torch-file or paired CSV folders."""
     if dataset is None:
@@ -310,6 +516,8 @@ def create_dataloader(
             wrist_folder=wrist_folder,
             stride=stride,
             normalize_sensors=normalize_sensors,
+            gait_cache_dir=gait_cache_dir,
+            disable_gait_cache=disable_gait_cache,
         )
     loader_kwargs = {
         "batch_size": batch_size,

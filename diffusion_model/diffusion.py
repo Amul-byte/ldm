@@ -69,6 +69,7 @@ class DiffusionProcess(nn.Module):
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
         h: Optional[torch.Tensor] = None,
+        gait_metrics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute epsilon prediction MSE loss for a denoiser."""
         assert_shape(z0, [None, None, None, None], "DiffusionProcess.predict_noise_loss.z0")
@@ -78,7 +79,7 @@ class DiffusionProcess(nn.Module):
             h_tokens = sensor_tokens
         noise = torch.randn_like(z0)
         zt = self.q_sample(z0=z0, t=t, noise=noise)
-        pred_noise = denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
+        pred_noise = denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global, gait_metrics=gait_metrics)
         assert pred_noise.shape == noise.shape, "predicted noise shape mismatch"
         return F.mse_loss(pred_noise, noise)
 
@@ -91,6 +92,7 @@ class DiffusionProcess(nn.Module):
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
         h: Optional[torch.Tensor] = None,
+        gait_metrics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Sample one reverse step p(z_{t-1}|z_t, h)."""
         assert_shape(zt, [None, None, None, None], "DiffusionProcess.p_sample.zt")
@@ -104,7 +106,7 @@ class DiffusionProcess(nn.Module):
         sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, zt.shape)
         sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t, zt.shape)
 
-        pred_noise = denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
+        pred_noise = denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global, gait_metrics=gait_metrics)
         model_mean = sqrt_recip_alphas_t * (zt - betas_t * pred_noise / sqrt_one_minus_alphas_cumprod_t)
 
         nonzero_mask = (t != 0).float().reshape(zt.shape[0], *([1] * (zt.ndim - 1)))
@@ -124,6 +126,7 @@ class DiffusionProcess(nn.Module):
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
         h: Optional[torch.Tensor] = None,
+        gait_metrics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run full reverse process from z_T ~ N(0, I) to z_0."""
         assert len(shape) == 4, "shape must be [B,T,J,D]"
@@ -140,7 +143,15 @@ class DiffusionProcess(nn.Module):
 
         for i in reversed(range(self.timesteps)):
             t = torch.full((shape[0],), i, device=device, dtype=torch.long)
-            z = self.p_sample(denoiser=denoiser, zt=z, t=t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
+            z = self.p_sample(
+                denoiser=denoiser,
+                zt=z,
+                t=t,
+                sensor_tokens=h_tokens,
+                h_tokens=h_tokens,
+                h_global=h_global,
+                gait_metrics=gait_metrics,
+            )
         assert_shape(z, [shape[0], shape[1], shape[2], shape[3]], "DiffusionProcess.p_sample_loop.z")
         return z
 
@@ -171,6 +182,7 @@ class DiffusionProcess(nn.Module):
         h_tokens: Optional[torch.Tensor] = None,
         h_global: Optional[torch.Tensor] = None,
         h: Optional[torch.Tensor] = None,
+        gait_metrics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run DDIM sampling with configurable number of reverse steps.
 
@@ -195,7 +207,7 @@ class DiffusionProcess(nn.Module):
 
         for t_scalar, t_next_scalar in zip(schedule, next_schedule):
             t = torch.full((shape[0],), int(t_scalar.item()), device=device, dtype=torch.long)
-            pred_noise = denoiser(z, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global)
+            pred_noise = denoiser(z, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global, gait_metrics=gait_metrics)
 
             alpha_bar_t = extract(self.alphas_cumprod, t, z.shape)
             sqrt_alpha_bar_t = torch.sqrt(torch.clamp(alpha_bar_t, min=1e-20))

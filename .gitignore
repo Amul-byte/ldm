@@ -1,1 +1,4 @@
-gait_loss/ldm/outputs
+/opt
+/checkpoints
+/outputs
+/checkpoints_old

@@ -21,13 +21,13 @@ Defined in `diffusion_model/model.py`:
 
 2. `Stage2Model`
 - IMU-to-latent alignment with frozen stage-1 encoder.
-- Inputs: `A_hip` and `A_wrist`, each `[B,T,3]`.
+- Inputs: raw `A_hip` and `A_wrist`, each `[B,T,3]`, expanded internally to `[ax, ay, az, |a|, pitch, roll]`, plus auto-computed `gait_metrics` `[B,G]`.
 - Core loss: `loss_align`.
 
 3. `Stage3Model`
 - Conditional latent diffusion + skeleton classifier.
-- Core losses: `loss_diff`, `loss_cls`, `loss_total`.
-- Formula: `loss_total = loss_diff + lambda_cls * loss_cls`.
+- Core losses: `loss_diff`, `loss_cls`, `loss_gait`, `loss_motion`, `loss_total`.
+- Formula: `loss_total = loss_diff + lambda_cls * loss_cls + lambda_motion * loss_motion + lambda_gait * loss_gait`.
 
 Default constants from `diffusion_model/util.py`:
 
@@ -45,6 +45,7 @@ Implemented in `diffusion_model/dataset.py`:
 1. Torch-file mode (`--dataset_path`)
 - Expects tensors from a `.pt`/`.pth` payload.
 - Uses keys `skeleton`, `A_hip`/`A`, `A_wrist`/`Omega`, `label`, `fps`, `joint_labels`.
+- Optional extra key: `gait_metrics` with shape `[N,G]` or `[G]`; if absent the code computes it automatically from skeletons.
 
 2. CSV-folder mode
 - Requires all three flags together:
@@ -52,6 +53,7 @@ Implemented in `diffusion_model/dataset.py`:
   - `--hip_folder`
   - `--wrist_folder`
 - Builds sliding windows using `window` and `stride`.
+- The loader auto-computes one gait-summary vector per source file and reuses it for all windows from that file.
 
 3. Synthetic fallback mode
 - Used when neither torch-file nor CSV-folder inputs are provided.
@@ -61,6 +63,7 @@ Batch keys used by training/generation:
 - `skeleton`
 - `A_hip`
 - `A_wrist`
+- `gait_metrics`
 - `label`
 - `fps`
 - `joint_labels`
@@ -103,6 +106,7 @@ Runtime behavior in current `train.py`:
 - `--ddp` is accepted but ignored in single-process mode.
 - Uses AMP on CUDA unless `--no_amp`.
 - Dataloader uses `drop_last=True`.
+- Gait metrics are auto-computed and cached unless `--disable_gait_cache` is set.
 
 ## Generation
 
@@ -124,8 +128,55 @@ Optional generation flags implemented in `generate.py`:
 - `--gif_index` (default `0`)
 - `--target_class` (formats: `A12`, `12`, or zero-based id)
 - `--max_attempts` (default `64`)
+- `--gait_cache_dir`
+- `--disable_gait_cache`
+- `--gait_metrics_dim`
 - `--h_none`
 - `--classify`
+
+## Auto-computed gait metrics
+
+The code now computes gait metrics internally from the input skeleton using the notebook-style pipeline:
+
+- extract the fixed 16-joint subset from the 32-joint skeleton
+- align the skeleton to the ground plane
+- detect gait events from smoothed head-height peaks
+- compute the gait summary vector
+- cache one CSV per source file under `--gait_cache_dir`
+
+The canonical gait vector now uses the exact 9 requested metrics:
+
+- Mean CoM Fore-Aft
+- StDev CoM Fore-Aft
+- Mean CoM Width
+- StDev CoM Width
+- Mean CoM Height
+- StDev CoM Height
+- Mean Walking Speed
+- Mean Stride Width
+- Mean Base of Support
+
+The same gait-summary vector is used for:
+
+- encoder conditioning
+- denoiser conditioning
+- Stage-2 IMU alignment
+- Stage-3 gait-summary matching loss on generated skeletons
+
+Example:
+
+```bash
+python train.py \
+  --stage 3 \
+  --stage1_ckpt checkpoints/stage1.pt \
+  --stage2_ckpt checkpoints/stage2.pt \
+  --skeleton_folder /path/to/skeleton \
+  --hip_folder /path/to/hip \
+  --wrist_folder /path/to/wrist \
+  --gait_cache_dir outputs/gait_cache \
+  --lambda-gait 0.1 \
+  --save_dir checkpoints
+```
 
 ## Imported dependencies
 
@@ -138,46 +189,28 @@ From `ldm` source imports:
 - `tqdm` (optional)
 - `torch_geometric` (required by `diffusion_model/graph_modules.py`)
 
-## Stage-3 biomechanics-aware instability losses
+## Stage-3 objective
 
-Stage-3 training now supports additional differentiable losses computed on decoded skeletons `X_gen`:
+Stage-3 training uses the decoded skeleton `X_gen` to optimize:
 
-- `L_bone`: temporal bone-length consistency (variance of canonical bone lengths).
-- `L_skate`: soft foot-skating penalty (horizontal foot speed weighted by soft contact probability).
-- `L_smooth`: small acceleration penalty (anti-jitter second-difference term).
-- `L_instab`: activity-aware instability loss from instability curve
-  - `I(t) = a*margin + b*avgW(vel) + c*avgW(acc) + d*stdW(margin)`
-  - non-fall samples: penalize `mean(I_gen)`
-  - fall samples: align `I_gen` to `I_gt` via `mean(|I_gen - I_gt|)`
+- `L_diffusion`: noise-prediction MSE in latent space
+- `L_classification`: class CE on decoded skeletons
+- `L_gait`: generated-vs-real gait-summary MSE
+- `L_motion`: biomechanical regularization (`bone + foot_skating + smoothness + instability`)
 
 Stage-3 optimized total loss is:
 
-`L_total = (loss_diff + loss_cls) + lambda_bone*L_bone + lambda_skate*L_skate + lambda_smooth*L_smooth + lambda_instab*L_instab`
+`L_total = L_diffusion + lambda_cls * L_classification + lambda_motion * L_motion + lambda_gait * L_gait`
 
-New Stage-3 CLI flags:
+Relevant Stage-3 CLI flags:
 
-- `--lambda-bone`
-- `--lambda-skate`
-- `--lambda-smooth`
-- `--lambda-instab`
-- `--instab-window-sec` (default `3.0`, constrained to `2.0..4.0`)
+- `--lambda_cls` (default `0.1`)
+- `--lambda_motion` (default `1.0`)
+- `--lambda-gait` (default `1.0`)
 - `--fps` (default `30`)
-- joint index overrides:
-  - `--left-ankle-idx`, `--right-ankle-idx`
-  - `--left-foot-idx`, `--right-foot-idx`
-  - `--pelvis-idx`
-  - `--torso-indices` (comma-separated)
-- `--debug-losses` (runs one Stage-3 batch, prints biomechanics diagnostics, exits)
+- `--sample_steps` (default `50`)
 
-Recommended starting weights:
-
-- `lambda_bone=0.05`
-- `lambda_skate=0.02`
-- `lambda_smooth=0.0001`
-- `lambda_instab=0.1`
-- `instab_window_sec=3.0`
-
-Example Stage-3 training command with these losses enabled:
+Example Stage-3 training command:
 
 ```bash
 python train.py \
@@ -185,10 +218,8 @@ python train.py \
   --stage1_ckpt checkpoints/stage1.pt \
   --stage2_ckpt checkpoints/stage2.pt \
   --save_dir checkpoints \
-  --lambda-bone 0.05 \
-  --lambda-skate 0.02 \
-  --lambda-smooth 1e-4 \
-  --lambda-instab 0.1 \
-  --instab-window-sec 3.0 \
+  --lambda_cls 0.1 \
+  --lambda_motion 1.0 \
+  --lambda-gait 1.0 \
   --fps 30
 ```

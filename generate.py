@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+from datetime import datetime
 from typing import List
 
 import numpy as np
@@ -12,8 +13,10 @@ import torch
 from PIL import Image, ImageDraw
 
 from diffusion_model.dataset import create_dataloader
+from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM
 from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model
 from diffusion_model.model_loader import load_checkpoint
+from diffusion_model.training_eval import sample_stage3_latents
 from diffusion_model.util import (
     DEFAULT_JOINTS,
     DEFAULT_LATENT_DIM,
@@ -24,15 +27,26 @@ from diffusion_model.util import (
 )
 
 
-def _normalize_xy(points_xy: np.ndarray, canvas_size: int) -> np.ndarray:
-    """Normalize xy coordinates into drawable canvas coordinates."""
+def _normalize_xy(points_xy: np.ndarray, canvas_size: int, root_index: int = 0) -> np.ndarray:
+    """Normalize xy coordinates into drawable canvas coordinates.
+
+    Anchor the sequence to the first-frame root instead of re-centering every
+    frame so the rendered motion can keep its global trajectory. Use robust
+    percentile bounds so a single outlier frame does not shrink the whole body.
+    """
     assert points_xy.ndim == 3, "points_xy must be [T, J, 2]"
-    min_xy = points_xy.min(axis=(0, 1), keepdims=True)
-    max_xy = points_xy.max(axis=(0, 1), keepdims=True)
-    span = np.maximum(max_xy - min_xy, 1e-6)
-    scaled = (points_xy - min_xy) / span
+    assert 0 <= root_index < points_xy.shape[1], "root_index out of range"
+    anchor = points_xy[:1, root_index : root_index + 1, :]
+    centered = points_xy - anchor
+    flat_xy = centered.reshape(-1, 2)
+    min_xy = np.percentile(flat_xy, 2.0, axis=0, keepdims=True).reshape(1, 1, 2)
+    max_xy = np.percentile(flat_xy, 98.0, axis=0, keepdims=True).reshape(1, 1, 2)
+    span = float(np.maximum(max_xy - min_xy, 1e-6).max())
+    normalized = (centered - (min_xy + max_xy) * 0.5) / span
     margin = 0.1 * canvas_size
-    scaled = scaled * (canvas_size - 2 * margin) + margin
+    drawable = canvas_size - 2 * margin
+    canvas_center = canvas_size * 0.5
+    scaled = normalized * drawable + canvas_center
     return scaled
 
 
@@ -103,7 +117,7 @@ def _pick_target_conditioning(
     loader: torch.utils.data.DataLoader,
     target_class: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Find first dataset sample whose real label matches target_class."""
     for batch in loader:
         labels = batch["label"]
@@ -114,7 +128,8 @@ def _pick_target_conditioning(
         skeleton = batch["skeleton"][i : i + 1].to(device)
         a_hip = batch["A_hip"][i : i + 1].to(device)
         a_wrist = batch["A_wrist"][i : i + 1].to(device)
-        return skeleton, a_hip, a_wrist, int(labels[i].item())
+        gait_metrics = batch["gait_metrics"][i : i + 1].to(device)
+        return skeleton, a_hip, a_wrist, gait_metrics, int(labels[i].item())
     raise ValueError(
         f"No sample with real label target_class={target_class} ({_class_name(target_class, 14)}) found in provided data."
     )
@@ -130,20 +145,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skeleton_folder", type=str, default="")
     parser.add_argument("--hip_folder", type=str, default="")
     parser.add_argument("--wrist_folder", type=str, default="")
+    parser.add_argument("--gait_cache_dir", type=str, default="")
+    parser.add_argument("--disable_gait_cache", action="store_true")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW)
     parser.add_argument("--joints", type=int, default=DEFAULT_JOINTS)
     parser.add_argument("--latent_dim", type=int, default=DEFAULT_LATENT_DIM)
+    parser.add_argument("--gait_metrics_dim", type=int, default=DEFAULT_GAIT_METRICS_DIM)
     parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument("--num_classes", type=int, default=DEFAULT_NUM_CLASSES)
     parser.add_argument("--stride", type=int, default=30)
     parser.add_argument("--disable_sensor_norm", action="store_true")
     parser.add_argument("--classify", action="store_true")
     parser.add_argument("--save_gif", action="store_true")
-    parser.add_argument("--gif_dir", type=str, default="outputs/results")
+    parser.add_argument("--gif_dir", type=str, default="outputs/results_new")
     parser.add_argument("--gif_prefix", type=str, default="sample")
     parser.add_argument("--gif_fps", type=int, default=12)
-    parser.add_argument("--gif_index", type=int, default=0, help="Batch index to save as a single GIF.")
+    parser.add_argument("--gif_index", type=int, default=0, help="Legacy single-GIF index; ignored when saving full batch.")
     parser.add_argument(
         "--target_class",
         type=str,
@@ -156,18 +174,34 @@ def parse_args() -> argparse.Namespace:
         default=64,
         help="Max sampling attempts to hit target predicted class.",
     )
+    parser.add_argument("--sample_steps", type=int, default=50, help="Reverse-process sampling steps.")
+    parser.add_argument("--sampler", type=str, default="ddim", choices=["ddim", "ddpm"], help="Reverse-process sampler.")
     return parser.parse_args()
 
 
 def main() -> None:
     """Run conditional sampling and optional classification."""
     args = parse_args()
+    if args.gait_metrics_dim != DEFAULT_GAIT_METRICS_DIM:
+        raise ValueError(
+            f"--gait_metrics_dim must equal the fixed auto-computed gait-summary size ({DEFAULT_GAIT_METRICS_DIM})."
+        )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    stage1 = Stage1Model(latent_dim=args.latent_dim, num_joints=args.joints, timesteps=args.timesteps).to(device)
+    stage1 = Stage1Model(
+        latent_dim=args.latent_dim,
+        num_joints=args.joints,
+        timesteps=args.timesteps,
+        gait_metrics_dim=args.gait_metrics_dim,
+    ).to(device)
     load_checkpoint(args.stage1_ckpt, stage1, strict=True)
 
-    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=args.latent_dim, num_joints=args.joints).to(device)
+    stage2 = Stage2Model(
+        encoder=stage1.encoder,
+        latent_dim=args.latent_dim,
+        num_joints=args.joints,
+        gait_metrics_dim=args.gait_metrics_dim,
+    ).to(device)
     load_checkpoint(args.stage2_ckpt, stage2, strict=True)
 
     stage3 = Stage3Model(
@@ -178,6 +212,7 @@ def main() -> None:
         num_joints=args.joints,
         num_classes=args.num_classes,
         timesteps=args.timesteps,
+        gait_metrics_dim=args.gait_metrics_dim,
     ).to(device)
     load_checkpoint(args.stage3_ckpt, stage3, strict=True)
 
@@ -193,12 +228,17 @@ def main() -> None:
         stride=args.stride,
         normalize_sensors=not args.disable_sensor_norm,
         shuffle=True,
+        gait_cache_dir=args.gait_cache_dir or None,
+        disable_gait_cache=args.disable_gait_cache,
     )
 
     target_class = _parse_target_class(args.target_class, args.num_classes) if args.target_class.strip() else None
 
     if target_class is not None:
-        skeleton, a_hip_stream, a_wrist_stream, cond_label = _pick_target_conditioning(loader, target_class, device)
+        skeleton, a_hip_stream, a_wrist_stream, gait_metrics, cond_label = _pick_target_conditioning(
+            loader, target_class, device
+        )
+        y_cond = torch.full((skeleton.shape[0],), target_class, device=device, dtype=torch.long)
         print(
             "conditioning sample class: "
             f"id={cond_label} name={_class_name(cond_label, args.num_classes)}"
@@ -208,21 +248,30 @@ def main() -> None:
         skeleton = batch["skeleton"].to(device)
         a_hip_stream = batch["A_hip"].to(device)
         a_wrist_stream = batch["A_wrist"].to(device)
+        gait_metrics = batch["gait_metrics"].to(device)
+        y_cond = batch["label"].to(device)
 
     def _sample_once() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        sensor_tokens_local, h_local = stage2.aligner(a_hip_stream, a_wrist_stream)
-        shape = (skeleton.shape[0], skeleton.shape[1], skeleton.shape[2], args.latent_dim)
-        z0_local = stage3.diffusion.p_sample_loop(
-            stage3.denoiser,
-            shape=torch.Size(shape),
-            device=device,
-            sensor_tokens=sensor_tokens_local,
+        sensor_tokens_local, h_local = stage2.aligner(a_hip_stream, a_wrist_stream, gait_metrics=gait_metrics)
+        cond_tokens_local, cond_global_local = stage3.condition_with_labels(
             h_tokens=sensor_tokens_local,
             h_global=h_local,
+            y=y_cond,
+        )
+        shape = (skeleton.shape[0], skeleton.shape[1], skeleton.shape[2], args.latent_dim)
+        z0_local = sample_stage3_latents(
+            stage3=stage3,
+            shape=torch.Size(shape),
+            device=device,
+            h_tokens=cond_tokens_local,
+            h_global=cond_global_local,
+            gait_metrics=gait_metrics,
+            sample_steps=args.sample_steps,
+            sampler=args.sampler,
         )
         x_local = stage3.decoder(z0_local)
         logits_local = stage3.classifier(x_local)
-        return x_local, logits_local, z0_local, h_local
+        return x_local, logits_local, z0_local, cond_global_local
 
     if target_class is None:
         x_hat, logits, z0_gen, h_global = _sample_once()
@@ -258,15 +307,22 @@ def main() -> None:
     print(f"x_hat shape: {tuple(x_hat.shape)}")
 
     pred = torch.argmax(logits, dim=1)
-    gif_idx = 0 if target_class is not None else int(max(0, min(args.gif_index, x_hat.shape[0] - 1)))
-    pred_id = int(pred[gif_idx].item())
-    pred_name = _class_name(pred_id, args.num_classes)
-    print(f"predicted class for sample[{gif_idx}]: id={pred_id} name={pred_name}")
+    for sample_idx in range(x_hat.shape[0]):
+        pred_id = int(pred[sample_idx].item())
+        pred_name = _class_name(pred_id, args.num_classes)
+        print(f"predicted class for sample[{sample_idx}]: id={pred_id} name={pred_name}")
 
     if args.save_gif:
-        gif_path = os.path.join(args.gif_dir, f"{args.gif_prefix}_{pred_name}.gif")
-        save_skeleton_gif(x_hat[gif_idx], gif_path, fps=args.gif_fps)
-        print(f"saved gif: {gif_path}")
+        run_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        for sample_idx in range(x_hat.shape[0]):
+            pred_id = int(pred[sample_idx].item())
+            pred_name = _class_name(pred_id, args.num_classes)
+            gif_path = os.path.join(
+                args.gif_dir,
+                f"{args.gif_prefix}_{run_tag}_idx{sample_idx:02d}_{pred_name}.gif",
+            )
+            save_skeleton_gif(x_hat[sample_idx], gif_path, fps=args.gif_fps)
+            print(f"saved gif: {gif_path}")
 
     if args.classify:
         print(f"logits shape: {tuple(logits.shape)}")

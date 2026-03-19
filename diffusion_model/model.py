@@ -96,7 +96,7 @@ class Stage2Model(nn.Module):
         self.num_joints = num_joints
         self.gait_metrics_dim = gait_metrics_dim
         self.encoder = encoder
-        self.aligner = IMULatentAligner(latent_dim=latent_dim, gait_metrics_dim=gait_metrics_dim)
+        self.aligner = IMULatentAligner(latent_dim=latent_dim, gait_metrics_dim=0)
         self.freeze_encoder()
 
     def freeze_encoder(self) -> None:

@@ -119,6 +119,22 @@ def write_scatter(out_path: Path, title: str, x_real: np.ndarray, y_real: np.nda
     plt.close()
 
 
+def write_heatmap(out_path: Path, title: str, values: np.ndarray, x_label: str, y_label: str, cmap: str = "viridis") -> None:
+    if plt is None:
+        return
+    ensure_dir(out_path.parent)
+    arr = np.asarray(values, dtype=np.float32)
+    plt.figure(figsize=(11, 5.5))
+    plt.imshow(arr, aspect="auto", cmap=cmap, interpolation="nearest")
+    plt.title(title)
+    plt.xlabel(x_label)
+    plt.ylabel(y_label)
+    plt.colorbar()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+
+
 def write_pca_plot(out_path: Path, title: str, features: np.ndarray, labels: np.ndarray, num_classes: int = DEFAULT_NUM_CLASSES) -> None:
     if plt is None or PCA is None or features.shape[0] < 2:
         return
@@ -462,7 +478,7 @@ def build_run_manifest(args, device: torch.device, runtime: dict[str, object] | 
             "imu_feature_names": list(IMU_FEATURE_NAMES),
             "gait_metric_names": list(GAIT_METRIC_NAMES),
             "skeleton_scaling": "millimeters_to_meters",
-            "sensor_normalization": not args.disable_sensor_norm,
+            "sensor_normalization": False,
             "fps": args.fps,
         },
         "optimization": {
@@ -538,12 +554,25 @@ def sample_stage3_latents(
 @torch.no_grad()
 def evaluate_stage1(model, loader, device: torch.device, out_dir: Path, timestep_values: Sequence[int]) -> None:
     rows: list[dict[str, object]] = []
+    latent_features: list[np.ndarray] = []
+    labels: list[np.ndarray] = []
+    sample_sequences: list[np.ndarray] = []
+    sample_latent_maps: list[tuple[np.ndarray, str]] = []
     for t_val in timestep_values:
         vals = []
         for batch in _iter_eval_batches(loader, max_batches=4):
             x = batch["skeleton"].to(device)
             gait_metrics = batch["gait_metrics"].to(device)
+            y = batch["label"].cpu().numpy()
             z0 = model.encoder(x, gait_metrics=gait_metrics)
+            if len(sample_sequences) < 3:
+                remaining = 3 - len(sample_sequences)
+                for seq, latent, label in zip(x[:remaining], z0[:remaining], y[:remaining]):
+                    sample_sequences.append(seq.cpu().numpy())
+                    latent_map = torch.linalg.norm(latent.float(), dim=-1).cpu().numpy()
+                    sample_latent_maps.append((latent_map, f"label_A{int(label) + 1:02d}"))
+            latent_features.append(z0.mean(dim=(1, 2)).cpu().numpy())
+            labels.append(y)
             t = torch.full((x.shape[0],), int(t_val), device=device, dtype=torch.long)
             noise = torch.randn_like(z0)
             zt = model.diffusion.q_sample(z0=z0, t=t, noise=noise)
@@ -554,6 +583,7 @@ def evaluate_stage1(model, loader, device: torch.device, out_dir: Path, timestep
             rows.append({"timestep": int(t_val), "mean_mse": float(np.mean(vals)), "std_mse": float(np.std(vals)), "count": len(vals)})
     if not rows:
         return
+    ensure_dir(out_dir)
     write_csv(out_dir / "noise_prediction_error_by_timestep.csv", rows, ["timestep", "mean_mse", "std_mse", "count"])
     write_curve_plot(
         out_dir / "noise_prediction_error_by_timestep.png",
@@ -563,6 +593,30 @@ def evaluate_stage1(model, loader, device: torch.device, out_dir: Path, timestep
         "Diffusion timestep",
         "MSE(pred_noise, true_noise)",
     )
+    if sample_sequences:
+        render_skeleton_panels(
+            out_dir / "encoder_input_skeletons.png",
+            sample_sequences,
+            [f"Input sample {idx}" for idx in range(len(sample_sequences))],
+        )
+    for idx, (latent_map, label_text) in enumerate(sample_latent_maps):
+        write_heatmap(
+            out_dir / f"encoder_output_latent_norm_sample_{idx}.png",
+            f"Stage1 Encoder Output Norm Map ({label_text})",
+            latent_map.T,
+            x_label="Frame",
+            y_label="Joint",
+            cmap="magma",
+        )
+    if latent_features and labels:
+        latent_arr = np.concatenate(latent_features, axis=0)
+        label_arr = np.concatenate(labels, axis=0)
+        write_pca_plot(
+            out_dir / "encoder_output_latent_pca.png",
+            "Stage1 Encoder Output PCA (mean pooled z0)",
+            latent_arr,
+            label_arr,
+        )
 
 
 @torch.no_grad()

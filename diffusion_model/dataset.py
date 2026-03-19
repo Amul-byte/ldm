@@ -410,15 +410,6 @@ class CSVPairedGaitDataset(Dataset):
         self.label = torch.tensor(labels, dtype=torch.long)
         self.subject_ids = torch.tensor(subject_ids, dtype=torch.long)
 
-        if normalize_sensors:
-            # hip_mean = self.A_hip.mean(dim=(0, 1), keepdim=True)
-            # hip_std = self.A_hip.std(dim=(0, 1), keepdim=True).clamp_min(eps)
-            # wrist_mean = self.A_wrist.mean(dim=(0, 1), keepdim=True)
-            # wrist_std = self.A_wrist.std(dim=(0, 1), keepdim=True).clamp_min(eps)
-            # self.A_hip = (self.A_hip - hip_mean) / hip_std
-            # self.A_wrist = (self.A_wrist - wrist_mean) / wrist_std
-            pass
-
         assert_shape(self.skeleton, [None, window, joints, 3], "CSVPairedGaitDataset.skeleton")
         assert_shape(self.A_hip, [self.skeleton.shape[0], window, 3], "CSVPairedGaitDataset.A_hip")
         assert_shape(self.A_wrist, [self.skeleton.shape[0], window, 3], "CSVPairedGaitDataset.A_wrist")

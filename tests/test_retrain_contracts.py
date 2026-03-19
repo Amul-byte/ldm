@@ -7,7 +7,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from diffusion_model.dataset import TorchFileGaitDataset, _default_gait_cache_dir, _parse_subject_id, _windowed, split_train_val_dataset
+from diffusion_model.dataset import (
+    TorchFileGaitDataset,
+    _default_gait_cache_dir,
+    _parse_subject_id,
+    _windowed,
+    split_train_val_dataset,
+)
 from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM, GAIT_CACHE_VERSION, GAIT_METRIC_NAMES, rotate_and_align_torch
 from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model
 from diffusion_model.sensor_model import IMU_FEATURE_NAMES, build_imu_features
@@ -38,6 +44,24 @@ def test_windowing_count_for_overlap():
     arr = np.arange(10)
     windows = _windowed(arr, window=4, stride=3)
     assert len(windows) == 3
+
+
+def test_csv_pairing_contract_uses_shortest_shared_length():
+    skeleton = np.arange(4 * 2 * 3, dtype=np.float32).reshape(4, 2, 3)
+    hip = np.arange(6 * 3, dtype=np.float32).reshape(6, 3)
+    wrist = np.arange(5 * 3, dtype=np.float32).reshape(5, 3)
+
+    t = min(skeleton.shape[0], hip.shape[0], wrist.shape[0])
+    aligned_skeleton = skeleton[:t]
+    aligned_hip = hip[:t]
+    aligned_wrist = wrist[:t]
+
+    assert t == 4
+    assert aligned_skeleton.shape == (4, 2, 3)
+    assert aligned_hip.shape == (4, 3)
+    assert aligned_wrist.shape == (4, 3)
+    assert np.array_equal(aligned_hip, hip[:4])
+    assert np.array_equal(aligned_wrist, wrist[:4])
 
 
 def test_subject_id_parser_reads_smartfall_style_names():

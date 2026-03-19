@@ -77,15 +77,6 @@ class IMULatentAligner(nn.Module):
         self.a_branch = SensorTGNNBranch(input_dim=self.imu_feature_dim, latent_dim=latent_dim)
         self.omega_branch = SensorTGNNBranch(input_dim=self.imu_feature_dim, latent_dim=latent_dim)
         fuse_in_dim = latent_dim * 2
-        if gait_metrics_dim > 0:
-            self.gait_metrics_proj = nn.Sequential(
-                nn.Linear(gait_metrics_dim, latent_dim),
-                nn.GELU(),
-                nn.Linear(latent_dim, latent_dim),
-            )
-            fuse_in_dim += latent_dim
-        else:
-            self.gait_metrics_proj = None
         self.fuse_tokens = nn.Sequential(
             nn.Linear(fuse_in_dim, latent_dim),
             nn.GELU(),
@@ -98,7 +89,7 @@ class IMULatentAligner(nn.Module):
         a_wrist_stream: torch.Tensor,
         gait_metrics: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return proposal-style temporal/global embeddings: (h_tokens [B,T,D], h_global [B,D])."""
+        """Return temporal/global sensor embeddings from IMU data only."""
         assert_shape(a_hip_stream, [None, None, 3], "IMULatentAligner.a_hip_stream")
         assert_shape(a_wrist_stream, [None, None, 3], "IMULatentAligner.a_wrist_stream")
         assert a_hip_stream.shape[:2] == a_wrist_stream.shape[:2], "Hip and wrist streams must share [B,T]"
@@ -107,19 +98,9 @@ class IMULatentAligner(nn.Module):
         wrist_features = build_imu_features(a_wrist_stream)
         hip_tokens = self.a_branch(hip_features)
         wrist_tokens = self.omega_branch(wrist_features)
-        token_parts = [hip_tokens, wrist_tokens]
-        gait_global = None
-        if self.gait_metrics_proj is not None:
-            if gait_metrics is None:
-                raise ValueError("gait_metrics must be provided when gait_metrics_dim > 0")
-            assert_shape(gait_metrics, [a_hip_stream.shape[0], self.gait_metrics_dim], "IMULatentAligner.gait_metrics")
-            gait_global = self.gait_metrics_proj(gait_metrics)
-            token_parts.append(gait_global.unsqueeze(1).expand(-1, a_hip_stream.shape[1], -1))
-        fused = torch.cat(token_parts, dim=-1)
+        fused = torch.cat([hip_tokens, wrist_tokens], dim=-1)
         sensor_tokens = self.fuse_tokens(fused)
         h_global = sensor_tokens.mean(dim=1)
-        if gait_global is not None:
-            h_global = h_global + gait_global
 
         assert_shape(
             sensor_tokens,

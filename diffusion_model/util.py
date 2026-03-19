@@ -9,7 +9,7 @@ from typing import List, Sequence, Tuple
 import numpy as np
 import torch
 
-DEFAULT_TIMESTEPS = 1000
+DEFAULT_TIMESTEPS = 500
 DEFAULT_LATENT_DIM = 256
 DEFAULT_WINDOW = 90
 DEFAULT_JOINTS = 32

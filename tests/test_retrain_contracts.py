@@ -16,7 +16,14 @@ from diffusion_model.dataset import (
 )
 from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM, GAIT_CACHE_VERSION, GAIT_METRIC_NAMES, rotate_and_align_torch
 from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model
-from diffusion_model.sensor_model import IMU_FEATURE_NAMES, build_imu_features
+from diffusion_model.sensor_model import (
+    IMU_FEATURE_NAMES,
+    IMUGraphEncoder,
+    IMULatentAligner,
+    build_imu_features,
+    build_imu_graph_adjacency,
+)
+from diffusion_model.training_eval import sample_stage3_latents
 
 
 def _dummy_batch(batch_size: int = 2, frames: int = 32, joints: int = 32):
@@ -116,7 +123,13 @@ def test_imu_feature_builder_outputs_expected_channels_and_finite_angles():
 def test_stage_forward_smoke_losses_are_finite():
     x, a_hip, a_wrist, gait, y = _dummy_batch()
 
-    stage1 = Stage1Model(latent_dim=32, num_joints=32, timesteps=10, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage1 = Stage1Model(
+        latent_dim=32,
+        num_joints=32,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+    )
     out1 = stage1(x, gait_metrics=gait)
     assert torch.isfinite(out1["loss_diff"])
 
@@ -133,11 +146,94 @@ def test_stage_forward_smoke_losses_are_finite():
         num_classes=14,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
     )
-    out3 = stage3(x=x, y=y, h_tokens=out2["h_tokens"], h_global=out2["h_global"], gait_metrics=gait, fps=30.0)
-    for key in ["loss_diff", "loss_cls", "loss_motion", "loss_bone", "loss_skate", "loss_smooth", "loss_instab"]:
+    out3 = stage3(x=x, h_tokens=out2["h_tokens"], h_global=out2["h_global"], gait_target=gait, fps=30.0)
+    for key in ["loss_diff", "loss_pose", "loss_latent", "loss_vel", "loss_gait", "loss_motion", "loss_bone", "loss_skate", "loss_smooth", "loss_instab"]:
         assert torch.isfinite(out3[key]), key
     assert out3["gait_gen"].shape == (x.shape[0], DEFAULT_GAIT_METRICS_DIM)
+    assert out3["z0_target"].shape == out3["z0_gen"].shape
+
+
+def test_stage3_sampling_is_deterministic_for_fixed_seed():
+    x, a_hip, a_wrist, gait, _ = _dummy_batch(batch_size=1)
+    stage1 = Stage1Model(
+        latent_dim=32,
+        num_joints=32,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+    )
+    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=32, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage3 = Stage3Model(
+        encoder=stage1.encoder,
+        decoder=stage1.decoder,
+        denoiser=stage1.denoiser,
+        latent_dim=32,
+        num_joints=32,
+        num_classes=14,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+    )
+    h_tokens, h_global = stage2.aligner(a_hip, a_wrist)
+    shape = torch.Size((1, x.shape[1], x.shape[2], 32))
+    # Pass real gait metrics (instead of None) to match the train/eval conditioning contract.
+    z_a = sample_stage3_latents(stage3, shape, x.device, h_tokens, h_global, gait_metrics=gait, sample_steps=5, sampler="ddim", sample_seed=7)
+    z_b = sample_stage3_latents(stage3, shape, x.device, h_tokens, h_global, gait_metrics=gait, sample_steps=5, sampler="ddim", sample_seed=7)
+    z_c = sample_stage3_latents(stage3, shape, x.device, h_tokens, h_global, gait_metrics=gait, sample_steps=5, sampler="ddim", sample_seed=8)
+    assert torch.allclose(z_a, z_b)
+    assert not torch.allclose(z_a, z_c)
+
+
+def test_imu_graph_adjacency_shape_and_edges():
+    """build_imu_graph_adjacency must produce a [2T,2T] adjacency with the
+    correct self-loops, within-stream temporal edges, and cross-sensor edges."""
+    T = 4
+    adj = build_imu_graph_adjacency(window_len=T, device=torch.device("cpu"))
+
+    assert adj.shape == (2 * T, 2 * T), f"Expected [{2*T},{2*T}], got {adj.shape}"
+    # Self-loops
+    for i in range(2 * T):
+        assert adj[i, i] == 1.0, f"Missing self-loop at node {i}"
+    # Hip intra-stream temporal edges
+    for i in range(T - 1):
+        assert adj[i, i + 1] == 1.0 and adj[i + 1, i] == 1.0, f"Missing hip temporal edge ({i},{i+1})"
+    # Wrist intra-stream temporal edges
+    for i in range(T - 1):
+        assert adj[T + i, T + i + 1] == 1.0 and adj[T + i + 1, T + i] == 1.0, f"Missing wrist temporal edge"
+    # Cross-sensor edges
+    for i in range(T):
+        assert adj[i, T + i] == 1.0 and adj[T + i, i] == 1.0, f"Missing cross-sensor edge at t={i}"
+    # No edges between non-adjacent hip nodes (only direct neighbours)
+    assert adj[0, 2] == 0.0, "Unexpected non-adjacent hip edge"
+
+
+def test_imu_graph_encoder_output_shapes():
+    """IMUGraphEncoder must return per-sensor tokens of the expected shape."""
+    B, T, D = 2, 8, 32
+    encoder = IMUGraphEncoder(input_dim=6, latent_dim=D, depth=2)
+    hip = torch.randn(B, T, 6)
+    wrist = torch.randn(B, T, 6)
+    hip_out, wrist_out = encoder(hip, wrist)
+    assert hip_out.shape == (B, T, D), f"hip_out shape mismatch: {hip_out.shape}"
+    assert wrist_out.shape == (B, T, D), f"wrist_out shape mismatch: {wrist_out.shape}"
+    assert torch.isfinite(hip_out).all()
+    assert torch.isfinite(wrist_out).all()
+
+
+def test_imu_aligner_uses_graph_encoder():
+    """IMULatentAligner must expose graph_encoder and produce correct output shapes."""
+    B, T, D = 2, 8, 32
+    aligner = IMULatentAligner(latent_dim=D)
+    assert hasattr(aligner, "graph_encoder"), "IMULatentAligner must have graph_encoder attribute"
+    a_hip = torch.randn(B, T, 3)
+    a_wrist = torch.randn(B, T, 3)
+    sensor_tokens, h_global = aligner(a_hip, a_wrist)
+    assert sensor_tokens.shape == (B, T, D)
+    assert h_global.shape == (B, D)
+    assert torch.isfinite(sensor_tokens).all()
+    assert torch.isfinite(h_global).all()
 
 
 def test_rotate_and_align_torch_handles_degenerate_sequences():

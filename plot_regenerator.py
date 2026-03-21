@@ -349,8 +349,8 @@ def collect_stage1_stage2_features(
             a_wrist = batch["A_wrist"].to(device)
             gait_metrics = batch["gait_metrics"].to(device)
             y = batch["label"].cpu().numpy()
-            z0 = stage1.encoder(x, gait_metrics=gait_metrics)
-            _, h_global = stage2.aligner(a_hip, a_wrist, gait_metrics=gait_metrics)
+            z0 = stage1.encoder(x, gait_metrics=gait_metrics if getattr(stage1, "use_gait_conditioning", True) else None)
+            _, h_global = stage2.aligner(a_hip, a_wrist)
             latent_features.append(z0.mean(dim=(1, 2)).cpu().numpy())
             sensor_features.append(h_global.cpu().numpy())
             labels.append(y)
@@ -378,12 +378,10 @@ def collect_real_and_generated_gait(
             if batch_idx >= max_batches:
                 break
             x = batch["skeleton"].to(device)
-            y = batch["label"].to(device)
             a_hip = batch["A_hip"].to(device)
             a_wrist = batch["A_wrist"].to(device)
             gait_metrics = batch["gait_metrics"].to(device)
-            h_tokens, h_global = stage2.aligner(a_hip, a_wrist, gait_metrics=gait_metrics)
-            cond_tokens, cond_global = stage3.condition_with_labels(h_tokens=h_tokens, h_global=h_global, y=y)
+            cond_tokens, cond_global = stage2.aligner(a_hip, a_wrist)
             shape = (x.shape[0], x.shape[1], x.shape[2], stage3.latent_dim)
             z0_gen = sample_stage3_latents(
                 stage3=stage3,
@@ -391,7 +389,7 @@ def collect_real_and_generated_gait(
                 device=device,
                 h_tokens=cond_tokens,
                 h_global=cond_global,
-                gait_metrics=gait_metrics,
+                gait_metrics=None,
                 sample_steps=sample_steps,
                 sampler=sampler,
             )
@@ -469,7 +467,9 @@ def main() -> None:
             "Stage3 Component Losses",
             [
                 ("train_loss_diff", "train_loss_diff", "#2563eb"),
-                ("train_loss_cls", "train_loss_cls", "#dc2626"),
+                ("train_loss_pose", "train_loss_pose", "#dc2626"),
+                ("train_loss_latent", "train_loss_latent", "#7c3aed"),
+                ("train_loss_vel", "train_loss_vel", "#ea580c"),
                 ("train_loss_gait", "train_loss_gait", "#059669"),
                 ("train_loss_motion", "train_loss_motion", "#0f766e"),
             ],

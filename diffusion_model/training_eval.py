@@ -7,6 +7,7 @@ import json
 from collections import Counter
 from pathlib import Path
 from typing import Iterable, Sequence
+from diffusion_model.losses import motion_losses
 
 import numpy as np
 import torch
@@ -34,6 +35,7 @@ except Exception:  # pragma: no cover - optional plotting dependency
     umap = None
 
 from diffusion_model.gait_metrics import GAIT_METRIC_NAMES, compute_gait_metrics_torch
+from diffusion_model.losses import motion_losses
 from diffusion_model.sensor_model import IMU_FEATURE_NAMES
 from diffusion_model.util import DEFAULT_NUM_CLASSES, get_skeleton_edges
 
@@ -313,7 +315,14 @@ def render_skeleton_panels(out_path: Path, sequences: Sequence[np.ndarray], titl
     fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 5.5))
     axes = np.atleast_1d(axes)
     for ax, seq, title in zip(axes, sequences, titles):
-        frame = seq[len(seq) // 2]
+        seq_arr = np.asarray(seq, dtype=np.float32)
+        if seq_arr.ndim != 3 or seq_arr.shape[-1] < 2 or not np.isfinite(seq_arr).any():
+            ax.text(0.5, 0.5, "Invalid sequence", ha="center", va="center", fontsize=11)
+            ax.set_title(title)
+            ax.axis("off")
+            continue
+        seq_xy = _normalize_xy(seq_arr[..., :2], canvas_size=512)
+        frame = seq_xy[len(seq_xy) // 2]
         xs = frame[:, 0]
         ys = frame[:, 1]
         for i, j in edges:
@@ -321,7 +330,8 @@ def render_skeleton_panels(out_path: Path, sequences: Sequence[np.ndarray], titl
         ax.scatter(xs, ys, s=20, color="#2563eb")
         ax.set_title(title)
         ax.set_aspect("equal")
-        ax.invert_yaxis()
+        ax.set_xlim(0, 512)
+        ax.set_ylim(512, 0)
         ax.axis("off")
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
@@ -331,7 +341,9 @@ def render_skeleton_panels(out_path: Path, sequences: Sequence[np.ndarray], titl
 def _normalize_xy(points_xy: np.ndarray, canvas_size: int, root_index: int = 0) -> np.ndarray:
     assert points_xy.ndim == 3, "points_xy must be [T, J, 2]"
     assert 0 <= root_index < points_xy.shape[1], "root_index out of range"
-    anchor = points_xy[:1, root_index : root_index + 1, :]
+    # Center each frame on its root joint so long walking translations do not
+    # collapse the visible body pose into a tiny dot on the canvas.
+    anchor = points_xy[:, root_index : root_index + 1, :]
     centered = points_xy - anchor
     flat_xy = centered.reshape(-1, 2)
     min_xy = np.percentile(flat_xy, 2.0, axis=0, keepdims=True).reshape(1, 1, 2)
@@ -393,10 +405,14 @@ def write_history(run_dir: Path, stage_name: str, history: list[dict[str, float]
         "val_loss_align": "#dc2626",
         "train_loss_total": "#111827",
         "val_loss_total": "#7c3aed",
+        "train_loss_pose": "#dc2626",
+        "val_loss_pose": "#f97316",
+        "train_loss_latent": "#7c3aed",
+        "val_loss_latent": "#a855f7",
+        "train_loss_vel": "#0891b2",
+        "val_loss_vel": "#06b6d4",
         "train_loss_gait": "#059669",
         "val_loss_gait": "#10b981",
-        "train_loss_cls": "#dc2626",
-        "val_loss_cls": "#f97316",
         "train_loss_motion": "#0f766e",
         "val_loss_motion": "#14b8a6",
     }
@@ -487,16 +503,22 @@ def build_run_manifest(args, device: torch.device, runtime: dict[str, object] | 
             "lr": args.lr,
             "optimizer": runtime.get("optimizer", "Adam"),
             "scheduler": runtime.get("scheduler", "none"),
-            "lambda_cls": getattr(args, "lambda_cls", None),
+            "lambda_pose": getattr(args, "lambda_pose", None),
+            "lambda_latent": getattr(args, "lambda_latent", None),
+            "lambda_vel": getattr(args, "lambda_vel", None),
             "lambda_motion": getattr(args, "lambda_motion", None),
             "lambda_gait": getattr(args, "lambda_gait", None),
         },
         "diffusion": {
             "train_timesteps": args.timesteps,
             "sample_steps": getattr(args, "sample_steps", 50),
+            "sample_seed": getattr(args, "sample_seed", None),
+            "sampler": getattr(args, "sampler", None),
         },
         "stage": args.stage,
         "seed": args.seed,
+        "conditioning_mode": "imu_only" if getattr(args, "one_to_one", False) else "legacy",
+        "gait_role": "auxiliary_supervision" if getattr(args, "one_to_one", False) else "conditioning",
         "checkpoints": {
             "stage1_ckpt": args.stage1_ckpt,
             "stage2_ckpt": args.stage2_ckpt,
@@ -523,10 +545,15 @@ def sample_stage3_latents(
     device: torch.device,
     h_tokens: torch.Tensor,
     h_global: torch.Tensor,
-    gait_metrics: torch.Tensor,
+    gait_metrics: torch.Tensor | None,
     sample_steps: int,
     sampler: str = "ddim",
+    sample_seed: int | None = None,
 ) -> torch.Tensor:
+    generator = None
+    if sample_seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(sample_seed))
     sampler_name = sampler.lower()
     if sampler_name == "ddim":
         return stage3.diffusion.p_sample_loop_ddim(
@@ -538,6 +565,7 @@ def sample_stage3_latents(
             h_tokens=h_tokens,
             h_global=h_global,
             gait_metrics=gait_metrics,
+            generator=generator,
         )
     if sampler_name == "ddpm":
         return stage3.diffusion.p_sample_loop(
@@ -547,8 +575,64 @@ def sample_stage3_latents(
             h_tokens=h_tokens,
             h_global=h_global,
             gait_metrics=gait_metrics,
+            generator=generator,
         )
     raise ValueError(f"Unsupported sampler: {sampler}")
+
+
+def _mpjpe(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    return torch.linalg.norm(x_hat - x, dim=-1).mean()
+
+
+def _velocity_error(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    vel_hat = x_hat[:, 1:] - x_hat[:, :-1]
+    vel = x[:, 1:] - x[:, :-1]
+    return torch.linalg.norm(vel_hat - vel, dim=-1).mean()
+
+
+def _root_trajectory_error(x_hat: torch.Tensor, x: torch.Tensor, root_index: int = 0) -> torch.Tensor:
+    return torch.linalg.norm(x_hat[:, :, root_index, :] - x[:, :, root_index, :], dim=-1).mean()
+
+
+def _pairwise_distance_rows(arr: np.ndarray) -> np.ndarray:
+    diffs = arr[:, None, :] - arr[None, :, :]
+    return np.linalg.norm(diffs, axis=-1)
+
+
+def _write_histogram(out_path: Path, title: str, values: np.ndarray, x_label: str, color: str = "#2563eb") -> None:
+    if plt is None:
+        return
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return
+    ensure_dir(out_path.parent)
+    plt.figure(figsize=(9, 6))
+    plt.hist(arr, bins=24, color=color, alpha=0.8)
+    plt.title(title)
+    plt.xlabel(x_label)
+    plt.ylabel("Count")
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+
+
+def _write_overlay_plot(out_path: Path, title: str, series_real: np.ndarray, series_gen: np.ndarray, y_label: str) -> None:
+    if plt is None:
+        return
+    ensure_dir(out_path.parent)
+    plt.figure(figsize=(11, 5.5))
+    plt.plot(series_real, label="Real", color="#2563eb", linewidth=2.0)
+    plt.plot(series_gen, label="Generated", color="#dc2626", linewidth=2.0)
+    plt.title(title)
+    plt.xlabel("Frame")
+    plt.ylabel(y_label)
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
 
 
 @torch.no_grad()
@@ -558,6 +642,7 @@ def evaluate_stage1(model, loader, device: torch.device, out_dir: Path, timestep
     labels: list[np.ndarray] = []
     sample_sequences: list[np.ndarray] = []
     sample_latent_maps: list[tuple[np.ndarray, str]] = []
+    recon_metrics: list[dict[str, float]] = []
     for t_val in timestep_values:
         vals = []
         for batch in _iter_eval_batches(loader, max_batches=4):
@@ -571,8 +656,18 @@ def evaluate_stage1(model, loader, device: torch.device, out_dir: Path, timestep
                     sample_sequences.append(seq.cpu().numpy())
                     latent_map = torch.linalg.norm(latent.float(), dim=-1).cpu().numpy()
                     sample_latent_maps.append((latent_map, f"label_A{int(label) + 1:02d}"))
+                    recon = model.decoder(latent.unsqueeze(0).float())[0].cpu().numpy()
+                    sample_sequences.append(recon)
             latent_features.append(z0.mean(dim=(1, 2)).cpu().numpy())
             labels.append(y)
+            x_recon = model.decoder(z0.float())
+            recon_metrics.append(
+                {
+                    "mpjpe_recon": float(_mpjpe(x_recon, x).item()),
+                    "velocity_error": float(_velocity_error(x_recon, x).item()),
+                    "bone_length_drift": float(motion_losses(x_recon.float())["loss_bone"].item()),
+                }
+            )
             t = torch.full((x.shape[0],), int(t_val), device=device, dtype=torch.long)
             noise = torch.randn_like(z0)
             zt = model.diffusion.q_sample(z0=z0, t=t, noise=noise)
@@ -593,6 +688,22 @@ def evaluate_stage1(model, loader, device: torch.device, out_dir: Path, timestep
         "Diffusion timestep",
         "MSE(pred_noise, true_noise)",
     )
+    if recon_metrics:
+        write_csv(out_dir / "stage1_recon_metrics.csv", recon_metrics, ["mpjpe_recon", "velocity_error", "bone_length_drift"])
+        write_json(
+            out_dir / "stage1_recon_summary.json",
+            {
+                "mpjpe_recon_mean": float(np.mean([row["mpjpe_recon"] for row in recon_metrics])),
+                "velocity_error_mean": float(np.mean([row["velocity_error"] for row in recon_metrics])),
+                "bone_length_drift_mean": float(np.mean([row["bone_length_drift"] for row in recon_metrics])),
+            },
+        )
+        _write_histogram(
+            out_dir / "stage1_recon_error_hist.png",
+            "Stage1 Reconstruction MPJPE Distribution",
+            np.asarray([row["mpjpe_recon"] for row in recon_metrics], dtype=np.float32),
+            "MPJPE",
+        )
     if sample_sequences:
         render_skeleton_panels(
             out_dir / "encoder_input_skeletons.png",
@@ -624,6 +735,10 @@ def evaluate_stage2(stage1, stage2, loader, device: torch.device, out_dir: Path,
     latent_features: list[np.ndarray] = []
     sensor_features: list[np.ndarray] = []
     labels: list[np.ndarray] = []
+    pair_cosines: list[float] = []
+    pair_l2s: list[float] = []
+    retrieval_hits = 0
+    retrieval_total = 0
     for batch in _iter_eval_batches(loader, max_batches=8):
         x = batch["skeleton"].to(device)
         a_hip = batch["A_hip"].to(device)
@@ -631,16 +746,46 @@ def evaluate_stage2(stage1, stage2, loader, device: torch.device, out_dir: Path,
         gait_metrics = batch["gait_metrics"].to(device)
         y = batch["label"].cpu().numpy()
         z0 = stage1.encoder(x, gait_metrics=gait_metrics)
-        _, h_global = stage2.aligner(a_hip, a_wrist, gait_metrics=gait_metrics)
-        latent_features.append(z0.mean(dim=(1, 2)).cpu().numpy())
-        sensor_features.append(h_global.cpu().numpy())
+        _, h_global = stage2.aligner(a_hip, a_wrist)
+        latent_batch = z0.mean(dim=(1, 2))
+        sensor_batch = h_global
+        latent_features.append(latent_batch.cpu().numpy())
+        sensor_features.append(sensor_batch.cpu().numpy())
         labels.append(y)
+        similarity = F.cosine_similarity(sensor_batch[:, None, :], latent_batch[None, :, :], dim=-1)
+        retrieval_hits += int((similarity.argmax(dim=1) == torch.arange(similarity.shape[0], device=similarity.device)).sum().item())
+        retrieval_total += int(similarity.shape[0])
+        pair_cosines.extend(F.cosine_similarity(latent_batch, sensor_batch, dim=1).cpu().tolist())
+        pair_l2s.extend(torch.linalg.norm(latent_batch - sensor_batch, dim=1).cpu().tolist())
     if not latent_features:
         return
     ensure_dir(out_dir)
     latent_arr = np.concatenate(latent_features, axis=0)
     sensor_arr = np.concatenate(sensor_features, axis=0)
     label_arr = np.concatenate(labels, axis=0)
+    valid_mask = (
+        np.isfinite(latent_arr).all(axis=1)
+        & np.isfinite(sensor_arr).all(axis=1)
+        & np.isfinite(label_arr)
+    )
+    invalid_count = int((~valid_mask).sum())
+    latent_arr = latent_arr[valid_mask]
+    sensor_arr = sensor_arr[valid_mask]
+    label_arr = label_arr[valid_mask]
+    pair_cosines_arr = np.asarray(pair_cosines, dtype=np.float32)
+    pair_l2s_arr = np.asarray(pair_l2s, dtype=np.float32)
+    pair_cosines_arr = pair_cosines_arr[np.isfinite(pair_cosines_arr)]
+    pair_l2s_arr = pair_l2s_arr[np.isfinite(pair_l2s_arr)]
+    if latent_arr.shape[0] == 0 or sensor_arr.shape[0] == 0:
+        write_json(
+            out_dir / "embedding_diagnostics.json",
+            {
+                "sample_count": 0,
+                "invalid_feature_rows_filtered": invalid_count,
+                "error": "All Stage2 latent/sensor feature rows were non-finite during evaluation.",
+            },
+        )
+        return
     projection_methods = [
         ("pca", "PCA"),
         ("tsne", "t-SNE"),
@@ -695,6 +840,9 @@ def evaluate_stage2(stage1, stage2, loader, device: torch.device, out_dir: Path,
 
     diagnostics = {
         "sample_count": int(label_arr.shape[0]),
+        "invalid_feature_rows_filtered": invalid_count,
+        "invalid_pair_cosines_filtered": int(len(pair_cosines) - pair_cosines_arr.shape[0]),
+        "invalid_pair_l2_filtered": int(len(pair_l2s) - pair_l2s_arr.shape[0]),
         "latent_sensor_cosine_mean": float(cosine_gap.mean().item()),
         "latent_sensor_cosine_std": float(cosine_gap.std(unbiased=False).item()),
         "latent_sensor_l2_mean": float(l2_gap.mean().item()),
@@ -702,6 +850,7 @@ def evaluate_stage2(stage1, stage2, loader, device: torch.device, out_dir: Path,
         "latent_within_class_scatter": _mean_within_class_scatter(latent_arr, label_arr),
         "sensor_within_class_scatter": _mean_within_class_scatter(sensor_arr, label_arr),
         "available_projections": projection_status,
+        "retrieval_at_1": float(retrieval_hits / max(retrieval_total, 1)),
     }
     if epoch is not None:
         prev_dir = out_dir.parent / f"epoch_{epoch - 1:03d}"
@@ -744,6 +893,10 @@ def evaluate_stage2(stage1, stage2, loader, device: torch.device, out_dir: Path,
     np.savez_compressed(out_dir / "latent_class_centroids.npz", centroids=latent_centroids, classes=np.asarray(centroid_classes))
     np.savez_compressed(out_dir / "sensor_class_centroids.npz", centroids=sensor_centroids, classes=np.asarray(centroid_classes))
     write_json(out_dir / "embedding_diagnostics.json", diagnostics)
+    _write_histogram(out_dir / "latent_sensor_pair_cosine_hist.png", "Stage2 Paired Latent/Sensor Cosine Similarity", pair_cosines_arr, "Cosine similarity")
+    _write_histogram(out_dir / "latent_sensor_pair_l2_hist.png", "Stage2 Paired Latent/Sensor L2 Distance", pair_l2s_arr, "L2 distance", color="#dc2626")
+    retrieval_matrix = sensor_arr @ latent_arr.T
+    write_heatmap(out_dir / "stage2_similarity_matrix.png", "Stage2 Sensor vs Latent Similarity", retrieval_matrix, "Latent sample", "Sensor sample", cmap="magma")
 
 
 @torch.no_grad()
@@ -757,111 +910,101 @@ def evaluate_stage3(
     fps: float,
     epoch: int | None = None,
     sampler: str = "ddim",
+    sample_seed: int | None = None,
 ) -> None:
     real_gait_list: list[np.ndarray] = []
     gen_gait_list: list[np.ndarray] = []
     gen_sequences: list[np.ndarray] = []
-    conditioning_rows: list[dict[str, object]] = []
-    label_counter: Counter[int] = Counter()
-    snapshot_written = False
+    reconstruction_rows: list[dict[str, object]] = []
+    sensitivity_pairs: list[dict[str, float]] = []
+    sample_real: np.ndarray | None = None
+    sample_gen: np.ndarray | None = None
 
     for batch_idx, batch in enumerate(_iter_eval_batches(loader, max_batches=4)):
         x = batch["skeleton"].to(device)
-        y = batch["label"].to(device)
         a_hip = batch["A_hip"].to(device)
         a_wrist = batch["A_wrist"].to(device)
         gait_metrics = batch["gait_metrics"].to(device)
-        h_tokens, h_global = stage2.aligner(a_hip, a_wrist, gait_metrics=gait_metrics)
-        cond_tokens, cond_global = stage3.condition_with_labels(h_tokens=h_tokens, h_global=h_global, y=y)
+        h_tokens, h_global = stage2.aligner(a_hip, a_wrist)
         shape = (x.shape[0], x.shape[1], x.shape[2], stage3.latent_dim)
         z0_gen = sample_stage3_latents(
             stage3=stage3,
             shape=torch.Size(shape),
             device=device,
-            h_tokens=cond_tokens,
-            h_global=cond_global,
+            h_tokens=h_tokens,
+            h_global=h_global,
             gait_metrics=gait_metrics,
             sample_steps=sample_steps,
             sampler=sampler,
+            sample_seed=sample_seed,
         )
         x_hat = stage3.decoder(z0_gen)
         gait_gen = compute_gait_metrics_torch(x_hat, fps=fps).cpu().numpy()
         real_gait_list.append(gait_metrics.cpu().numpy())
         gen_gait_list.append(gait_gen)
-        logits = stage3.classifier(x_hat)
-        preds = torch.argmax(logits, dim=1).cpu().numpy()
-        for cid in preds.tolist():
-            label_counter[int(cid)] += 1
         if len(gen_sequences) < 3:
             gen_sequences.extend([seq for seq in x_hat.cpu().numpy()[: 3 - len(gen_sequences)]])
-
-        if not snapshot_written:
-            sample_gait = gait_metrics[:1]
-            sample_y = y[:1]
-            sample_hip = a_hip[:1]
-            sample_wrist = a_wrist[:1]
-            s_tokens, s_global = stage2.aligner(sample_hip, sample_wrist, gait_metrics=sample_gait)
-            c_tokens, c_global = stage3.condition_with_labels(h_tokens=s_tokens, h_global=s_global, y=sample_y)
-            z = torch.randn((1, x.shape[1], x.shape[2], stage3.latent_dim), device=device)
-            captured: dict[int, np.ndarray] = {}
-            capture_steps = _snapshot_timesteps(stage3.diffusion.timesteps)
-            for i in reversed(range(stage3.diffusion.timesteps)):
-                t = torch.full((1,), i, device=device, dtype=torch.long)
-                pred_noise = stage3.denoiser(z, t, h_tokens=c_tokens, h_global=c_global, gait_metrics=sample_gait)
-                alpha_bar_t = stage3.diffusion.alphas_cumprod[i]
-                sqrt_alpha_bar_t = torch.sqrt(torch.clamp(alpha_bar_t, min=1e-20))
-                sqrt_one_minus = torch.sqrt(torch.clamp(1.0 - alpha_bar_t, min=1e-20))
-                x0_pred = (z - sqrt_one_minus * pred_noise) / sqrt_alpha_bar_t
-                if i in capture_steps:
-                    captured[i] = stage3.decoder(x0_pred).cpu().numpy()[0]
-                z = stage3.diffusion.p_sample(stage3.denoiser, z, t, h_tokens=c_tokens, h_global=c_global, gait_metrics=sample_gait)
-            times = capture_steps
-            render_skeleton_panels(out_dir / "intermediate_diffusion_states.png", [captured[t] for t in times if t in captured], [f"t={t}" for t in times if t in captured])
-            snapshot_written = True
+        if sample_real is None:
+            sample_real = x[0].cpu().numpy()
+            sample_gen = x_hat[0].cpu().numpy()
+        for idx in range(x.shape[0]):
+            reconstruction_rows.append(
+                {
+                    "sample_index": len(reconstruction_rows),
+                    "mpjpe": float(_mpjpe(x_hat[idx : idx + 1], x[idx : idx + 1]).item()),
+                    "root_trajectory_error": float(_root_trajectory_error(x_hat[idx : idx + 1], x[idx : idx + 1]).item()),
+                    "velocity_error": float(_velocity_error(x_hat[idx : idx + 1], x[idx : idx + 1]).item()),
+                    "latent_reconstruction_error": float(F.mse_loss(z0_gen[idx : idx + 1], stage3.encoder(x[idx : idx + 1])).item()),
+                    "gait_error": float(F.mse_loss(torch.from_numpy(gait_gen[idx : idx + 1]), gait_metrics[idx : idx + 1].cpu()).item()),
+                }
+            )
 
         if batch_idx == 0 and len(loader.dataset) >= 2:
             sample_a = loader.dataset[0]
             sample_b = loader.dataset[min(100, len(loader.dataset) - 1)]
-            seed = 123
             a_hip_fixed = sample_a["A_hip"].unsqueeze(0).to(device)
             a_wrist_fixed = sample_a["A_wrist"].unsqueeze(0).to(device)
-            x_fixed = sample_a["skeleton"].unsqueeze(0).to(device)
+            a_hip_other = sample_b["A_hip"].unsqueeze(0).to(device)
+            a_wrist_other = sample_b["A_wrist"].unsqueeze(0).to(device)
+            # Per-sample gait metrics to ensure generation is conditioned on the
+            # same input that was used during training (fixes gait_metrics=None path).
             gait_a = sample_a["gait_metrics"].unsqueeze(0).to(device)
             gait_b = sample_b["gait_metrics"].unsqueeze(0).to(device)
-            y_fixed = sample_a["label"].view(1).to(device)
 
-            def _generate(gait_tensor: torch.Tensor) -> np.ndarray:
-                torch.manual_seed(seed)
-                s_tokens, s_global = stage2.aligner(a_hip_fixed, a_wrist_fixed, gait_metrics=gait_tensor)
-                c_tokens, c_global = stage3.condition_with_labels(h_tokens=s_tokens, h_global=s_global, y=y_fixed)
+            def _generate(
+                hip_tensor: torch.Tensor,
+                wrist_tensor: torch.Tensor,
+                sample_gait: torch.Tensor,
+            ) -> np.ndarray:
+                s_tokens, s_global = stage2.aligner(hip_tensor, wrist_tensor)
+                x_ref = sample_a["skeleton"].unsqueeze(0)
                 z0_local = sample_stage3_latents(
                     stage3=stage3,
-                    shape=torch.Size((1, x_fixed.shape[1], x_fixed.shape[2], stage3.latent_dim)),
+                    shape=torch.Size((1, x_ref.shape[1], x_ref.shape[2], stage3.latent_dim)),
                     device=device,
-                    h_tokens=c_tokens,
-                    h_global=c_global,
-                    gait_metrics=gait_tensor,
+                    h_tokens=s_tokens,
+                    h_global=s_global,
+                    gait_metrics=sample_gait,
                     sample_steps=sample_steps,
                     sampler=sampler,
+                    sample_seed=sample_seed,
                 )
-                x_local = stage3.decoder(z0_local)
-                return compute_gait_metrics_torch(x_local, fps=fps).cpu().numpy()[0]
+                return stage3.decoder(z0_local).cpu().numpy()[0]
 
-            gen_a = _generate(gait_a)
-            gen_b = _generate(gait_b)
-            for i, name in enumerate(GAIT_METRIC_NAMES):
-                conditioning_rows.append(
-                    {
-                        "metric_name": name,
-                        "conditioning_a": float(gait_a.cpu().numpy()[0, i]),
-                        "conditioning_b": float(gait_b.cpu().numpy()[0, i]),
-                        "generated_a": float(gen_a[i]),
-                        "generated_b": float(gen_b[i]),
-                        "generated_delta": float(gen_b[i] - gen_a[i]),
-                    }
-                )
+            gen_a1 = _generate(a_hip_fixed, a_wrist_fixed, gait_a)
+            gen_a2 = _generate(a_hip_fixed, a_wrist_fixed, gait_a)
+            gen_b = _generate(a_hip_other, a_wrist_other, gait_b)
+            sensitivity_pairs.append(
+                {
+                    "repeatability_error": float(np.abs(gen_a1 - gen_a2).max()),
+                    "imu_distance": float(
+                        torch.linalg.norm(torch.cat([a_hip_fixed.flatten(), a_wrist_fixed.flatten()]) - torch.cat([a_hip_other.flatten(), a_wrist_other.flatten()])).item()
+                    ),
+                    "output_distance": float(np.linalg.norm(gen_a1.reshape(-1) - gen_b.reshape(-1))),
+                }
+            )
 
-    if not gen_gait_list:
+    if not gen_gait_list or not reconstruction_rows:
         return
     real_gait = np.concatenate(real_gait_list, axis=0)
     gen_gait = np.concatenate(gen_gait_list, axis=0)
@@ -876,23 +1019,59 @@ def evaluate_stage3(
                 "generated_std": float(gen_gait[:, i].std()),
             }
         )
+    write_csv(
+        out_dir / "stage3_reconstruction_summary.csv",
+        reconstruction_rows,
+        ["sample_index", "mpjpe", "root_trajectory_error", "velocity_error", "latent_reconstruction_error", "gait_error"],
+    )
+    write_json(
+        out_dir / "stage3_reconstruction_metrics.json",
+        {
+            "mpjpe_mean": float(np.mean([row["mpjpe"] for row in reconstruction_rows])),
+            "root_trajectory_error_mean": float(np.mean([row["root_trajectory_error"] for row in reconstruction_rows])),
+            "velocity_error_mean": float(np.mean([row["velocity_error"] for row in reconstruction_rows])),
+            "latent_reconstruction_error_mean": float(np.mean([row["latent_reconstruction_error"] for row in reconstruction_rows])),
+            "gait_error_mean": float(np.mean([row["gait_error"] for row in reconstruction_rows])),
+        },
+    )
     write_csv(out_dir / "generated_gait_metric_summary.csv", rows, ["metric_name", "real_mean", "real_std", "generated_mean", "generated_std"])
     if epoch is not None:
         update_stage3_metric_history(out_dir.parent, epoch, rows)
     write_hist_grid(out_dir / "real_vs_generated_gait_distributions.png", "Real vs Generated Gait Metric Distributions", real_gait, gen_gait, GAIT_METRIC_NAMES)
     write_scatter(out_dir / "real_vs_generated_speed_vs_com_fore_aft.png", "Real vs Generated: Walking Speed vs Mean CoM Fore-Aft", real_gait[:, 6], real_gait[:, 0], gen_gait[:, 6], gen_gait[:, 0], "Mean Walking Speed", "Mean CoM Fore-Aft")
-    if conditioning_rows:
-        write_csv(out_dir / "conditioning_sensitivity.csv", conditioning_rows, ["metric_name", "conditioning_a", "conditioning_b", "generated_a", "generated_b", "generated_delta"])
+    _write_histogram(out_dir / "stage3_mpjpe_hist.png", "Stage3 MPJPE Distribution", np.asarray([row["mpjpe"] for row in reconstruction_rows], dtype=np.float32), "MPJPE")
+    if sample_real is not None and sample_gen is not None:
+        render_skeleton_panels(out_dir / "stage3_real_vs_generated_panels.png", [sample_real, sample_gen], ["Real", "Generated"])
+        _write_overlay_plot(out_dir / "stage3_root_trajectory_overlay.png", "Root Trajectory Overlay", sample_real[:, 0, 0], sample_gen[:, 0, 0], "Root X")
+        real_speed = np.linalg.norm(sample_real[1:, 0, :] - sample_real[:-1, 0, :], axis=-1)
+        gen_speed = np.linalg.norm(sample_gen[1:, 0, :] - sample_gen[:-1, 0, :], axis=-1)
+        _write_overlay_plot(out_dir / "stage3_velocity_overlay.png", "Root Velocity Overlay", real_speed, gen_speed, "Speed")
+        joint_error = np.linalg.norm(sample_gen - sample_real, axis=-1)
+        write_heatmap(out_dir / "stage3_joint_error_heatmap_sample_0.png", "Stage3 Joint Reconstruction Error", joint_error.T, "Frame", "Joint", cmap="magma")
+    if sensitivity_pairs:
+        write_json(
+            out_dir / "stage3_repeatability.json",
+            {
+                "repeatability_error": float(np.mean([row["repeatability_error"] for row in sensitivity_pairs])),
+                "imu_distance_mean": float(np.mean([row["imu_distance"] for row in sensitivity_pairs])),
+                "output_distance_mean": float(np.mean([row["output_distance"] for row in sensitivity_pairs])),
+            },
+        )
         if plt is not None:
-            plt.figure(figsize=(12, 6))
-            plt.bar([row["metric_name"] for row in conditioning_rows], [row["generated_delta"] for row in conditioning_rows], color="#2563eb")
-            plt.title("Conditioning Sensitivity Under Fixed Seed")
-            plt.xlabel("Gait metric")
-            plt.ylabel("Generated metric delta (B - A)")
-            plt.xticks(rotation=40, ha="right")
-            plt.grid(True, axis="y", alpha=0.25)
+            ensure_dir(out_dir)
+            plt.figure(figsize=(8, 6))
+            plt.scatter(
+                [row["imu_distance"] for row in sensitivity_pairs],
+                [row["output_distance"] for row in sensitivity_pairs],
+                color="#2563eb",
+                s=50,
+            )
+            plt.title("IMU Distance vs Output Distance")
+            plt.xlabel("IMU distance")
+            plt.ylabel("Generated output distance")
+            plt.grid(True, alpha=0.25)
             plt.tight_layout()
-            plt.savefig(out_dir / "conditioning_sensitivity.png", dpi=180)
+            plt.savefig(out_dir / "stage3_sensitivity_scatter.png", dpi=180)
             plt.close()
     if gen_sequences:
         render_skeleton_panels(out_dir / "generated_motion_examples.png", gen_sequences, [f"sample_{i}" for i in range(len(gen_sequences))])

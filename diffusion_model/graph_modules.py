@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from diffusion_model.util import assert_shape, build_adjacency_matrix
 
 try:
-    from torch_geometric.nn import GATConv
+    from torch_geometric.nn import GATConv, GCNConv
 
     HAS_TORCH_GEOMETRIC = True
 except Exception:
@@ -51,6 +51,9 @@ class PyGGraphLayer(nn.Module):
         self.dim = dim
         self.num_joints = num_joints
         self.gat = GATConv(in_channels=dim, out_channels=dim // heads, heads=heads, concat=True)
+        # Cache batched edge_index by (b*t, num_joints, num_edges) key to avoid
+        # rebuilding the offset tensor every forward call.
+        self._batched_edge_cache: dict = {}
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """Apply graph convolution to x with shape [B, T, J, D]."""
@@ -58,8 +61,13 @@ class PyGGraphLayer(nn.Module):
         assert_shape(x, [None, None, self.num_joints, self.dim], "PyGGraphLayer.x")
         assert_shape(edge_index, [2, None], "PyGGraphLayer.edge_index")
         x_flat = x.reshape(b * t * j, d)
-        offsets = torch.arange(0, b * t, device=x.device).repeat_interleave(edge_index.shape[1]) * j
-        repeated_edge_index = edge_index.repeat(1, b * t) + offsets.unsqueeze(0)
+        cache_key = (b * t, j, int(edge_index.shape[1]))
+        if cache_key not in self._batched_edge_cache:
+            offsets = torch.arange(0, b * t, device=x.device).repeat_interleave(edge_index.shape[1]) * j
+            self._batched_edge_cache[cache_key] = (
+                edge_index.repeat(1, b * t) + offsets.unsqueeze(0)
+            ).contiguous()
+        repeated_edge_index = self._batched_edge_cache[cache_key]
         y = self.gat(x_flat, repeated_edge_index)
         y = y.reshape(b, t, j, d)
         return y
@@ -124,6 +132,7 @@ class TemporalPyGGraphLayer(nn.Module):
         super().__init__()
         self.dim = dim
         self.gat = GATConv(in_channels=dim, out_channels=dim // heads, heads=heads, concat=True)
+        self._batched_edge_cache: dict = {}
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """Apply temporal graph convolution to x with shape [B, T, D]."""
@@ -131,24 +140,41 @@ class TemporalPyGGraphLayer(nn.Module):
         assert_shape(x, [None, None, self.dim], "TemporalPyGGraphLayer.x")
         assert_shape(edge_index, [2, None], "TemporalPyGGraphLayer.edge_index")
         x_flat = x.reshape(b * t, d)
-        offsets = torch.arange(0, b, device=x.device).repeat_interleave(edge_index.shape[1]) * t
-        repeated_edge_index = edge_index.repeat(1, b) + offsets.unsqueeze(0)
+        cache_key = (b, t, int(edge_index.shape[1]))
+        if cache_key not in self._batched_edge_cache:
+            offsets = torch.arange(0, b, device=x.device).repeat_interleave(edge_index.shape[1]) * t
+            self._batched_edge_cache[cache_key] = (
+                edge_index.repeat(1, b) + offsets.unsqueeze(0)
+            ).contiguous()
+        repeated_edge_index = self._batched_edge_cache[cache_key]
         y = self.gat(x_flat, repeated_edge_index)
         y = y.reshape(b, t, d)
         return y
 
 
 class TemporalGraphBlock(nn.Module):
-    """Residual temporal graph block using temporal GAT edges."""
+    """Residual temporal block using full-sequence multi-head attention.
+
+    Replaced the TemporalPyGGraphLayer (GATConv with ±1 neighbours) with
+    TemporalMaskedGraphAttention (full MHA over the sequence).
+
+    Root cause of sensor model collapse: GATConv with 3 layers has a
+    receptive field of only 7 frames out of 90.  Walking cadence (~1 Hz)
+    spans 30 frames; a single step spans 15 frames — both are completely
+    outside the 7-frame window, so the TGNN is structurally blind to gait
+    patterns regardless of training signal.
+
+    Full attention allows every timestep to attend to every other timestep,
+    giving the sensor model a global view of the IMU window.
+    The adjacency argument is accepted but ignored (kept for API compatibility
+    with call sites that pass it).
+    """
 
     def __init__(self, dim: int, num_heads: int, use_pyg: bool = True) -> None:
         super().__init__()
         self.dim = dim
-        self.use_pyg = bool(use_pyg and HAS_TORCH_GEOMETRIC)
-        if not self.use_pyg:
-            raise RuntimeError("TemporalGraphBlock requires torch_geometric GATConv for proposal-exact mode.")
-        self.graph_op = TemporalPyGGraphLayer(dim=dim, heads=num_heads)
-        self.masked_attn = None
+        # Full-sequence attention: receptive field = T (entire window)
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.ff = nn.Sequential(
@@ -158,16 +184,89 @@ class TemporalGraphBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, adjacency: torch.Tensor, edge_index: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Run temporal graph op then feed-forward with residual paths."""
+        """Run full-sequence self-attention then feed-forward with residual paths."""
         b, t, d = x.shape
         assert_shape(x, [None, None, self.dim], "TemporalGraphBlock.x")
-        assert_shape(adjacency, [t, t], "TemporalGraphBlock.adjacency")
         h = self.norm1(x)
-        assert edge_index is not None, "edge_index is required when torch_geometric path is used"
-        y = self.graph_op(h, edge_index)
+        y, _ = self.attn(h, h, h)
         x = x + y
         x = x + self.ff(self.norm2(x))
         assert_shape(x, [b, t, d], "TemporalGraphBlock.out")
+        return x
+
+
+class TemporalGCNBlock(nn.Module):
+    """Residual temporal GCN block using GCNConv over a multi-scale temporal graph.
+
+    Replaces full MHA with graph convolution.  The key difference from the old
+    TGNN (GATConv with ±1 neighbours only) is that the graph this block operates
+    on includes multi-scale temporal edges at distances {1, 5, 15, 30}, giving a
+    receptive field of 3×30+1 = 91 frames with 3 stacked blocks — enough to
+    capture a full gait cycle at 30 fps.
+
+    GCNConv normalises by node degree, which handles the varying connectivity of
+    boundary nodes (beginning/end of sequence) automatically.
+    """
+
+    def __init__(self, dim: int, num_layers: int = 3, dropout: float = 0.25) -> None:
+        super().__init__()
+        self.dim = dim
+        self.num_layers = num_layers
+        self.dropout = dropout
+        if not HAS_TORCH_GEOMETRIC:
+            raise ImportError("torch_geometric is required for TemporalGCNBlock.")
+        # Stack of GCNConv layers with residual connections.
+        # add_self_loops=False because self-loops are already in the graph adjacency.
+        self.convs = nn.ModuleList(
+            [GCNConv(in_channels=dim, out_channels=dim, add_self_loops=False) for _ in range(num_layers)]
+        )
+        self.norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
+        self.norm_ff = nn.LayerNorm(dim)
+        self.drop = nn.Dropout(p=dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(dim * 4, dim),
+        )
+        # Cache batched edge_index by (batch_size, seq_len, num_edges) to avoid
+        # rebuilding the offset tensor every forward call.
+        self._batched_edge_cache: dict = {}
+
+    def forward(self, x: torch.Tensor, adjacency: torch.Tensor, edge_index: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Apply GCN layers then feed-forward with residual paths.
+
+        Args:
+            x:          [B, T, D] node features.
+            adjacency:  [T, T] adjacency matrix (used only for shape checking).
+            edge_index: [2, E] edge list derived from adjacency (required).
+        """
+        b, t, d = x.shape
+        assert_shape(x, [None, None, self.dim], "TemporalGCNBlock.x")
+        assert edge_index is not None, "edge_index is required for TemporalGCNBlock"
+
+        x_flat = x.reshape(b * t, d)
+
+        # Build or retrieve batched edge_index with per-graph node offsets.
+        cache_key = (b, t, int(edge_index.shape[1]), x.device.index if x.device.type == "cuda" else -1)
+        if cache_key not in self._batched_edge_cache:
+            offsets = torch.arange(0, b, device=x.device).repeat_interleave(edge_index.shape[1]) * t
+            self._batched_edge_cache[cache_key] = (
+                edge_index.repeat(1, b) + offsets.unsqueeze(0)
+            ).contiguous()
+        batched_ei = self._batched_edge_cache[cache_key]
+
+        # Stacked GCN layers with residual connections.
+        for conv, norm in zip(self.convs, self.norms):
+            h = conv(x_flat, batched_ei)          # [B*T, D]
+            h = F.gelu(h)
+            h = self.drop(h)
+            h = norm(h.reshape(b, t, d)).reshape(b * t, d)
+            x_flat = x_flat + h
+
+        x = x_flat.reshape(b, t, d)
+        x = x + self.ff(self.norm_ff(x))
+        assert_shape(x, [b, t, d], "TemporalGCNBlock.out")
         return x
 
 

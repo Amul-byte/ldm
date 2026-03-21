@@ -154,25 +154,35 @@ def save_skeleton_frame_plot(sample_idx: int, x: torch.Tensor, x_hat: torch.Tens
     panel_titles = ["Start", "Middle", "End"]
     x_np = x.detach().cpu().numpy()
     x_hat_np = x_hat.detach().cpu().numpy()
+    projected_x = x_np[..., [0, 2]] - x_np[:, 0:1, [0, 2]]
+    projected_x_hat = x_hat_np[..., [0, 2]] - x_hat_np[:, 0:1, [0, 2]]
+    combined = np.concatenate([projected_x.reshape(-1, 2), projected_x_hat.reshape(-1, 2)], axis=0)
+    lo = np.percentile(combined, 2.0, axis=0)
+    hi = np.percentile(combined, 98.0, axis=0)
+    span = max(float(np.max(hi - lo)), 1e-6)
+    center = (lo + hi) * 0.5
+    half = span * 0.6
 
     fig, axes = plt.subplots(2, 3, figsize=(12, 8), constrained_layout=True)
-    for row_idx, (source, row_name, color) in enumerate(((x_np, "Input", "#2563eb"), (x_hat_np, "Decoded", "#dc2626"))):
+    for row_idx, (source, row_name, color) in enumerate(((projected_x, "Input", "#2563eb"), (projected_x_hat, "Decoded", "#dc2626"))):
         for col_idx, (frame_idx, panel_title) in enumerate(zip(frame_ids, panel_titles)):
             ax = axes[row_idx][col_idx]
             pose = source[frame_idx]
             for start, end in edges:
                 ax.plot(
                     [pose[start, 0], pose[end, 0]],
-                    [pose[start, 2], pose[end, 2]],
+                    [pose[start, 1], pose[end, 1]],
                     color=color,
                     linewidth=1.2,
                     alpha=0.9,
                 )
-            ax.scatter(pose[:, 0], pose[:, 2], color=color, s=10)
+            ax.scatter(pose[:, 0], pose[:, 1], color=color, s=10)
             ax.set_title(f"{row_name} {panel_title} f={frame_idx}")
             ax.set_xlabel("x")
             ax.set_ylabel("z")
             ax.set_aspect("equal", adjustable="box")
+            ax.set_xlim(center[0] - half, center[0] + half)
+            ax.set_ylim(center[1] + half, center[1] - half)
             ax.grid(alpha=0.2)
 
     fig.suptitle(f"Stage-1 Skeleton Frames Sample {sample_idx} (x-z projection)", fontsize=14)

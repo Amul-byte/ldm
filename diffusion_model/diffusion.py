@@ -47,12 +47,18 @@ class DiffusionProcess(nn.Module):
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
         self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0 / alphas))
 
-    def q_sample(self, z0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def q_sample(
+        self,
+        z0: torch.Tensor,
+        t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
         """Sample forward process q(z_t | z_0)."""
         assert_shape(z0, [None, None, None, None], "DiffusionProcess.q_sample.z0")
         assert_shape(t, [z0.shape[0]], "DiffusionProcess.q_sample.t")
         if noise is None:
-            noise = torch.randn_like(z0)
+            noise = torch.randn(z0.shape, device=z0.device, dtype=z0.dtype, generator=generator)
         assert noise.shape == z0.shape, "noise and z0 shape mismatch"
         sqrt_alpha = extract(self.sqrt_alphas_cumprod, t, z0.shape)
         sqrt_one_minus = extract(self.sqrt_one_minus_alphas_cumprod, t, z0.shape)
@@ -70,6 +76,7 @@ class DiffusionProcess(nn.Module):
         h_global: Optional[torch.Tensor] = None,
         h: Optional[torch.Tensor] = None,
         gait_metrics: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         """Compute epsilon prediction MSE loss for a denoiser."""
         assert_shape(z0, [None, None, None, None], "DiffusionProcess.predict_noise_loss.z0")
@@ -77,7 +84,7 @@ class DiffusionProcess(nn.Module):
             h_global = h
         if h_tokens is None and sensor_tokens is not None:
             h_tokens = sensor_tokens
-        noise = torch.randn_like(z0)
+        noise = torch.randn(z0.shape, device=z0.device, dtype=z0.dtype, generator=generator)
         zt = self.q_sample(z0=z0, t=t, noise=noise)
         pred_noise = denoiser(zt, t, sensor_tokens=h_tokens, h_tokens=h_tokens, h_global=h_global, gait_metrics=gait_metrics)
         assert pred_noise.shape == noise.shape, "predicted noise shape mismatch"
@@ -93,6 +100,7 @@ class DiffusionProcess(nn.Module):
         h_global: Optional[torch.Tensor] = None,
         h: Optional[torch.Tensor] = None,
         gait_metrics: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         """Sample one reverse step p(z_{t-1}|z_t, h)."""
         assert_shape(zt, [None, None, None, None], "DiffusionProcess.p_sample.zt")
@@ -110,7 +118,7 @@ class DiffusionProcess(nn.Module):
         model_mean = sqrt_recip_alphas_t * (zt - betas_t * pred_noise / sqrt_one_minus_alphas_cumprod_t)
 
         nonzero_mask = (t != 0).float().reshape(zt.shape[0], *([1] * (zt.ndim - 1)))
-        noise = torch.randn_like(zt)
+        noise = torch.randn(zt.shape, device=zt.device, dtype=zt.dtype, generator=generator)
         sigma_t = torch.sqrt(torch.clamp(betas_t, min=1e-20))
         z_prev = model_mean + nonzero_mask * sigma_t * noise
         assert z_prev.shape == zt.shape, "p_sample output shape mismatch"
@@ -127,6 +135,7 @@ class DiffusionProcess(nn.Module):
         h_global: Optional[torch.Tensor] = None,
         h: Optional[torch.Tensor] = None,
         gait_metrics: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         """Run full reverse process from z_T ~ N(0, I) to z_0."""
         assert len(shape) == 4, "shape must be [B,T,J,D]"
@@ -134,7 +143,7 @@ class DiffusionProcess(nn.Module):
             h_global = h
         if h_tokens is None and sensor_tokens is not None:
             h_tokens = sensor_tokens
-        z = torch.randn(shape, device=device)
+        z = torch.randn(shape, device=device, generator=generator)
 
         if h_tokens is not None:
             assert_shape(h_tokens, [shape[0], shape[1], shape[3]], "DiffusionProcess.p_sample_loop.h_tokens")
@@ -151,6 +160,7 @@ class DiffusionProcess(nn.Module):
                 h_tokens=h_tokens,
                 h_global=h_global,
                 gait_metrics=gait_metrics,
+                generator=generator,
             )
         assert_shape(z, [shape[0], shape[1], shape[2], shape[3]], "DiffusionProcess.p_sample_loop.z")
         return z
@@ -183,6 +193,7 @@ class DiffusionProcess(nn.Module):
         h_global: Optional[torch.Tensor] = None,
         h: Optional[torch.Tensor] = None,
         gait_metrics: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         """Run DDIM sampling with configurable number of reverse steps.
 
@@ -195,7 +206,7 @@ class DiffusionProcess(nn.Module):
             h_global = h
         if h_tokens is None and sensor_tokens is not None:
             h_tokens = sensor_tokens
-        z = torch.randn(shape, device=device)
+        z = torch.randn(shape, device=device, generator=generator)
 
         if h_tokens is not None:
             assert_shape(h_tokens, [shape[0], shape[1], shape[3]], "DiffusionProcess.p_sample_loop_ddim.h_tokens")
@@ -226,7 +237,7 @@ class DiffusionProcess(nn.Module):
             )
             direction = torch.sqrt(torch.clamp(1.0 - alpha_bar_next - sigma * sigma, min=0.0)) * pred_noise
             if eta > 0.0 and int(t_next_scalar.item()) >= 0:
-                noise = torch.randn_like(z)
+                noise = torch.randn(z.shape, device=z.device, dtype=z.dtype, generator=generator)
             else:
                 noise = torch.zeros_like(z)
             z = torch.sqrt(torch.clamp(alpha_bar_next, min=1e-20)) * x0_pred + direction + sigma * noise

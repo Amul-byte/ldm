@@ -52,8 +52,8 @@ OUTPUTS_DIR = ROOT / "outputs"
 CHECKPOINTS_DIR = ROOT / "checkpoints"
 SMARTFALL_ENV_PYTHON = Path("/home/qsw26/miniconda3/envs/smartfall_env_3.11/bin/python")
 CHECKPOINT_SEARCH_DIRS = [
-    OUTPUTS_DIR / "retrain_meeting" / "checkpoints",
     CHECKPOINTS_DIR,
+    OUTPUTS_DIR / "retrain_meeting" / "checkpoints",
 ]
 
 
@@ -771,6 +771,8 @@ def current_code_facts() -> dict[str, str]:
         facts["current_train_cli_has_gait_loss"] = "yes"
     if "loss = loss_diff + args.lambda_cls * loss_cls + args.lambda_motion * loss_motion + args.lambda_gait * loss_gait" in train_text:
         facts["current_stage3_objective_in_code"] = "diffusion + classification + motion + gait"
+    elif "lambda_pose * loss_pose" in train_text and "lambda_latent * loss_latent" in train_text:
+        facts["current_stage3_objective_in_code"] = "diffusion + pose + latent + velocity + gait + motion"
     elif "loss = args.lambda_gait * loss_gait" in train_text:
         facts["current_stage3_objective_in_code"] = "gait-only total loss"
     if "GAIT_METRIC_NAMES" in gait_text:
@@ -1170,6 +1172,7 @@ def run_rich_analysis(report_dir: Path, gait_metric_names: list[str]) -> dict[st
         num_joints=DEFAULT_JOINTS,
         timesteps=DEFAULT_TIMESTEPS,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
     ).to(device)
     stage1_ckpt_path = _load_checkpoint_from_candidates(stage1, "stage1_best.pt")
     stage2 = Stage2Model(
@@ -1188,6 +1191,7 @@ def run_rich_analysis(report_dir: Path, gait_metric_names: list[str]) -> dict[st
         num_classes=DEFAULT_NUM_CLASSES,
         timesteps=DEFAULT_TIMESTEPS,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
     ).to(device)
     stage3_ckpt_path = _load_checkpoint_from_candidates(stage3, "stage3_best.pt")
     stage1.eval()
@@ -1218,7 +1222,17 @@ def run_rich_analysis(report_dir: Path, gait_metric_names: list[str]) -> dict[st
         drop_last=False,
     )
 
-    timestep_values = [0, 100, 200,400, 499, 599, 799, 999]
+    max_timestep = int(stage3.diffusion.timesteps) - 1
+    timestep_values = sorted(
+        {
+            0,
+            max_timestep // 5,
+            (2 * max_timestep) // 5,
+            (3 * max_timestep) // 5,
+            (4 * max_timestep) // 5,
+            max_timestep,
+        }
+    )
     timestep_errors = {t: [] for t in timestep_values}
     stage3_timestep_errors = {t: [] for t in timestep_values}
     latent_features: list[np.ndarray] = []
@@ -1302,7 +1316,17 @@ def run_rich_analysis(report_dir: Path, gait_metric_names: list[str]) -> dict[st
                     sample_y = y[:1]
                     s_tokens, s_global = stage2.aligner(sample_hip, sample_wrist, gait_metrics=sample_gait)
                     c_tokens, c_global = stage3.condition_with_labels(h_tokens=s_tokens, h_global=s_global, y=sample_y)
-                    timesteps_to_capture = [999, 699, 499, 300, 100, 0]
+                    timesteps_to_capture = sorted(
+                        {
+                            0,
+                            max_timestep // 5,
+                            (2 * max_timestep) // 5,
+                            (3 * max_timestep) // 5,
+                            (4 * max_timestep) // 5,
+                            max_timestep,
+                        },
+                        reverse=True,
+                    )
                     z = torch.randn((1, sample_x.shape[1], sample_x.shape[2], DEFAULT_LATENT_DIM), device=device)
                     captured: dict[int, np.ndarray] = {}
                     for i in reversed(range(stage3.diffusion.timesteps)):
@@ -1616,12 +1640,14 @@ def main() -> int:
         component_series: list[tuple[str, list[float], str]] = []
         color_cycle = {
             "train_loss_diff": "#2563eb",
-            "train_loss_cls": "#7c3aed",
+            "train_loss_pose": "#dc2626",
+            "train_loss_latent": "#7c3aed",
+            "train_loss_vel": "#ea580c",
             "train_loss_gait": "#059669",
-            "train_loss_bone": "#ea580c",
-            "train_loss_instab": "#dc2626",
+            "train_loss_bone": "#c2410c",
+            "train_loss_instab": "#be123c",
         }
-        for metric in ["train_loss_diff", "train_loss_cls", "train_loss_gait", "train_loss_bone", "train_loss_instab"]:
+        for metric in ["train_loss_diff", "train_loss_pose", "train_loss_latent", "train_loss_vel", "train_loss_gait", "train_loss_bone", "train_loss_instab"]:
             if stage3_latest.has_metric(metric):
                 component_series.append(
                     (

@@ -291,6 +291,8 @@ class TorchFileGaitDataset(Dataset):
             assert hip_id in {"meta_hip", "right_hip"}, "Hip accel stream must correspond to meta_hip"
             assert wrist_id in {"weta_wrist", "meta_wrist", "left_wrist"}, "Wrist accel stream must correspond to weta_wrist"
         assert self.fps == 30, f"SmartFallMM constraint violated: expected 30 FPS, got {self.fps}"
+        self._fps_tensor = torch.tensor(self.fps, dtype=torch.long)
+        self._joint_labels = list(get_joint_labels())
 
         assert_shape(self.skeleton, [None, window, joints, 3], "TorchFileGaitDataset.skeleton")
         assert_shape(self.A_hip, [self.skeleton.shape[0], window, 3], "TorchFileGaitDataset.A_hip")
@@ -310,8 +312,8 @@ class TorchFileGaitDataset(Dataset):
             "A_wrist": self.A_wrist[idx],
             "gait_metrics": self.gait_metrics[idx],
             "label": self.label[idx],
-            "fps": torch.tensor(self.fps, dtype=torch.long),
-            "joint_labels": list(get_joint_labels()),
+            "fps": self._fps_tensor,
+            "joint_labels": self._joint_labels,
         }
 
 
@@ -416,6 +418,8 @@ class CSVPairedGaitDataset(Dataset):
         assert_shape(self.gait_metrics, [self.skeleton.shape[0], None], "CSVPairedGaitDataset.gait_metrics")
         assert_shape(self.label, [self.skeleton.shape[0]], "CSVPairedGaitDataset.label")
         assert_shape(self.subject_ids, [self.skeleton.shape[0]], "CSVPairedGaitDataset.subject_ids")
+        self._fps_tensor = torch.tensor(self.fps, dtype=torch.long)
+        self._joint_labels = list(get_joint_labels())
 
     def __len__(self) -> int:
         """Return number of samples."""
@@ -429,8 +433,8 @@ class CSVPairedGaitDataset(Dataset):
             "A_wrist": self.A_wrist[idx],
             "gait_metrics": self.gait_metrics[idx],
             "label": self.label[idx],
-            "fps": torch.tensor(self.fps, dtype=torch.long),
-            "joint_labels": list(get_joint_labels()),
+            "fps": self._fps_tensor,
+            "joint_labels": self._joint_labels,
         }
 
 
@@ -520,4 +524,5 @@ def create_dataloader(
     }
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
     return DataLoader(dataset, **loader_kwargs)

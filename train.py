@@ -111,16 +111,29 @@ def _setup_logging() -> None:
 
 
 def _init_distributed(args: argparse.Namespace) -> tuple[bool, int, int]:
-    """Single-GPU mode: reject multi-process launches and skip DDP init."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size > 1:
-        raise ValueError(
-            "This training script is configured for single-GPU mode. "
-            "Run with `python train.py ...` (do not use torchrun --nproc_per_node>1)."
+        if not torch.cuda.is_available():
+            raise ValueError("DDP requires CUDA/NCCL in this script.")
+
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        rank = int(os.environ.get("RANK", "0"))
+
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
         )
+        torch.cuda.set_device(local_rank)
+
+        if args.ddp or world_size > 1:
+            print(f"[train] DDP initialized rank={rank} local_rank={local_rank} world_size={world_size}")
+
+        return True, local_rank, world_size
+
     if args.ddp:
-        print("[train] --ddp is ignored in single-GPU mode.")
+        print("[train] --ddp was passed, but WORLD_SIZE=1 so DDP is disabled.")
     return False, 0, 1
+
 
 
 def _resolve_data_mode(args: argparse.Namespace) -> str:
@@ -166,10 +179,13 @@ def _print_run_summary(args: argparse.Namespace, device: torch.device) -> None:
     LOGGER.info("Gait metrics dim: %s", args.gait_metrics_dim)
     LOGGER.info("Gait metric names: %s", ", ".join(GAIT_METRIC_NAMES))
     LOGGER.info("IMU feature names: %s", ", ".join(IMU_FEATURE_NAMES))
+    LOGGER.info("One-to-one mode: %s", args.one_to_one)
     if args.stage == 3:
         LOGGER.info(
-            "Stage3 objective: lambda_cls=%s lambda_motion=%s lambda_gait=%s fps=%s sample_steps=%s",
-            args.lambda_cls,
+            "Stage3 objective: lambda_pose=%s lambda_latent=%s lambda_vel=%s lambda_gait=%s lambda_motion=%s fps=%s sample_steps=%s",
+            args.lambda_pose,
+            args.lambda_latent,
+            args.lambda_vel,
             args.lambda_motion,
             args.lambda_gait,
             args.fps,
@@ -299,7 +315,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_gait_cache", action="store_true")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--ddp", action="store_true", help="Enable DistributedDataParallel (or auto-enabled under torchrun).")
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--no_pin_memory", action="store_true")
     parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -323,20 +339,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=30)
     parser.add_argument("--disable_sensor_norm", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--one_to_one", dest="one_to_one", action="store_true", help="Enable one-to-one IMU->skeleton mode.")
+    parser.add_argument("--no_one_to_one", dest="one_to_one", action="store_false", help="Use legacy conditioning behavior.")
+    parser.set_defaults(one_to_one=True)
     parser.add_argument("--val_split", type=float, default=0.1, help="Fraction of data used for validation (0 disables validation).")
     parser.add_argument(
         "--train_subjects",
         type=str,
-        default=",".join(str(item) for item in DEFAULT_TRAIN_SUBJECTS),
-        help="Comma-separated subject ids used for training; all other subjects go to validation.",
+        default="",
+        help="Comma-separated subject ids used for training; all other subjects go to validation. Leave empty to use random val_split instead.",
     )
     parser.add_argument("--log_every", type=int, default=20, help="Plain progress print interval (steps) when tqdm is not interactive.")
     parser.add_argument("--lambda_cls", type=float, default=0.1, help="Weight for classification loss (Stage-3 only).")
+    parser.add_argument("--lambda_pose", type=float, default=1.0, help="Weight for paired skeleton reconstruction loss (Stage-3 only).")
+    parser.add_argument("--lambda_latent", type=float, default=0.5, help="Weight for latent reconstruction loss (Stage-3 only).")
+    parser.add_argument("--lambda_vel", type=float, default=0.5, help="Weight for velocity reconstruction loss (Stage-3 only).")
     parser.add_argument("--lambda_motion", type=float, default=1.0, help="Weight for motion regularization loss (Stage-3 only).")
     parser.add_argument("--lambda-gait", type=float, default=1.0, help="Weight for generated-vs-real gait-summary MSE loss (Stage-3 only).")
     parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="Skeleton frame-rate for temporal losses (Stage-3 only).")
     parser.add_argument("--sample_steps", type=int, default=50, help="DDIM sampling steps for evaluation/generation.")
     parser.add_argument("--sampler", type=str, default="ddpm", choices=["ddim", "ddpm"], help="Reverse-process sampler for evaluation/generation.")
+    parser.add_argument("--sample_seed", type=int, default=0, help="Deterministic sampling seed used for evaluation/generation.")
     parser.add_argument("--eval_every_stage1", type=int, default=5, help="Epoch interval for Stage-1 evaluation artifacts.")
     parser.add_argument("--eval_every_stage2", type=int, default=10, help="Epoch interval for Stage-2 evaluation artifacts.")
     parser.add_argument("--eval_every_stage3", type=int, default=5, help="Epoch interval for Stage-3 evaluation artifacts.")
@@ -352,6 +375,7 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         num_joints=args.joints,
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
+        use_gait_conditioning=not args.one_to_one,
     ).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -515,6 +539,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         num_joints=args.joints,
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
+        use_gait_conditioning=not args.one_to_one,
     ).to(device)
     if args.stage1_ckpt:
         load_checkpoint(args.stage1_ckpt, stage1, strict=True)
@@ -524,6 +549,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         latent_dim=args.latent_dim,
         num_joints=args.joints,
         gait_metrics_dim=args.gait_metrics_dim,
+        num_classes=args.num_classes,
     ).to(device)
     assert all(not p.requires_grad for p in model.encoder.parameters()), "stage2 encoder must be frozen"
     if distributed:
@@ -576,6 +602,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
     for epoch in range(args.epochs):
         t0 = time.time()
         sum_loss = 0.0
+        sum_contrast = 0.0
         n_batches = 0
         total_steps = len(train_loader)
         progress_enabled = _is_main_process() and sys.stdout.isatty()
@@ -589,6 +616,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
             a_hip_stream = batch["A_hip"].to(device)
             a_wrist_stream = batch["A_wrist"].to(device)
             gait_metrics = batch["gait_metrics"].to(device)
+            y = batch["label"].to(device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 out = model(
@@ -596,12 +624,14 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
                     a_hip_stream=a_hip_stream,
                     a_wrist_stream=a_wrist_stream,
                     gait_metrics=gait_metrics,
+                    y=y,
                 )
                 loss = out["loss_align"]
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             sum_loss += float(loss.item())
+            sum_contrast += float(out.get("loss_cls", loss).item())
             n_batches += 1
             if tqdm is not None and progress_enabled:
                 pbar.set_postfix(loss=f"{(sum_loss / n_batches):.4f}")
@@ -622,6 +652,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
                 )
         avg_train_loss = sum_loss / max(n_batches, 1)
         avg_train_loss = _sync_mean(avg_train_loss, device)
+        avg_train_contrast = sum_contrast / max(n_batches, 1)
 
         avg_val_loss = None
         if val_loader is not None:
@@ -636,12 +667,14 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
                     a_hip_stream = batch["A_hip"].to(device)
                     a_wrist_stream = batch["A_wrist"].to(device)
                     gait_metrics = batch["gait_metrics"].to(device)
+                    y = batch["label"].to(device)
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                         out = model(
                             x=x,
                             a_hip_stream=a_hip_stream,
                             a_wrist_stream=a_wrist_stream,
                             gait_metrics=gait_metrics,
+                            y=y,
                         )
                         loss = out["loss_align"]
                     val_sum += float(loss.item())
@@ -650,7 +683,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
             avg_val_loss = val_sum / max(val_n, 1)
             avg_val_loss = _sync_mean(avg_val_loss, device)
 
-        metrics = {"train_loss_align": avg_train_loss}
+        metrics = {"train_loss_align": avg_train_loss, "train_loss_gait": avg_train_contrast}
         if avg_val_loss is not None:
             metrics["val_loss_align"] = avg_val_loss
         history.append({"epoch": float(epoch + 1), **metrics})
@@ -705,6 +738,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         num_joints=args.joints,
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
+        use_gait_conditioning=not args.one_to_one,
     ).to(device)
     if args.stage1_ckpt:
         load_checkpoint(args.stage1_ckpt, stage1, strict=True)
@@ -728,11 +762,16 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         num_classes=args.num_classes,
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
+        use_gait_conditioning=not args.one_to_one,
     ).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
+    # Include the Stage-2 aligner in the Stage-3 optimizer so Stage-3
+    # reconstruction losses (pose, velocity, gait, motion) can refine it.
+    # Stage-2 pre-training warm-starts the aligner; Stage-3 fine-tunes it.
     trainable_params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
+    trainable_params += list(stage2.aligner.parameters())
     optimizer = optim.Adam(trainable_params, lr=args.lr)
     if _is_main_process():
         save_run_manifest(
@@ -780,7 +819,9 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         t0 = time.time()
         sum_total = 0.0
         sum_diff = 0.0
-        sum_cls = 0.0
+        sum_pose = 0.0
+        sum_latent = 0.0
+        sum_vel = 0.0
         sum_gait = 0.0
         sum_motion = 0.0
         sum_bone = 0.0
@@ -797,40 +838,46 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             if args.max_train_batches > 0 and batch_idx >= args.max_train_batches:
                 break
             x = batch["skeleton"].to(device)
-            y = batch["label"].to(device)
             a_hip_stream = batch["A_hip"].to(device)
             a_wrist_stream = batch["A_wrist"].to(device)
             gait_metrics = batch["gait_metrics"].to(device)
 
-            # Stage2 is a fixed conditioner in stage3; avoid autograd through aligner.
-            with torch.no_grad():
-                h_tokens, h_global = stage2.aligner(
-                    a_hip_stream=a_hip_stream,
-                    a_wrist_stream=a_wrist_stream,
-                    gait_metrics=gait_metrics,
-                )
+            # Aligner is trainable in Stage 3: reconstruction losses provide
+            # stronger gradient signal than Stage-2 gait-metric prediction alone.
+            h_tokens, h_global = stage2.aligner(a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 out = model(
                     x=x,
-                    y=y,
                     h_tokens=h_tokens,
                     h_global=h_global,
+                    gait_target=gait_metrics,
                     gait_metrics=gait_metrics,
                     fps=args.fps,
                 )
                 loss_diff = out["loss_diff"]
-                loss_cls = out["loss_cls"]
-                loss_gait = torch.nn.functional.mse_loss(out["gait_gen"], gait_metrics)
+                loss_pose = out["loss_pose"]
+                loss_latent = out["loss_latent"]
+                loss_vel = out["loss_vel"]
+                loss_gait = out["loss_gait"]
                 loss_motion = out["loss_motion"]
-                loss = loss_diff + args.lambda_cls * loss_cls + args.lambda_motion * loss_motion + args.lambda_gait * loss_gait
+                loss = (
+                    loss_diff
+                    + args.lambda_pose * loss_pose
+                    + args.lambda_latent * loss_latent
+                    + args.lambda_vel * loss_vel
+                    + args.lambda_gait * loss_gait
+                    + args.lambda_motion * loss_motion
+                )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             sum_total += float(loss.item())
             sum_diff += float(loss_diff.item())
-            sum_cls += float(loss_cls.item())
+            sum_pose += float(loss_pose.item())
+            sum_latent += float(loss_latent.item())
+            sum_vel += float(loss_vel.item())
             sum_gait += float(loss_gait.item())
             sum_motion += float(loss_motion.item())
             sum_bone += float(out["loss_bone"].item())
@@ -860,15 +907,19 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     t0,
                 )
                 LOGGER.info(
-                    "[Stage3] step_losses diff=%.6f cls=%.6f gait=%.6f motion=%.6f",
+                    "[Stage3] step_losses diff=%.6f pose=%.6f latent=%.6f vel=%.6f gait=%.6f motion=%.6f",
                     sum_diff / n_batches,
-                    sum_cls / n_batches,
+                    sum_pose / n_batches,
+                    sum_latent / n_batches,
+                    sum_vel / n_batches,
                     sum_gait / n_batches,
                     sum_motion / n_batches,
                 )
         avg_train_total = sum_total / max(n_batches, 1)
         avg_train_diff = sum_diff / max(n_batches, 1)
-        avg_train_cls = sum_cls / max(n_batches, 1)
+        avg_train_pose = sum_pose / max(n_batches, 1)
+        avg_train_latent = sum_latent / max(n_batches, 1)
+        avg_train_vel = sum_vel / max(n_batches, 1)
         avg_train_gait = sum_gait / max(n_batches, 1)
         avg_train_motion = sum_motion / max(n_batches, 1)
         avg_train_bone = sum_bone / max(n_batches, 1)
@@ -877,7 +928,9 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         avg_train_instab = sum_instab / max(n_batches, 1)
         avg_train_total = _sync_mean(avg_train_total, device)
         avg_train_diff = _sync_mean(avg_train_diff, device)
-        avg_train_cls = _sync_mean(avg_train_cls, device)
+        avg_train_pose = _sync_mean(avg_train_pose, device)
+        avg_train_latent = _sync_mean(avg_train_latent, device)
+        avg_train_vel = _sync_mean(avg_train_vel, device)
         avg_train_gait = _sync_mean(avg_train_gait, device)
         avg_train_motion = _sync_mean(avg_train_motion, device)
         avg_train_bone = _sync_mean(avg_train_bone, device)
@@ -887,7 +940,9 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
 
         avg_val_total = None
         avg_val_diff = None
-        avg_val_cls = None
+        avg_val_pose = None
+        avg_val_latent = None
+        avg_val_vel = None
         avg_val_gait = None
         avg_val_motion = None
         avg_val_bone = None
@@ -898,7 +953,9 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             model.eval()
             val_total_sum = 0.0
             val_diff_sum = 0.0
-            val_cls_sum = 0.0
+            val_pose_sum = 0.0
+            val_latent_sum = 0.0
+            val_vel_sum = 0.0
             val_gait_sum = 0.0
             val_motion_sum = 0.0
             val_bone_sum = 0.0
@@ -911,32 +968,38 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     if args.max_val_batches > 0 and batch_idx >= args.max_val_batches:
                         break
                     x = batch["skeleton"].to(device)
-                    y = batch["label"].to(device)
                     a_hip_stream = batch["A_hip"].to(device)
                     a_wrist_stream = batch["A_wrist"].to(device)
                     gait_metrics = batch["gait_metrics"].to(device)
-                    h_tokens, h_global = stage2.aligner(
-                        a_hip_stream=a_hip_stream,
-                        a_wrist_stream=a_wrist_stream,
-                        gait_metrics=gait_metrics,
-                    )
+                    h_tokens, h_global = stage2.aligner(a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                         out = model(
                             x=x,
-                            y=y,
                             h_tokens=h_tokens,
                             h_global=h_global,
+                            gait_target=gait_metrics,
                             gait_metrics=gait_metrics,
                             fps=args.fps,
                         )
                         val_loss_diff = out["loss_diff"]
-                        val_loss_cls = out["loss_cls"]
-                        val_loss_gait = torch.nn.functional.mse_loss(out["gait_gen"], gait_metrics)
+                        val_loss_pose = out["loss_pose"]
+                        val_loss_latent = out["loss_latent"]
+                        val_loss_vel = out["loss_vel"]
+                        val_loss_gait = out["loss_gait"]
                         val_loss_motion = out["loss_motion"]
-                        val_total = val_loss_diff + args.lambda_cls * val_loss_cls + args.lambda_motion * val_loss_motion + args.lambda_gait * val_loss_gait
+                        val_total = (
+                            val_loss_diff
+                            + args.lambda_pose * val_loss_pose
+                            + args.lambda_latent * val_loss_latent
+                            + args.lambda_vel * val_loss_vel
+                            + args.lambda_gait * val_loss_gait
+                            + args.lambda_motion * val_loss_motion
+                        )
                     val_total_sum += float(val_total.item())
                     val_diff_sum += float(val_loss_diff.item())
-                    val_cls_sum += float(val_loss_cls.item())
+                    val_pose_sum += float(val_loss_pose.item())
+                    val_latent_sum += float(val_loss_latent.item())
+                    val_vel_sum += float(val_loss_vel.item())
                     val_gait_sum += float(val_loss_gait.item())
                     val_motion_sum += float(val_loss_motion.item())
                     val_bone_sum += float(out["loss_bone"].item())
@@ -947,7 +1010,9 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             model.train()
             avg_val_total = _sync_mean(val_total_sum / max(val_n, 1), device)
             avg_val_diff = _sync_mean(val_diff_sum / max(val_n, 1), device)
-            avg_val_cls = _sync_mean(val_cls_sum / max(val_n, 1), device)
+            avg_val_pose = _sync_mean(val_pose_sum / max(val_n, 1), device)
+            avg_val_latent = _sync_mean(val_latent_sum / max(val_n, 1), device)
+            avg_val_vel = _sync_mean(val_vel_sum / max(val_n, 1), device)
             avg_val_gait = _sync_mean(val_gait_sum / max(val_n, 1), device)
             avg_val_motion = _sync_mean(val_motion_sum / max(val_n, 1), device)
             avg_val_bone = _sync_mean(val_bone_sum / max(val_n, 1), device)
@@ -958,7 +1023,9 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         metrics = {
             "train_loss_total": avg_train_total,
             "train_loss_diff": avg_train_diff,
-            "train_loss_cls": avg_train_cls,
+            "train_loss_pose": avg_train_pose,
+            "train_loss_latent": avg_train_latent,
+            "train_loss_vel": avg_train_vel,
             "train_loss_gait": avg_train_gait,
             "train_loss_motion": avg_train_motion,
             "train_loss_bone": avg_train_bone,
@@ -969,7 +1036,9 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         if avg_val_total is not None and avg_val_gait is not None:
             metrics["val_loss_total"] = avg_val_total
             metrics["val_loss_diff"] = avg_val_diff
-            metrics["val_loss_cls"] = avg_val_cls
+            metrics["val_loss_pose"] = avg_val_pose
+            metrics["val_loss_latent"] = avg_val_latent
+            metrics["val_loss_vel"] = avg_val_vel
             metrics["val_loss_gait"] = avg_val_gait
             metrics["val_loss_motion"] = avg_val_motion
             metrics["val_loss_bone"] = avg_val_bone
@@ -998,6 +1067,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                 fps=args.fps,
                 epoch=epoch + 1,
                 sampler=args.sampler,
+                sample_seed=args.sample_seed,
             )
             model.train()
         monitor_loss = avg_val_total if avg_val_total is not None else avg_train_total
@@ -1012,18 +1082,24 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     "best_monitor_name": "val_loss_total" if avg_val_total is not None else "train_loss_total",
                     "best_train_loss_total": avg_train_total,
                     "best_train_loss_diff": avg_train_diff,
-                    "best_train_loss_cls": avg_train_cls,
+                    "best_train_loss_pose": avg_train_pose,
+                    "best_train_loss_latent": avg_train_latent,
+                    "best_train_loss_vel": avg_train_vel,
                     "best_train_loss_gait": avg_train_gait,
                     "best_train_loss_motion": avg_train_motion,
                     "best_val_loss_total": avg_val_total,
                     "best_val_loss_diff": avg_val_diff,
-                    "best_val_loss_cls": avg_val_cls,
+                    "best_val_loss_pose": avg_val_pose,
+                    "best_val_loss_latent": avg_val_latent,
+                    "best_val_loss_vel": avg_val_vel,
                     "best_val_loss_gait": avg_val_gait,
                     "best_val_loss_motion": avg_val_motion,
                     "best_epoch": epoch + 1,
                     "gait_metric_names": list(GAIT_METRIC_NAMES),
                     "imu_feature_names": list(IMU_FEATURE_NAMES),
                     "run_dir": args.run_dir,
+                    "conditioning_mode": "imu_only" if args.one_to_one else "legacy",
+                    "gait_role": "auxiliary_supervision" if args.one_to_one else "conditioning",
                 },
             )
             LOGGER.info("[Stage3] new best checkpoint: %s (epoch=%s monitor_loss=%.6f)", best_ckpt, epoch + 1, best_loss)

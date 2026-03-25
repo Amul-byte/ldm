@@ -128,6 +128,7 @@ class Stage2Model(nn.Module):
         num_joints: int = 32,
         gait_metrics_dim: int = 0,
         num_classes: int = 14,
+        imu_graph_type: str = "chain",
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -135,7 +136,7 @@ class Stage2Model(nn.Module):
         self.gait_metrics_dim = gait_metrics_dim
         self.num_classes = num_classes
         self.encoder = encoder
-        self.aligner = IMULatentAligner(latent_dim=latent_dim, gait_metrics_dim=0)
+        self.aligner = IMULatentAligner(latent_dim=latent_dim, gait_metrics_dim=0, graph_type=imu_graph_type)
         self.use_gait_conditioning = False
         # Activity classification head: h_global [B,D] → logits [B,C]
         # Classification loss is far more discriminative than gait metric regression

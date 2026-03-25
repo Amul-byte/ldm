@@ -416,10 +416,9 @@ def write_history(run_dir: Path, stage_name: str, history: list[dict[str, float]
         "train_loss_motion": "#0f766e",
         "val_loss_motion": "#14b8a6",
     }
+    _PLOT_KEYS = {"train_loss_total", "val_loss_total"}
     for key in history[0].keys():
-        if key == "epoch":
-            continue
-        if not key.startswith("train_") and not key.startswith("val_"):
+        if key not in _PLOT_KEYS:
             continue
         series.append((key, [row.get(key, float("nan")) for row in history], color_map.get(key, "#374151")))
     write_curve_plot(run_dir / stage_name / "loss_curves.png", f"{stage_name} Loss Curves", epochs, series, "Epoch", "Loss")

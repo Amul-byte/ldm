@@ -12,6 +12,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset
@@ -350,6 +351,8 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated subject ids used for training; all other subjects go to validation. Leave empty to use random val_split instead.",
     )
     parser.add_argument("--log_every", type=int, default=20, help="Plain progress print interval (steps) when tqdm is not interactive.")
+    parser.add_argument("--imu_graph", choices=["chain", "multiscale"], default="chain",
+                        help="IMU temporal graph type for Stage-2 encoder: 'chain' (j→j+1 only, simpler) or 'multiscale' (gaps 1,5,15,30, wider receptive field).")
     parser.add_argument("--lambda_cls", type=float, default=0.1, help="Weight for classification loss (Stage-3 only).")
     parser.add_argument("--lambda_pose", type=float, default=1.0, help="Weight for paired skeleton reconstruction loss (Stage-3 only).")
     parser.add_argument("--lambda_latent", type=float, default=0.5, help="Weight for latent reconstruction loss (Stage-3 only).")
@@ -550,6 +553,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         num_joints=args.joints,
         gait_metrics_dim=args.gait_metrics_dim,
         num_classes=args.num_classes,
+        imu_graph_type=args.imu_graph,
     ).to(device)
     assert all(not p.requires_grad for p in model.encoder.parameters()), "stage2 encoder must be frozen"
     if distributed:
@@ -748,6 +752,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         latent_dim=args.latent_dim,
         num_joints=args.joints,
         gait_metrics_dim=args.gait_metrics_dim,
+        imu_graph_type=args.imu_graph,
     ).to(device)
     if args.stage2_ckpt:
         load_checkpoint(args.stage2_ckpt, stage2, strict=True)
@@ -819,6 +824,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         t0 = time.time()
         sum_total = 0.0
         sum_diff = 0.0
+        sum_cls = 0.0
         sum_pose = 0.0
         sum_latent = 0.0
         sum_vel = 0.0
@@ -841,6 +847,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             a_hip_stream = batch["A_hip"].to(device)
             a_wrist_stream = batch["A_wrist"].to(device)
             gait_metrics = batch["gait_metrics"].to(device)
+            y = batch["label"].to(device)
 
             # Aligner is trainable in Stage 3: reconstruction losses provide
             # stronger gradient signal than Stage-2 gait-metric prediction alone.
@@ -862,19 +869,21 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                 loss_vel = out["loss_vel"]
                 loss_gait = out["loss_gait"]
                 loss_motion = out["loss_motion"]
+                loss_cls = F.cross_entropy(
+                    _unwrap_model(model).classifier(out["x_hat"].float()), y.long()
+                )
                 loss = (
                     loss_diff
-                    + args.lambda_pose * loss_pose
-                    + args.lambda_latent * loss_latent
-                    + args.lambda_vel * loss_vel
-                    + args.lambda_gait * loss_gait
+                    + args.lambda_cls * loss_cls
                     + args.lambda_motion * loss_motion
+                    + args.lambda_gait * loss_gait
                 )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             sum_total += float(loss.item())
             sum_diff += float(loss_diff.item())
+            sum_cls += float(loss_cls.item())
             sum_pose += float(loss_pose.item())
             sum_latent += float(loss_latent.item())
             sum_vel += float(loss_vel.item())
@@ -907,16 +916,15 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     t0,
                 )
                 LOGGER.info(
-                    "[Stage3] step_losses diff=%.6f pose=%.6f latent=%.6f vel=%.6f gait=%.6f motion=%.6f",
+                    "[Stage3] step_losses diff=%.6f cls=%.6f gait=%.6f motion=%.6f",
                     sum_diff / n_batches,
-                    sum_pose / n_batches,
-                    sum_latent / n_batches,
-                    sum_vel / n_batches,
+                    sum_cls / n_batches,
                     sum_gait / n_batches,
                     sum_motion / n_batches,
                 )
         avg_train_total = sum_total / max(n_batches, 1)
         avg_train_diff = sum_diff / max(n_batches, 1)
+        avg_train_cls = sum_cls / max(n_batches, 1)
         avg_train_pose = sum_pose / max(n_batches, 1)
         avg_train_latent = sum_latent / max(n_batches, 1)
         avg_train_vel = sum_vel / max(n_batches, 1)
@@ -928,6 +936,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         avg_train_instab = sum_instab / max(n_batches, 1)
         avg_train_total = _sync_mean(avg_train_total, device)
         avg_train_diff = _sync_mean(avg_train_diff, device)
+        avg_train_cls = _sync_mean(avg_train_cls, device)
         avg_train_pose = _sync_mean(avg_train_pose, device)
         avg_train_latent = _sync_mean(avg_train_latent, device)
         avg_train_vel = _sync_mean(avg_train_vel, device)
@@ -940,6 +949,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
 
         avg_val_total = None
         avg_val_diff = None
+        avg_val_cls = None
         avg_val_pose = None
         avg_val_latent = None
         avg_val_vel = None
@@ -953,6 +963,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             model.eval()
             val_total_sum = 0.0
             val_diff_sum = 0.0
+            val_cls_sum = 0.0
             val_pose_sum = 0.0
             val_latent_sum = 0.0
             val_vel_sum = 0.0
@@ -971,6 +982,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     a_hip_stream = batch["A_hip"].to(device)
                     a_wrist_stream = batch["A_wrist"].to(device)
                     gait_metrics = batch["gait_metrics"].to(device)
+                    y = batch["label"].to(device)
                     h_tokens, h_global = stage2.aligner(a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                         out = model(
@@ -987,16 +999,18 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                         val_loss_vel = out["loss_vel"]
                         val_loss_gait = out["loss_gait"]
                         val_loss_motion = out["loss_motion"]
+                        val_loss_cls = F.cross_entropy(
+                            _unwrap_model(model).classifier(out["x_hat"].float()), y.long()
+                        )
                         val_total = (
                             val_loss_diff
-                            + args.lambda_pose * val_loss_pose
-                            + args.lambda_latent * val_loss_latent
-                            + args.lambda_vel * val_loss_vel
-                            + args.lambda_gait * val_loss_gait
+                            + val_loss_cls
                             + args.lambda_motion * val_loss_motion
+                            + args.lambda_gait * val_loss_gait
                         )
                     val_total_sum += float(val_total.item())
                     val_diff_sum += float(val_loss_diff.item())
+                    val_cls_sum += float(val_loss_cls.item())
                     val_pose_sum += float(val_loss_pose.item())
                     val_latent_sum += float(val_loss_latent.item())
                     val_vel_sum += float(val_loss_vel.item())
@@ -1010,6 +1024,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             model.train()
             avg_val_total = _sync_mean(val_total_sum / max(val_n, 1), device)
             avg_val_diff = _sync_mean(val_diff_sum / max(val_n, 1), device)
+            avg_val_cls = _sync_mean(val_cls_sum / max(val_n, 1), device)
             avg_val_pose = _sync_mean(val_pose_sum / max(val_n, 1), device)
             avg_val_latent = _sync_mean(val_latent_sum / max(val_n, 1), device)
             avg_val_vel = _sync_mean(val_vel_sum / max(val_n, 1), device)
@@ -1023,28 +1038,16 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         metrics = {
             "train_loss_total": avg_train_total,
             "train_loss_diff": avg_train_diff,
-            "train_loss_pose": avg_train_pose,
-            "train_loss_latent": avg_train_latent,
-            "train_loss_vel": avg_train_vel,
+            "train_loss_cls": avg_train_cls,
             "train_loss_gait": avg_train_gait,
             "train_loss_motion": avg_train_motion,
-            "train_loss_bone": avg_train_bone,
-            "train_loss_skate": avg_train_skate,
-            "train_loss_smooth": avg_train_smooth,
-            "train_loss_instab": avg_train_instab,
         }
         if avg_val_total is not None and avg_val_gait is not None:
             metrics["val_loss_total"] = avg_val_total
             metrics["val_loss_diff"] = avg_val_diff
-            metrics["val_loss_pose"] = avg_val_pose
-            metrics["val_loss_latent"] = avg_val_latent
-            metrics["val_loss_vel"] = avg_val_vel
+            metrics["val_loss_cls"] = avg_val_cls
             metrics["val_loss_gait"] = avg_val_gait
             metrics["val_loss_motion"] = avg_val_motion
-            metrics["val_loss_bone"] = avg_val_bone
-            metrics["val_loss_skate"] = avg_val_skate
-            metrics["val_loss_smooth"] = avg_val_smooth
-            metrics["val_loss_instab"] = avg_val_instab
         history.append({"epoch": float(epoch + 1), **metrics})
         if _is_main_process():
             write_history(run_dir, "stage3", history)
@@ -1082,16 +1085,12 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     "best_monitor_name": "val_loss_total" if avg_val_total is not None else "train_loss_total",
                     "best_train_loss_total": avg_train_total,
                     "best_train_loss_diff": avg_train_diff,
-                    "best_train_loss_pose": avg_train_pose,
-                    "best_train_loss_latent": avg_train_latent,
-                    "best_train_loss_vel": avg_train_vel,
+                    "best_train_loss_cls": avg_train_cls,
                     "best_train_loss_gait": avg_train_gait,
                     "best_train_loss_motion": avg_train_motion,
                     "best_val_loss_total": avg_val_total,
                     "best_val_loss_diff": avg_val_diff,
-                    "best_val_loss_pose": avg_val_pose,
-                    "best_val_loss_latent": avg_val_latent,
-                    "best_val_loss_vel": avg_val_vel,
+                    "best_val_loss_cls": avg_val_cls,
                     "best_val_loss_gait": avg_val_gait,
                     "best_val_loss_motion": avg_val_motion,
                     "best_epoch": epoch + 1,

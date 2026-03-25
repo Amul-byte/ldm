@@ -40,6 +40,45 @@ Distances chosen to capture:
 """
 
 
+def build_chain_imu_graph_adjacency(window_len: int, device: torch.device) -> torch.Tensor:
+    """Build [2T, 2T] simple chain adjacency for a combined hip+wrist IMU graph.
+
+    Node layout:
+      - Nodes 0 .. T-1      : hip timesteps
+      - Nodes T .. 2T-1     : wrist timesteps
+
+    Edge types:
+      - Self-loops on all 2T nodes
+      - Sequential edges (gap=1 only) within each stream: node[t] ↔ node[t+1]
+      - Cross-sensor edges between aligned timesteps: (i, T+i) and (T+i, i)
+
+    Receptive field with 3 stacked TemporalGCNBlock (3 internal GCN layers each):
+    3 × 3 × 1 + 1 = ~19 frames — simpler than multiscale but still captures
+    short-range motion patterns. Mirrors the graph topology of GCNN_v2.ipynb.
+    """
+    n = 2 * window_len
+    adj = torch.zeros((n, n), dtype=torch.float32, device=device)
+
+    # Self-loops
+    idx_all = torch.arange(n, device=device)
+    adj[idx_all, idx_all] = 1.0
+
+    # Sequential edges (gap=1 only) within each stream
+    idx = torch.arange(window_len - 1, device=device)
+    adj[idx, idx + 1] = 1.0
+    adj[idx + 1, idx] = 1.0
+    adj[window_len + idx, window_len + idx + 1] = 1.0
+    adj[window_len + idx + 1, window_len + idx] = 1.0
+
+    # Cross-sensor edges (aligned timesteps)
+    idx_t = torch.arange(window_len, device=device)
+    adj[idx_t, window_len + idx_t] = 1.0
+    adj[window_len + idx_t, idx_t] = 1.0
+
+    assert_shape(adj, [n, n], "build_chain_imu_graph_adjacency.adj")
+    return adj
+
+
 def build_imu_graph_adjacency(window_len: int, device: torch.device) -> torch.Tensor:
     """Build [2T, 2T] multi-scale adjacency for a combined hip+wrist IMU graph.
 
@@ -97,11 +136,13 @@ class IMUGraphEncoder(nn.Module):
         depth:      Number of TemporalGraphBlock layers applied to the combined graph.
     """
 
-    def __init__(self, input_dim: int = 6, latent_dim: int = 256, depth: int = 3) -> None:
+    def __init__(self, input_dim: int = 6, latent_dim: int = 256, depth: int = 3,
+                 graph_type: str = "chain") -> None:
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.depth = depth
+        self.graph_type = graph_type
         # Separate projections for each sensor so the model can learn sensor-specific
         # initial embeddings before the shared graph processing.
         self.hip_proj = nn.Linear(input_dim, latent_dim)
@@ -141,7 +182,10 @@ class IMUGraphEncoder(nn.Module):
 
         # Retrieve or build the [2T, 2T] adjacency and edge_index for this window length.
         if t not in self._imu_graph_cache:
-            adj = build_imu_graph_adjacency(window_len=t, device=hip_feat.device)
+            if self.graph_type == "chain":
+                adj = build_chain_imu_graph_adjacency(window_len=t, device=hip_feat.device)
+            else:
+                adj = build_imu_graph_adjacency(window_len=t, device=hip_feat.device)
             edge_index = build_edge_index_from_adjacency(adj) if HAS_TORCH_GEOMETRIC else None
             self._imu_graph_cache[t] = (adj, edge_index)
         adj, edge_index = self._imu_graph_cache[t]
@@ -176,7 +220,8 @@ class IMULatentAligner(nn.Module):
     Stage-1 checkpoints are unaffected (they do not contain the aligner).
     """
 
-    def __init__(self, latent_dim: int = 256, gait_metrics_dim: int = 0) -> None:
+    def __init__(self, latent_dim: int = 256, gait_metrics_dim: int = 0,
+                 graph_type: str = "chain") -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.gait_metrics_dim = gait_metrics_dim
@@ -186,6 +231,7 @@ class IMULatentAligner(nn.Module):
             input_dim=self.imu_feature_dim,
             latent_dim=latent_dim,
             depth=3,
+            graph_type=graph_type,
         )
         fuse_in_dim = latent_dim * 2
         self.fuse_tokens = nn.Sequential(

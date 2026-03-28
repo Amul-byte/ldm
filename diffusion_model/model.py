@@ -138,30 +138,6 @@ class Stage2Model(nn.Module):
         self.encoder = encoder
         self.aligner = IMULatentAligner(latent_dim=latent_dim, gait_metrics_dim=0, graph_type=imu_graph_type)
         self.use_gait_conditioning = False
-        # Activity classification head: h_global [B,D] → logits [B,C]
-        # Classification loss is far more discriminative than gait metric regression
-        # because (a) 14 hard class targets vs 9 continuous near-constant targets,
-        # (b) GCNN proved IMU is 95% accurate for activity classification so the
-        # gradient is non-zero and task-relevant from the very first epoch.
-        self.cls_head: nn.Module = nn.Sequential(
-            nn.LayerNorm(latent_dim),
-            nn.Linear(latent_dim, latent_dim),
-            nn.GELU(),
-            nn.Dropout(p=0.25),
-            nn.Linear(latent_dim, num_classes),
-        )
-        # Gait prediction head: kept as auxiliary signal when gait_metrics_dim > 0
-        if gait_metrics_dim > 0:
-            self.gait_pred_head: nn.Module | None = nn.Sequential(
-                nn.LayerNorm(latent_dim),
-                nn.Linear(latent_dim, latent_dim),
-                nn.GELU(),
-                nn.Linear(latent_dim, gait_metrics_dim),
-            )
-        else:
-            self.gait_pred_head = None
-        # Latent projection head: maps h_global into z0 space for Stage-3 warm-start
-        self.latent_proj = nn.Linear(latent_dim, latent_dim)
         self.freeze_encoder()
 
     def freeze_encoder(self) -> None:
@@ -195,44 +171,13 @@ class Stage2Model(nn.Module):
         h = h_tokens.unsqueeze(2).expand(-1, -1, self.num_joints, -1)
         assert_shape(h, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.h")
 
-        # ------------------------------------------------------------------ #
-        # Loss 1: Activity classification (primary training signal).          #
-        #                                                                      #
-        # Predicting 14 activity classes from IMU is proven discriminative    #
-        # (GCNN achieves 95% accuracy on this dataset).  Classification loss  #
-        # provides hard per-sample gradients that force h_global to encode    #
-        # activity-discriminative features — unlike gait metric regression    #
-        # which collapses to predicting the mean within 2 epochs because      #
-        # 90-frame gait metric windows have very low inter-sample variance.   #
-        # ------------------------------------------------------------------ #
-        loss_cls = torch.zeros(1, device=x.device).squeeze()
-        if y is not None:
-            logits = self.cls_head(h_global)              # [B, C]
-            loss_cls = F.cross_entropy(logits, y.long())
-
-        # ------------------------------------------------------------------ #
-        # Loss 2: Auxiliary gait metric prediction.                           #
-        # ------------------------------------------------------------------ #
-        loss_gait = torch.zeros(1, device=x.device).squeeze()
-        if self.gait_pred_head is not None and gait_metrics is not None:
-            assert_shape(gait_metrics, [x.shape[0], self.gait_metrics_dim], "Stage2Model.gait_metrics")
-            gait_pred = self.gait_pred_head(h_global)     # [B, G]
-            loss_gait = F.mse_loss(gait_pred, gait_metrics)
-
-        # ------------------------------------------------------------------ #
-        # Loss 3: Latent projection alignment.                                #
-        # ------------------------------------------------------------------ #
-        z0_global = z0.mean(dim=(1, 2))                   # [B, D]
-        h_proj = self.latent_proj(h_global)               # [B, D]
-        loss_proj = F.mse_loss(h_proj, z0_global.detach())
-
-        loss_align = loss_cls + 0.1 * loss_gait + 0.01 * loss_proj
+        # L_enc = ||h - z0||^2
+        # Enforce that sensor-derived features faithfully capture the dynamics
+        # of the skeleton latent space at every timestep and every joint.
+        loss_align = F.mse_loss(h, z0.detach())
 
         return {
             "loss_align": loss_align,
-            "loss_cls": loss_cls,
-            "loss_gait": loss_gait,
-            "loss_proj": loss_proj,
             "h": h,
             "h_global": h_global,
             "h_tokens": h_tokens,

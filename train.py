@@ -606,7 +606,6 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
     for epoch in range(args.epochs):
         t0 = time.time()
         sum_loss = 0.0
-        sum_contrast = 0.0
         n_batches = 0
         total_steps = len(train_loader)
         progress_enabled = _is_main_process() and sys.stdout.isatty()
@@ -635,7 +634,6 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
             scaler.step(optimizer)
             scaler.update()
             sum_loss += float(loss.item())
-            sum_contrast += float(out.get("loss_cls", loss).item())
             n_batches += 1
             if tqdm is not None and progress_enabled:
                 pbar.set_postfix(loss=f"{(sum_loss / n_batches):.4f}")
@@ -656,7 +654,6 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
                 )
         avg_train_loss = sum_loss / max(n_batches, 1)
         avg_train_loss = _sync_mean(avg_train_loss, device)
-        avg_train_contrast = sum_contrast / max(n_batches, 1)
 
         avg_val_loss = None
         if val_loader is not None:
@@ -687,7 +684,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
             avg_val_loss = val_sum / max(val_n, 1)
             avg_val_loss = _sync_mean(avg_val_loss, device)
 
-        metrics = {"train_loss_align": avg_train_loss, "train_loss_gait": avg_train_contrast}
+        metrics = {"train_loss_align": avg_train_loss}
         if avg_val_loss is not None:
             metrics["val_loss_align"] = avg_val_loss
         history.append({"epoch": float(epoch + 1), **metrics})

@@ -6,6 +6,9 @@ import torch
 import torch.nn as nn
 
 from diffusion_model.graph_modules import HAS_TORCH_GEOMETRIC, TemporalGCNBlock, build_edge_index_from_adjacency
+
+if HAS_TORCH_GEOMETRIC:
+    from torch_geometric.nn import GCNConv
 from diffusion_model.util import assert_shape
 
 
@@ -123,6 +126,52 @@ def build_imu_graph_adjacency(window_len: int, device: torch.device) -> torch.Te
     return adj
 
 
+class SensorGCNEncoder(nn.Module):
+    """Per-sensor temporal GCN encoder matching the saved checkpoint architecture.
+
+    Parameter names: conv1/conv2/conv3, norm1/norm2/norm3, out_proj.
+    Each conv is a GCNConv over a chain temporal graph on T nodes.
+    """
+
+    def __init__(self, input_dim: int = 6, latent_dim: int = 256) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        # Hidden dims match checkpoint: 6→32→32→64→256
+        self.conv1 = GCNConv(input_dim, 32, add_self_loops=False)
+        self.conv2 = GCNConv(32, 32, add_self_loops=False)
+        self.conv3 = GCNConv(32, 64, add_self_loops=False)
+        self.norm1 = nn.LayerNorm(32)
+        self.norm2 = nn.LayerNorm(32)
+        self.norm3 = nn.LayerNorm(64)
+        self.out_proj = nn.Linear(64, latent_dim)
+        self._edge_cache: dict = {}
+
+    def _get_batched_edge_index(self, b: int, t: int, device: torch.device) -> torch.Tensor:
+        if (b, t) not in self._edge_cache:
+            idx = torch.arange(t - 1, device=device)
+            self_idx = torch.arange(t, device=device)
+            src = torch.cat([idx, idx + 1, self_idx])
+            dst = torch.cat([idx + 1, idx, self_idx])
+            single_ei = torch.stack([src, dst], dim=0)
+            batched = torch.cat([single_ei + i * t for i in range(b)], dim=1)
+            self._edge_cache[(b, t)] = batched
+        ei = self._edge_cache[(b, t)]
+        if ei.device != device:
+            ei = ei.to(device)
+            self._edge_cache[(b, t)] = ei
+        return ei
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, T, input_dim] -> [B, T, latent_dim]"""
+        b, t, _ = x.shape
+        ei = self._get_batched_edge_index(b, t, x.device)
+        h = x.reshape(b * t, -1)
+        h = torch.relu(self.norm1(self.conv1(h, ei).reshape(b, t, -1))).reshape(b * t, -1)
+        h = torch.relu(self.norm2(self.conv2(h, ei).reshape(b, t, -1))).reshape(b * t, -1)
+        h = torch.relu(self.norm3(self.conv3(h, ei).reshape(b, t, -1))).reshape(b * t, -1)
+        return self.out_proj(h).reshape(b, t, -1)
+
+
 class IMUGraphEncoder(nn.Module):
     """Encode hip and wrist IMU streams jointly as a single bipartite temporal graph.
 
@@ -226,16 +275,11 @@ class IMULatentAligner(nn.Module):
         self.latent_dim = latent_dim
         self.gait_metrics_dim = gait_metrics_dim
         self.imu_feature_dim = len(IMU_FEATURE_NAMES)
-        # Single encoder that processes both streams as one graph
-        self.graph_encoder = IMUGraphEncoder(
-            input_dim=self.imu_feature_dim,
-            latent_dim=latent_dim,
-            depth=3,
-            graph_type=graph_type,
-        )
-        fuse_in_dim = latent_dim * 2
+        # Separate per-sensor encoders matching checkpoint architecture
+        self.hip_encoder = SensorGCNEncoder(input_dim=self.imu_feature_dim, latent_dim=latent_dim)
+        self.wrist_encoder = SensorGCNEncoder(input_dim=self.imu_feature_dim, latent_dim=latent_dim)
         self.fuse_tokens = nn.Sequential(
-            nn.Linear(fuse_in_dim, latent_dim),
+            nn.Linear(latent_dim * 2, latent_dim),
             nn.GELU(),
             nn.Linear(latent_dim, latent_dim),
         )
@@ -262,16 +306,15 @@ class IMULatentAligner(nn.Module):
         assert_shape(a_wrist_stream, [None, None, 3], "IMULatentAligner.a_wrist_stream")
         assert a_hip_stream.shape[:2] == a_wrist_stream.shape[:2], "Hip and wrist streams must share [B,T]"
 
-        hip_features = build_imu_features(a_hip_stream)
-        wrist_features = build_imu_features(a_wrist_stream)
+        hip_features = build_imu_features(a_hip_stream)    # [B, T, 6]
+        wrist_features = build_imu_features(a_wrist_stream)  # [B, T, 6]
 
-        # Graph-based joint encoding: cross-sensor edges are included in the graph
-        hip_tokens, wrist_tokens = self.graph_encoder(hip_features, wrist_features)
+        hip_tokens = self.hip_encoder(hip_features)        # [B, T, D]
+        wrist_tokens = self.wrist_encoder(wrist_features)  # [B, T, D]
 
-        # Fuse hip and wrist token sequences
-        fused = torch.cat([hip_tokens, wrist_tokens], dim=-1)
-        sensor_tokens = self.fuse_tokens(fused)
-        h_global = sensor_tokens.mean(dim=1)
+        fused = torch.cat([hip_tokens, wrist_tokens], dim=-1)  # [B, T, 2D]
+        sensor_tokens = self.fuse_tokens(fused)                # [B, T, D]
+        h_global = sensor_tokens.mean(dim=1)                   # [B, D]
 
         assert_shape(
             sensor_tokens,

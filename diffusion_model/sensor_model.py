@@ -143,6 +143,9 @@ class SensorGCNEncoder(nn.Module):
         self.norm1 = nn.LayerNorm(32)
         self.norm2 = nn.LayerNorm(32)
         self.norm3 = nn.LayerNorm(64)
+        self.drop1 = nn.Dropout(p=0.1)
+        self.drop2 = nn.Dropout(p=0.1)
+        self.drop3 = nn.Dropout(p=0.1)
         self.out_proj = nn.Linear(64, latent_dim)
         self._edge_cache: dict = {}
 
@@ -166,9 +169,9 @@ class SensorGCNEncoder(nn.Module):
         b, t, _ = x.shape
         ei = self._get_batched_edge_index(b, t, x.device)
         h = x.reshape(b * t, -1)
-        h = torch.relu(self.norm1(self.conv1(h, ei).reshape(b, t, -1))).reshape(b * t, -1)
-        h = torch.relu(self.norm2(self.conv2(h, ei).reshape(b, t, -1))).reshape(b * t, -1)
-        h = torch.relu(self.norm3(self.conv3(h, ei).reshape(b, t, -1))).reshape(b * t, -1)
+        h = self.drop1(torch.relu(self.norm1(self.conv1(h, ei).reshape(b, t, -1)))).reshape(b * t, -1)
+        h = self.drop2(torch.relu(self.norm2(self.conv2(h, ei).reshape(b, t, -1)))).reshape(b * t, -1)
+        h = self.drop3(torch.relu(self.norm3(self.conv3(h, ei).reshape(b, t, -1)))).reshape(b * t, -1)
         return self.out_proj(h).reshape(b, t, -1)
 
 

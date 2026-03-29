@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from diffusion_model.diffusion import DiffusionProcess, extract
 from diffusion_model.gait_metrics import compute_gait_metrics_torch
-from diffusion_model.losses import motion_losses
+from diffusion_model.losses import motion_losses, supervised_contrastive_loss
 from diffusion_model.sensor_model import IMULatentAligner
 from diffusion_model.skeleton_model import GraphDecoder, GraphDenoiserMasked, GraphEncoder
 from diffusion_model.util import assert_shape
@@ -59,10 +59,12 @@ class Stage1Model(nn.Module):
         timesteps: int = 500,
         gait_metrics_dim: int = 0,
         use_gait_conditioning: bool = True,
+        num_classes: int = 14,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.num_joints = num_joints
+        self.num_classes = num_classes
         self.gait_metrics_dim = gait_metrics_dim
         self.use_gait_conditioning = bool(use_gait_conditioning)
         self.encoder = GraphEncoder(
@@ -80,9 +82,21 @@ class Stage1Model(nn.Module):
         )
         self.decoder = GraphDecoder(latent_dim=latent_dim, output_dim=3, num_joints=num_joints)
         self.diffusion = DiffusionProcess(timesteps=timesteps)
+        # Auxiliary classification head — used only during Stage-1 training to
+        # force discriminative latent structure; not used in Stage-2/3.
+        self.cls_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.GELU(),
+            nn.Linear(latent_dim // 2, num_classes),
+        )
 
-    def forward(self, x: torch.Tensor, gait_metrics: torch.Tensor | None = None) -> Dict[str, torch.Tensor]:
-        """Compute stage-1 diffusion loss and latent outputs."""
+    def forward(
+        self,
+        x: torch.Tensor,
+        gait_metrics: torch.Tensor | None = None,
+        y: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute stage-1 losses: diffusion + optional classification + variance regularizer."""
         assert_shape(x, [None, None, self.num_joints, 3], "Stage1Model.x")
         if self.gait_metrics_dim > 0 and self.use_gait_conditioning:
             assert gait_metrics is not None, "gait_metrics are required when gait_metrics_dim > 0"
@@ -98,7 +112,27 @@ class Stage1Model(nn.Module):
             h_global=None,
             gait_metrics=active_gait,
         )
-        return {"loss_diff": loss_diff, "z0": z0}
+
+        # Pool z0 over T and J → [B, D] for classification and variance losses
+        z_pooled = z0.mean(dim=(1, 2))
+
+        # Classification loss: forces inter-class separation in latent space
+        if y is not None:
+            loss_cls = F.cross_entropy(self.cls_head(z_pooled), y)
+        else:
+            loss_cls = torch.zeros(1, device=x.device).squeeze()
+
+        # Variance regulariser: penalise any latent dimension with var < 1
+        # relu(1 - var) → 0 when spread out, positive when collapsed
+        var_per_dim = z_pooled.var(dim=0)                        # [D]
+        loss_var = torch.relu(1.0 - var_per_dim).mean()
+
+        return {
+            "loss_diff": loss_diff,
+            "loss_cls": loss_cls,
+            "loss_var": loss_var,
+            "z0": z0,
+        }
 
 
 class Stage2Model(nn.Module):
@@ -171,13 +205,33 @@ class Stage2Model(nn.Module):
         h = h_tokens.unsqueeze(2).expand(-1, -1, self.num_joints, -1)
         assert_shape(h, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.h")
 
-        # L_enc = ||h - z0||^2
-        # Enforce that sensor-derived features faithfully capture the dynamics
-        # of the skeleton latent space at every timestep and every joint.
-        loss_align = F.mse_loss(h, z0.detach())
+        # Class-conditional alignment: target = mean z0 over all same-class samples in the batch.
+        # Per-sample z0_mean encodes subject-specific skeleton geometry, causing the IMU encoder
+        # to memorise subject identity (train subjects fit, val subjects don't).
+        # Using the within-batch class mean removes subject-specific signal while still grounding
+        # h_tokens in the skeleton latent space — the same direction SupCon pushes h_global.
+        z0_joint_mean = z0.mean(dim=2).detach()    # [B, T, D]  joint-mean per sample
+        if y is not None:
+            # Build class-conditional target: for each sample, average z0 across same-class samples
+            unique_classes = y.unique()
+            z0_class_target = z0_joint_mean.clone()
+            for c in unique_classes:
+                mask = (y == c)                    # [B] bool
+                z0_class_target[mask] = z0_joint_mean[mask].mean(dim=0, keepdim=True)
+        else:
+            z0_class_target = z0_joint_mean
+        loss_align = F.mse_loss(h_tokens, z0_class_target)
+
+        # SupCon loss — pulls same-activity IMU embeddings together across subjects
+        if y is not None:
+            h_norm = F.normalize(h_global, dim=-1)   # [B, D] — L2 normalise
+            loss_supcon = supervised_contrastive_loss(h_norm, y)
+        else:
+            loss_supcon = torch.zeros((), device=x.device, dtype=x.dtype)
 
         return {
             "loss_align": loss_align,
+            "loss_supcon": loss_supcon,
             "h": h,
             "h_global": h_global,
             "h_tokens": h_tokens,

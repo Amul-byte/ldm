@@ -51,6 +51,49 @@ def instability_loss(x: torch.Tensor) -> torch.Tensor:
     return overflow.mean()
 
 
+def supervised_contrastive_loss(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 0.07,
+) -> torch.Tensor:
+    """Supervised Contrastive Loss (Khosla et al. 2020).
+
+    Args:
+        features: L2-normalised embeddings [B, D]
+        labels:   activity class indices    [B]
+        temperature: sharpness — lower means tighter clusters
+
+    Returns scalar loss.
+    """
+    # Force fp32: exp(sim/temperature) overflows fp16 at typical cosine sims
+    features = features.float()
+    device = features.device
+    B = features.shape[0]
+
+    # cosine similarity matrix [B, B] scaled by temperature
+    sim = torch.matmul(features, features.T) / temperature
+
+    # exclude self-comparisons
+    self_mask = torch.eye(B, dtype=torch.bool, device=device)
+    sim.masked_fill_(self_mask, float("-inf"))
+
+    # positive mask: same class, excluding self
+    lab = labels.view(-1, 1)
+    pos_mask = (lab == lab.T) & ~self_mask             # [B, B]
+
+    # log-softmax denominator over all non-self pairs
+    log_prob = sim - torch.logsumexp(
+        sim.masked_fill(self_mask, float("-inf")), dim=1, keepdim=True
+    )
+
+    # average over positives per anchor
+    # use masked_fill instead of multiplication to avoid -inf * 0 = NaN
+    n_pos = pos_mask.sum(dim=1).clamp(min=1)
+    loss = -log_prob.masked_fill(~pos_mask, 0.0).sum(dim=1) / n_pos
+
+    return loss.mean()
+
+
 def motion_losses(x: torch.Tensor) -> dict[str, torch.Tensor]:
     """Compute all motion regularizers and their summed loss."""
     loss_bone = bone_length_loss(x)

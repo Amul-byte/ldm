@@ -354,6 +354,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imu_graph", choices=["chain", "multiscale"], default="chain",
                         help="IMU temporal graph type for Stage-2 encoder: 'chain' (j→j+1 only, simpler) or 'multiscale' (gaps 1,5,15,30, wider receptive field).")
     parser.add_argument("--lambda_cls", type=float, default=0.1, help="Weight for classification loss (Stage-3 only).")
+    parser.add_argument("--lambda_cls_s1", type=float, default=0.1, help="Weight for classification loss in Stage-1 (discriminative latent training).")
+    parser.add_argument("--lambda_var", type=float, default=0.01, help="Weight for variance regulariser in Stage-1 (prevents embedding collapse).")
+    parser.add_argument("--lambda_supcon", type=float, default=0.1, help="Weight for supervised contrastive loss in Stage-2 (subject-invariant activity embeddings).")
     parser.add_argument("--lambda_pose", type=float, default=1.0, help="Weight for paired skeleton reconstruction loss (Stage-3 only).")
     parser.add_argument("--lambda_latent", type=float, default=0.5, help="Weight for latent reconstruction loss (Stage-3 only).")
     parser.add_argument("--lambda_vel", type=float, default=0.5, help="Weight for velocity reconstruction loss (Stage-3 only).")
@@ -364,7 +367,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sampler", type=str, default="ddpm", choices=["ddim", "ddpm"], help="Reverse-process sampler for evaluation/generation.")
     parser.add_argument("--sample_seed", type=int, default=0, help="Deterministic sampling seed used for evaluation/generation.")
     parser.add_argument("--eval_every_stage1", type=int, default=5, help="Epoch interval for Stage-1 evaluation artifacts.")
-    parser.add_argument("--eval_every_stage2", type=int, default=10, help="Epoch interval for Stage-2 evaluation artifacts.")
+    parser.add_argument("--eval_every_stage2", type=int, default=50, help="Epoch interval for Stage-2 evaluation artifacts.")
     parser.add_argument("--eval_every_stage3", type=int, default=5, help="Epoch interval for Stage-3 evaluation artifacts.")
     parser.add_argument("--max_train_batches", type=int, default=0, help="Cap batches per training epoch for smoke runs (0 disables).")
     parser.add_argument("--max_val_batches", type=int, default=0, help="Cap batches per validation epoch for smoke runs (0 disables).")
@@ -379,6 +382,7 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
         use_gait_conditioning=not args.one_to_one,
+        num_classes=args.num_classes,
     ).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -396,7 +400,7 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         disable_gait_cache=args.disable_gait_cache,
     )
     train_loader, val_loader = _build_train_val_loaders(args, dataset=dataset, distributed=distributed)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     if _is_main_process():
         save_run_manifest(
             Path(args.run_dir),
@@ -429,6 +433,9 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
     for epoch in range(args.epochs):
         t0 = time.time()
         sum_loss = 0.0
+        sum_diff = 0.0
+        sum_cls  = 0.0
+        sum_var  = 0.0
         n_batches = 0
         total_steps = len(train_loader)
         progress_enabled = _is_main_process() and sys.stdout.isatty()
@@ -440,39 +447,56 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
                 break
             x = batch["skeleton"].to(device)
             gait_metrics = batch["gait_metrics"].to(device)
+            y = batch["label"].to(device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                out = model(x, gait_metrics=gait_metrics)
-                loss = out["loss_diff"]
+                out = model(x, gait_metrics=gait_metrics, y=y)
+                loss = (
+                    out["loss_diff"]
+                    + args.lambda_cls_s1 * out["loss_cls"]
+                    + args.lambda_var    * out["loss_var"]
+                )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             sum_loss += float(loss.item())
+            sum_diff += float(out["loss_diff"].item())
+            sum_cls  += float(out["loss_cls"].item())
+            sum_var  += float(out["loss_var"].item())
             n_batches += 1
             if tqdm is not None and progress_enabled:
-                pbar.set_postfix(loss=f"{(sum_loss / n_batches):.4f}")
+                pbar.set_postfix(
+                    total=f"{sum_loss/n_batches:.4f}",
+                    diff=f"{sum_diff/n_batches:.4f}",
+                    cls=f"{sum_cls/n_batches:.4f}",
+                    var=f"{sum_var/n_batches:.4f}",
+                )
             elif _is_main_process() and (
                 n_batches == 1
                 or n_batches % max(1, args.log_every) == 0
                 or n_batches == total_steps
             ):
-                _log_step_progress(
-                    "Stage1",
-                    epoch + 1,
-                    args.epochs,
-                    n_batches,
-                    total_steps,
-                    "loss",
-                    sum_loss / n_batches,
-                    t0,
+                LOGGER.info(
+                    "[Stage1] epoch=%s/%s step=%s/%s  total=%.4f  diff=%.4f  cls=%.4f  var=%.4f",
+                    epoch + 1, args.epochs, n_batches, total_steps,
+                    sum_loss / n_batches, sum_diff / n_batches,
+                    sum_cls  / n_batches, sum_var  / n_batches,
                 )
-        avg_train_loss = sum_loss / max(n_batches, 1)
-        avg_train_loss = _sync_mean(avg_train_loss, device)
+        avg_train_total = sum_loss / max(n_batches, 1)
+        avg_train_diff  = sum_diff / max(n_batches, 1)
+        avg_train_cls   = sum_cls  / max(n_batches, 1)
+        avg_train_var   = sum_var  / max(n_batches, 1)
+        avg_train_total = _sync_mean(avg_train_total, device)
+        avg_train_diff  = _sync_mean(avg_train_diff,  device)
+        avg_train_cls   = _sync_mean(avg_train_cls,   device)
+        avg_train_var   = _sync_mean(avg_train_var,   device)
+        avg_train_loss  = avg_train_total  # kept for checkpoint monitor compat
 
         avg_val_loss = None
+        avg_val_total = avg_val_diff = avg_val_cls = avg_val_var = None
         if val_loader is not None:
             model.eval()
-            val_sum = 0.0
+            val_sum = val_diff = val_cls = val_var = 0.0
             val_n = 0
             with torch.no_grad():
                 for batch_idx, batch in enumerate(val_loader):
@@ -480,18 +504,37 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
                         break
                     x = batch["skeleton"].to(device)
                     gait_metrics = batch["gait_metrics"].to(device)
+                    y = batch["label"].to(device)
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                        out = model(x, gait_metrics=gait_metrics)
-                        loss = out["loss_diff"]
-                    val_sum += float(loss.item())
+                        out = model(x, gait_metrics=gait_metrics, y=y)
+                        loss = (
+                            out["loss_diff"]
+                            + args.lambda_cls_s1 * out["loss_cls"]
+                            + args.lambda_var    * out["loss_var"]
+                        )
+                    val_sum  += float(loss.item())
+                    val_diff += float(out["loss_diff"].item())
+                    val_cls  += float(out["loss_cls"].item())
+                    val_var  += float(out["loss_var"].item())
                     val_n += 1
             model.train()
-            avg_val_loss = val_sum / max(val_n, 1)
-            avg_val_loss = _sync_mean(avg_val_loss, device)
+            avg_val_total = _sync_mean(val_sum  / max(val_n, 1), device)
+            avg_val_diff  = _sync_mean(val_diff / max(val_n, 1), device)
+            avg_val_cls   = _sync_mean(val_cls  / max(val_n, 1), device)
+            avg_val_var   = _sync_mean(val_var  / max(val_n, 1), device)
+            avg_val_loss  = avg_val_total
 
-        metrics = {"train_loss_diff": avg_train_loss}
-        if avg_val_loss is not None:
-            metrics["val_loss_diff"] = avg_val_loss
+        metrics = {
+            "train_loss_total": avg_train_total,
+            "train_loss_diff":  avg_train_diff,
+            "train_loss_cls":   avg_train_cls,
+            "train_loss_var":   avg_train_var,
+        }
+        if avg_val_total is not None:
+            metrics["val_loss_total"] = avg_val_total
+            metrics["val_loss_diff"]  = avg_val_diff
+            metrics["val_loss_cls"]   = avg_val_cls
+            metrics["val_loss_var"]   = avg_val_var
         history.append({"epoch": float(epoch + 1), **metrics})
         if _is_main_process():
             write_history(run_dir, "stage1", history)
@@ -518,7 +561,7 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
                 _unwrap_model(model),
                 extra={
                     "best_monitor_loss": best_loss,
-                    "best_monitor_name": "val_loss_diff" if avg_val_loss is not None else "train_loss_diff",
+                    "best_monitor_name": "val_loss_total" if avg_val_loss is not None else "train_loss_total",
                     "best_epoch": epoch + 1,
                     "gait_metric_names": list(GAIT_METRIC_NAMES),
                     "imu_feature_names": list(IMU_FEATURE_NAMES),
@@ -573,7 +616,10 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
     )
     train_loader, val_loader = _build_train_val_loaders(args, dataset=dataset, distributed=distributed)
     trainable_params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
-    optimizer = optim.Adam(trainable_params, lr=args.lr)
+    optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6
+    )
     if _is_main_process():
         save_run_manifest(
             Path(args.run_dir),
@@ -581,7 +627,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
             device,
             runtime={
                 "optimizer": optimizer.__class__.__name__,
-                "scheduler": "none",
+                "scheduler": "ReduceLROnPlateau(factor=0.5, patience=5)",
                 "sensor_modality": "accelerometer only",
                 "sensor_locations": [Path(args.hip_folder).name if args.hip_folder else "", Path(args.wrist_folder).name if args.wrist_folder else ""],
             },
@@ -606,6 +652,8 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
     for epoch in range(args.epochs):
         t0 = time.time()
         sum_loss = 0.0
+        sum_align = 0.0
+        sum_supcon = 0.0
         n_batches = 0
         total_steps = len(train_loader)
         progress_enabled = _is_main_process() and sys.stdout.isatty()
@@ -629,11 +677,13 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
                     gait_metrics=gait_metrics,
                     y=y,
                 )
-                loss = out["loss_align"]
+                loss = out["loss_align"] + args.lambda_supcon * out["loss_supcon"]
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             sum_loss += float(loss.item())
+            sum_align += float(out["loss_align"].item())
+            sum_supcon += float(out["loss_supcon"].item())
             n_batches += 1
             if tqdm is not None and progress_enabled:
                 pbar.set_postfix(loss=f"{(sum_loss / n_batches):.4f}")
@@ -655,10 +705,17 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         avg_train_loss = sum_loss / max(n_batches, 1)
         avg_train_loss = _sync_mean(avg_train_loss, device)
 
+        avg_train_align = sum_align / max(n_batches, 1)
+        avg_train_supcon = sum_supcon / max(n_batches, 1)
+
         avg_val_loss = None
+        avg_val_align = None
+        avg_val_supcon = None
         if val_loader is not None:
             model.eval()
             val_sum = 0.0
+            val_align_sum = 0.0
+            val_supcon_sum = 0.0
             val_n = 0
             with torch.no_grad():
                 for batch_idx, batch in enumerate(val_loader):
@@ -677,16 +734,29 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
                             gait_metrics=gait_metrics,
                             y=y,
                         )
-                        loss = out["loss_align"]
+                        loss = out["loss_align"] + args.lambda_supcon * out["loss_supcon"]
                     val_sum += float(loss.item())
+                    val_align_sum += float(out["loss_align"].item())
+                    val_supcon_sum += float(out["loss_supcon"].item())
                     val_n += 1
             model.train()
             avg_val_loss = val_sum / max(val_n, 1)
             avg_val_loss = _sync_mean(avg_val_loss, device)
+            avg_val_align = val_align_sum / max(val_n, 1)
+            avg_val_supcon = val_supcon_sum / max(val_n, 1)
 
-        metrics = {"train_loss_align": avg_train_loss}
         if avg_val_loss is not None:
-            metrics["val_loss_align"] = avg_val_loss
+            scheduler.step(avg_val_loss)
+
+        metrics = {
+            "train_loss_total": avg_train_loss,
+            "train_loss_align": avg_train_align,
+            "train_loss_supcon": avg_train_supcon,
+        }
+        if avg_val_loss is not None:
+            metrics["val_loss_total"] = avg_val_loss
+            metrics["val_loss_align"] = avg_val_align
+            metrics["val_loss_supcon"] = avg_val_supcon
         history.append({"epoch": float(epoch + 1), **metrics})
         if _is_main_process():
             write_history(run_dir, "stage2", history)
@@ -713,7 +783,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
                 _unwrap_model(model),
                 extra={
                     "best_monitor_loss": best_loss,
-                    "best_monitor_name": "val_loss_align" if avg_val_loss is not None else "train_loss_align",
+                    "best_monitor_name": "val_loss_total" if avg_val_loss is not None else "train_loss_total",
                     "best_epoch": epoch + 1,
                     "gait_metric_names": list(GAIT_METRIC_NAMES),
                     "imu_feature_names": list(IMU_FEATURE_NAMES),
@@ -774,7 +844,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
     # Stage-2 pre-training warm-starts the aligner; Stage-3 fine-tunes it.
     trainable_params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
     trainable_params += list(stage2.aligner.parameters())
-    optimizer = optim.Adam(trainable_params, lr=args.lr)
+    optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-3)
     if _is_main_process():
         save_run_manifest(
             Path(args.run_dir),

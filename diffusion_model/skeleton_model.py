@@ -10,6 +10,7 @@ import torch.nn as nn
 from diffusion_model.graph_modules import (
     CrossAttentionBlock,
     GraphBlock,
+    GraphBlockGCN,
     TemporalConvBlock,
     HAS_TORCH_GEOMETRIC,
     build_edge_index,
@@ -75,6 +76,70 @@ class GraphEncoder(nn.Module):
             z = g_block(z, adjacency=adjacency, edge_index=edge_index)
             z = t_block(z)
         assert_shape(z, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "GraphEncoder.z")
+        return z
+
+
+class GraphEncoderGCN(nn.Module):
+    """GCN-based skeleton encoder — drop-in replacement for GraphEncoder.
+
+    Uses GCNConv (fixed degree-normalized aggregation) instead of GATConv
+    (learned per-edge attention weights). Lighter and faster; useful for
+    comparing whether attention is necessary for the skeleton latent space.
+    Output shape is identical: [B, T, J, latent_dim].
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 3,
+        latent_dim: int = 256,
+        num_joints: int = 32,
+        depth: int = 4,
+        gait_metrics_dim: int = 0,
+        use_gait_conditioning: bool = True,
+    ) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.num_joints = num_joints
+        self.gait_metrics_dim = gait_metrics_dim
+        self.use_gait_conditioning = bool(use_gait_conditioning) and gait_metrics_dim > 0
+        self.in_proj = nn.Linear(input_dim, latent_dim)
+        if gait_metrics_dim > 0:
+            self.gait_proj = nn.Sequential(
+                nn.Linear(gait_metrics_dim, latent_dim),
+                nn.GELU(),
+                nn.Linear(latent_dim, latent_dim),
+            )
+        else:
+            self.gait_proj = None
+        self.graph_blocks = nn.ModuleList(
+            [GraphBlockGCN(dim=latent_dim, num_joints=num_joints) for _ in range(depth)]
+        )
+        self.temporal_blocks = nn.ModuleList([TemporalConvBlock(dim=latent_dim) for _ in range(depth)])
+        _adj = build_adjacency_matrix(num_joints=num_joints, device=torch.device("cpu"))
+        self.register_buffer("_skel_adjacency", _adj, persistent=False)
+        _ei = build_edge_index(num_joints, torch.device("cpu")) if HAS_TORCH_GEOMETRIC else None
+        if _ei is not None:
+            self.register_buffer("_skel_edge_index", _ei, persistent=False)
+        else:
+            self._skel_edge_index = None
+
+    def forward(self, x: torch.Tensor, gait_metrics: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Encode x with shape [B, T, J, 3] into z0 with shape [B, T, J, latent_dim]."""
+        assert_shape(x, [None, None, self.num_joints, self.input_dim], "GraphEncoderGCN.x")
+        adjacency = self._skel_adjacency
+        edge_index = self._skel_edge_index
+        z = self.in_proj(x)
+        if self.gait_proj is not None and self.use_gait_conditioning:
+            if gait_metrics is None:
+                raise ValueError("gait_metrics must be provided when gait_metrics_dim > 0")
+            assert_shape(gait_metrics, [x.shape[0], self.gait_metrics_dim], "GraphEncoderGCN.gait_metrics")
+            gait_bias = self.gait_proj(gait_metrics).unsqueeze(1).unsqueeze(1)
+            z = z + gait_bias
+        for g_block, t_block in zip(self.graph_blocks, self.temporal_blocks):
+            z = g_block(z, adjacency=adjacency, edge_index=edge_index)
+            z = t_block(z)
+        assert_shape(z, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "GraphEncoderGCN.z")
         return z
 
 

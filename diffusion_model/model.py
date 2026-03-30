@@ -13,7 +13,7 @@ from diffusion_model.diffusion import DiffusionProcess, extract
 from diffusion_model.gait_metrics import compute_gait_metrics_torch
 from diffusion_model.losses import motion_losses, supervised_contrastive_loss
 from diffusion_model.sensor_model import IMULatentAligner
-from diffusion_model.skeleton_model import GraphDecoder, GraphDenoiserMasked, GraphEncoder
+from diffusion_model.skeleton_model import GraphDecoder, GraphDenoiserMasked, GraphEncoder, GraphEncoderGCN
 from diffusion_model.util import assert_shape
 
 
@@ -60,6 +60,7 @@ class Stage1Model(nn.Module):
         gait_metrics_dim: int = 0,
         use_gait_conditioning: bool = True,
         num_classes: int = 14,
+        encoder_type: str = "gat",
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -67,7 +68,8 @@ class Stage1Model(nn.Module):
         self.num_classes = num_classes
         self.gait_metrics_dim = gait_metrics_dim
         self.use_gait_conditioning = bool(use_gait_conditioning)
-        self.encoder = GraphEncoder(
+        encoder_cls = GraphEncoderGCN if encoder_type == "gcn" else GraphEncoder
+        self.encoder = encoder_cls(
             input_dim=3,
             latent_dim=latent_dim,
             num_joints=num_joints,
@@ -171,6 +173,7 @@ class Stage2Model(nn.Module):
         self.num_classes = num_classes
         self.encoder = encoder
         self.aligner = IMULatentAligner(latent_dim=latent_dim, gait_metrics_dim=0, graph_type=imu_graph_type)
+        self.cls_head = nn.Linear(latent_dim, num_classes)
         self.use_gait_conditioning = False
         self.freeze_encoder()
 
@@ -202,37 +205,33 @@ class Stage2Model(nn.Module):
         assert_shape(z0, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.z0")
 
         h_tokens, h_global = self.aligner(a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
-        h = h_tokens.unsqueeze(2).expand(-1, -1, self.num_joints, -1)
-        assert_shape(h, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.h")
 
-        # Class-conditional alignment: target = mean z0 over all same-class samples in the batch.
-        # Per-sample z0_mean encodes subject-specific skeleton geometry, causing the IMU encoder
-        # to memorise subject identity (train subjects fit, val subjects don't).
-        # Using the within-batch class mean removes subject-specific signal while still grounding
-        # h_tokens in the skeleton latent space — the same direction SupCon pushes h_global.
-        z0_joint_mean = z0.mean(dim=2).detach()    # [B, T, D]  joint-mean per sample
-        if y is not None:
-            # Build class-conditional target: for each sample, average z0 across same-class samples
-            unique_classes = y.unique()
-            z0_class_target = z0_joint_mean.clone()
-            for c in unique_classes:
-                mask = (y == c)                    # [B] bool
-                z0_class_target[mask] = z0_joint_mean[mask].mean(dim=0, keepdim=True)
-        else:
-            z0_class_target = z0_joint_mean
-        loss_align = F.mse_loss(h_tokens, z0_class_target)
+        # Per-sample cosine alignment: align h_global direction to z0 global direction.
+        # Using cosine (not MSE) avoids magnitude collapse, and per-sample targets (not class
+        # means) preserve within-class variance so the encoder can still discriminate subjects.
+        # SupCon handles inter-class separation independently.
+        z0_global = z0.mean(dim=(1, 2)).detach()     # [B, D] — pool over T and J
+        h_norm  = F.normalize(h_global, dim=-1)      # [B, D]
+        z0_norm = F.normalize(z0_global, dim=-1)     # [B, D]
+        loss_align = (1.0 - (h_norm * z0_norm).sum(dim=-1)).mean()
 
         # SupCon loss — pulls same-activity IMU embeddings together across subjects
         if y is not None:
-            h_norm = F.normalize(h_global, dim=-1)   # [B, D] — L2 normalise
             loss_supcon = supervised_contrastive_loss(h_norm, y)
         else:
             loss_supcon = torch.zeros((), device=x.device, dtype=x.dtype)
 
+        # CE classification — directly forces linear separability of 14 classes in h_global;
+        # converges in ~10 epochs vs SupCon's slow metric learning
+        if y is not None:
+            loss_cls = F.cross_entropy(self.cls_head(h_global), y)
+        else:
+            loss_cls = torch.zeros((), device=x.device, dtype=x.dtype)
+
         return {
             "loss_align": loss_align,
             "loss_supcon": loss_supcon,
-            "h": h,
+            "loss_cls": loss_cls,
             "h_global": h_global,
             "h_tokens": h_tokens,
             "sensor_tokens": h_tokens,

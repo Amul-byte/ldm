@@ -105,6 +105,64 @@ class GraphBlock(nn.Module):
         return x
 
 
+class PyGGCNGraphLayer(nn.Module):
+    """Graph layer using torch_geometric GCNConv over the skeleton graph."""
+
+    def __init__(self, dim: int, num_joints: int) -> None:
+        super().__init__()
+        self.dim = dim
+        self.num_joints = num_joints
+        # Self-loops already included in build_adjacency_matrix; don't add again.
+        self.gcn = GCNConv(in_channels=dim, out_channels=dim, add_self_loops=False)
+        self._batched_edge_cache: dict = {}
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        """Apply GCN to x with shape [B, T, J, D]."""
+        b, t, j, d = x.shape
+        assert_shape(x, [None, None, self.num_joints, self.dim], "PyGGCNGraphLayer.x")
+        assert_shape(edge_index, [2, None], "PyGGCNGraphLayer.edge_index")
+        x_flat = x.reshape(b * t * j, d)
+        cache_key = (b * t, j, int(edge_index.shape[1]))
+        if cache_key not in self._batched_edge_cache:
+            offsets = torch.arange(0, b * t, device=x.device).repeat_interleave(edge_index.shape[1]) * j
+            self._batched_edge_cache[cache_key] = (
+                edge_index.repeat(1, b * t) + offsets.unsqueeze(0)
+            ).contiguous()
+        repeated_edge_index = self._batched_edge_cache[cache_key]
+        if repeated_edge_index.device != x.device:
+            repeated_edge_index = repeated_edge_index.to(x.device)
+            self._batched_edge_cache[cache_key] = repeated_edge_index
+        y = self.gcn(x_flat, repeated_edge_index)
+        return y.reshape(b, t, j, d)
+
+
+class GraphBlockGCN(nn.Module):
+    """Residual graph block using GCNConv — drop-in replacement for GraphBlock."""
+
+    def __init__(self, dim: int, num_joints: int) -> None:
+        super().__init__()
+        self.dim = dim
+        self.num_joints = num_joints
+        self.graph_op = PyGGCNGraphLayer(dim=dim, num_joints=num_joints)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+    def forward(self, x: torch.Tensor, adjacency: torch.Tensor, edge_index: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Run GCN then feed-forward with residual paths."""
+        assert_shape(x, [None, None, self.num_joints, self.dim], "GraphBlockGCN.x")
+        assert edge_index is not None, "edge_index is required for GraphBlockGCN"
+        h = self.norm1(x)
+        y = self.graph_op(h, edge_index)
+        x = x + y
+        x = x + self.ff(self.norm2(x))
+        return x
+
+
 class TemporalMaskedGraphAttention(nn.Module):
     """Temporal adjacency-masked multi-head attention over sequence steps."""
 

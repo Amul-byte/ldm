@@ -337,7 +337,7 @@ def parse_args() -> argparse.Namespace:
         help="Number of scalar gait metrics provided per sample. Defaults to the fixed auto-computed gait-summary size.",
     )
     parser.add_argument("--num_classes", type=int, default=DEFAULT_NUM_CLASSES)
-    parser.add_argument("--stride", type=int, default=30)
+    parser.add_argument("--stride", type=int, default=45)
     parser.add_argument("--disable_sensor_norm", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--one_to_one", dest="one_to_one", action="store_true", help="Enable one-to-one IMU->skeleton mode.")
@@ -351,12 +351,16 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated subject ids used for training; all other subjects go to validation. Leave empty to use random val_split instead.",
     )
     parser.add_argument("--log_every", type=int, default=20, help="Plain progress print interval (steps) when tqdm is not interactive.")
+    parser.add_argument("--encoder_type", choices=["gat", "gcn"], default="gat",
+                        help="Skeleton encoder for Stage 1: 'gat' (GATConv, default) or 'gcn' (GCNConv, lighter).")
     parser.add_argument("--imu_graph", choices=["chain", "multiscale"], default="chain",
                         help="IMU temporal graph type for Stage-2 encoder: 'chain' (j→j+1 only, simpler) or 'multiscale' (gaps 1,5,15,30, wider receptive field).")
     parser.add_argument("--lambda_cls", type=float, default=0.1, help="Weight for classification loss (Stage-3 only).")
     parser.add_argument("--lambda_cls_s1", type=float, default=0.1, help="Weight for classification loss in Stage-1 (discriminative latent training).")
     parser.add_argument("--lambda_var", type=float, default=0.01, help="Weight for variance regulariser in Stage-1 (prevents embedding collapse).")
     parser.add_argument("--lambda_supcon", type=float, default=0.1, help="Weight for supervised contrastive loss in Stage-2 (subject-invariant activity embeddings).")
+    parser.add_argument("--lambda_align", type=float, default=1.0, help="Weight for IMU-skeleton cosine alignment loss in Stage-2.")
+    parser.add_argument("--lambda_cls_s2", type=float, default=0.1, help="Weight for CE classification loss in Stage-2 (faster class separation than SupCon).")
     parser.add_argument("--lambda_pose", type=float, default=1.0, help="Weight for paired skeleton reconstruction loss (Stage-3 only).")
     parser.add_argument("--lambda_latent", type=float, default=0.5, help="Weight for latent reconstruction loss (Stage-3 only).")
     parser.add_argument("--lambda_vel", type=float, default=0.5, help="Weight for velocity reconstruction loss (Stage-3 only).")
@@ -383,6 +387,7 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         gait_metrics_dim=args.gait_metrics_dim,
         use_gait_conditioning=not args.one_to_one,
         num_classes=args.num_classes,
+        encoder_type=args.encoder_type,
     ).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -586,9 +591,11 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
         use_gait_conditioning=not args.one_to_one,
+        encoder_type=args.encoder_type,
     ).to(device)
     if args.stage1_ckpt:
-        load_checkpoint(args.stage1_ckpt, stage1, strict=True)
+        # strict=False: checkpoint may predate Stage-1 cls_head; only encoder weights matter here
+        load_checkpoint(args.stage1_ckpt, stage1, strict=False)
 
     model = Stage2Model(
         encoder=stage1.encoder,
@@ -654,6 +661,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         sum_loss = 0.0
         sum_align = 0.0
         sum_supcon = 0.0
+        sum_cls = 0.0
         n_batches = 0
         total_steps = len(train_loader)
         progress_enabled = _is_main_process() and sys.stdout.isatty()
@@ -677,13 +685,16 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
                     gait_metrics=gait_metrics,
                     y=y,
                 )
-                loss = out["loss_align"] + args.lambda_supcon * out["loss_supcon"]
+                loss = (args.lambda_align * out["loss_align"]
+                        + args.lambda_supcon * out["loss_supcon"]
+                        + args.lambda_cls_s2 * out["loss_cls"])
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             sum_loss += float(loss.item())
             sum_align += float(out["loss_align"].item())
             sum_supcon += float(out["loss_supcon"].item())
+            sum_cls += float(out["loss_cls"].item())
             n_batches += 1
             if tqdm is not None and progress_enabled:
                 pbar.set_postfix(loss=f"{(sum_loss / n_batches):.4f}")
@@ -707,15 +718,18 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
 
         avg_train_align = sum_align / max(n_batches, 1)
         avg_train_supcon = sum_supcon / max(n_batches, 1)
+        avg_train_cls = sum_cls / max(n_batches, 1)
 
         avg_val_loss = None
         avg_val_align = None
         avg_val_supcon = None
+        avg_val_cls = None
         if val_loader is not None:
             model.eval()
             val_sum = 0.0
             val_align_sum = 0.0
             val_supcon_sum = 0.0
+            val_cls_sum = 0.0
             val_n = 0
             with torch.no_grad():
                 for batch_idx, batch in enumerate(val_loader):
@@ -734,16 +748,20 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
                             gait_metrics=gait_metrics,
                             y=y,
                         )
-                        loss = out["loss_align"] + args.lambda_supcon * out["loss_supcon"]
+                        loss = (args.lambda_align * out["loss_align"]
+                                + args.lambda_supcon * out["loss_supcon"]
+                                + args.lambda_cls_s2 * out["loss_cls"])
                     val_sum += float(loss.item())
                     val_align_sum += float(out["loss_align"].item())
                     val_supcon_sum += float(out["loss_supcon"].item())
+                    val_cls_sum += float(out["loss_cls"].item())
                     val_n += 1
             model.train()
             avg_val_loss = val_sum / max(val_n, 1)
             avg_val_loss = _sync_mean(avg_val_loss, device)
             avg_val_align = val_align_sum / max(val_n, 1)
             avg_val_supcon = val_supcon_sum / max(val_n, 1)
+            avg_val_cls = val_cls_sum / max(val_n, 1)
 
         if avg_val_loss is not None:
             scheduler.step(avg_val_loss)
@@ -752,11 +770,13 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
             "train_loss_total": avg_train_loss,
             "train_loss_align": avg_train_align,
             "train_loss_supcon": avg_train_supcon,
+            "train_loss_cls": avg_train_cls,
         }
         if avg_val_loss is not None:
             metrics["val_loss_total"] = avg_val_loss
             metrics["val_loss_align"] = avg_val_align
             metrics["val_loss_supcon"] = avg_val_supcon
+            metrics["val_loss_cls"] = avg_val_cls
         history.append({"epoch": float(epoch + 1), **metrics})
         if _is_main_process():
             write_history(run_dir, "stage2", history)
@@ -810,6 +830,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
         use_gait_conditioning=not args.one_to_one,
+        encoder_type=args.encoder_type,
     ).to(device)
     if args.stage1_ckpt:
         load_checkpoint(args.stage1_ckpt, stage1, strict=True)

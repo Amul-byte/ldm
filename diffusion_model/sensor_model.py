@@ -133,9 +133,11 @@ class SensorGCNEncoder(nn.Module):
     Each conv is a GCNConv over a chain temporal graph on T nodes.
     """
 
-    def __init__(self, input_dim: int = 6, latent_dim: int = 256) -> None:
+    def __init__(self, input_dim: int = 6, latent_dim: int = 256,
+                 graph_type: str = "chain") -> None:
         super().__init__()
         self.latent_dim = latent_dim
+        self.graph_type = graph_type
         # Hidden dims match checkpoint: 6→32→32→64→256
         self.conv1 = GCNConv(input_dim, 32, add_self_loops=False)
         self.conv2 = GCNConv(32, 32, add_self_loops=False)
@@ -150,18 +152,27 @@ class SensorGCNEncoder(nn.Module):
         self._edge_cache: dict = {}
 
     def _get_batched_edge_index(self, b: int, t: int, device: torch.device) -> torch.Tensor:
-        if (b, t) not in self._edge_cache:
-            idx = torch.arange(t - 1, device=device)
+        cache_key = (b, t, self.graph_type)
+        if cache_key not in self._edge_cache:
             self_idx = torch.arange(t, device=device)
-            src = torch.cat([idx, idx + 1, self_idx])
-            dst = torch.cat([idx + 1, idx, self_idx])
+            srcs = [self_idx]
+            dsts = [self_idx]
+            scales = [1, 5, 15, 30] if self.graph_type == "multiscale" else [1]
+            for scale in scales:
+                if scale >= t:
+                    continue
+                idx = torch.arange(t - scale, device=device)
+                srcs += [idx, idx + scale]
+                dsts += [idx + scale, idx]
+            src = torch.cat(srcs)
+            dst = torch.cat(dsts)
             single_ei = torch.stack([src, dst], dim=0)
             batched = torch.cat([single_ei + i * t for i in range(b)], dim=1)
-            self._edge_cache[(b, t)] = batched
-        ei = self._edge_cache[(b, t)]
+            self._edge_cache[cache_key] = batched
+        ei = self._edge_cache[cache_key]
         if ei.device != device:
             ei = ei.to(device)
-            self._edge_cache[(b, t)] = ei
+            self._edge_cache[cache_key] = ei
         return ei
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -279,8 +290,8 @@ class IMULatentAligner(nn.Module):
         self.gait_metrics_dim = gait_metrics_dim
         self.imu_feature_dim = len(IMU_FEATURE_NAMES)
         # Separate per-sensor encoders matching checkpoint architecture
-        self.hip_encoder = SensorGCNEncoder(input_dim=self.imu_feature_dim, latent_dim=latent_dim)
-        self.wrist_encoder = SensorGCNEncoder(input_dim=self.imu_feature_dim, latent_dim=latent_dim)
+        self.hip_encoder   = SensorGCNEncoder(input_dim=self.imu_feature_dim, latent_dim=latent_dim, graph_type=graph_type)
+        self.wrist_encoder = SensorGCNEncoder(input_dim=self.imu_feature_dim, latent_dim=latent_dim, graph_type=graph_type)
         self.fuse_tokens = nn.Sequential(
             nn.Linear(latent_dim * 2, latent_dim),
             nn.GELU(),

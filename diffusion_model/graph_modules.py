@@ -344,6 +344,13 @@ class CrossAttentionBlock(nn.Module):
             nn.GELU(),
             nn.Linear(dim * 4, dim),
         )
+        # Zero-init output projections so cross-attention is a no-op at initialisation.
+        # This preserves the Stage-1 denoiser prior at the start of Stage-3 training
+        # and lets conditioning grow in gradually (ControlNet / IP-Adapter trick).
+        nn.init.zeros_(self.attn.out_proj.weight)
+        nn.init.zeros_(self.attn.out_proj.bias)
+        nn.init.zeros_(self.ff[2].weight)
+        nn.init.zeros_(self.ff[2].bias)
 
     def forward(self, joint_tokens: torch.Tensor, sensor_tokens: torch.Tensor) -> torch.Tensor:
         """Condition [B,T,J,D] joint tokens with [B,T,D] sensor tokens via cross-attention."""

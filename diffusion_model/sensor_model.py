@@ -6,26 +6,19 @@ import torch
 import torch.nn as nn
 
 from diffusion_model.graph_modules import HAS_TORCH_GEOMETRIC, TemporalGCNBlock, build_edge_index_from_adjacency
-
+from diffusion_model.shared_features import SHARED_FEATURE_NAMES, build_shared_motion_features
 if HAS_TORCH_GEOMETRIC:
     from torch_geometric.nn import GCNConv
 from diffusion_model.util import assert_shape
 
 
-IMU_FEATURE_NAMES: tuple[str, ...] = ("ax", "ay", "az", "magnitude", "pitch", "roll")
+IMU_FEATURE_NAMES: tuple[str, ...] = SHARED_FEATURE_NAMES
 
 
 def build_imu_features(accel: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Expand raw accelerometer streams [B,T,3] into [B,T,6]."""
+    """Expand raw accelerometer streams [B,T,3] into shared [B,T,10] motion features."""
     assert_shape(accel, [None, None, 3], "build_imu_features.accel")
-    ax = accel[..., 0]
-    ay = accel[..., 1]
-    az = accel[..., 2]
-    magnitude = torch.sqrt(torch.clamp(ax * ax + ay * ay + az * az, min=eps))
-    pitch = torch.atan2(ax, torch.sqrt(torch.clamp(ay * ay + az * az, min=eps)))
-    az_safe = torch.where(az.abs() < eps, torch.full_like(az, eps), az)
-    roll = torch.atan2(ay, az_safe)
-    features = torch.stack([ax, ay, az, magnitude, pitch, roll], dim=-1)
+    features = build_shared_motion_features(accel, eps=eps)
     assert_shape(features, [accel.shape[0], accel.shape[1], len(IMU_FEATURE_NAMES)], "build_imu_features.features")
     return features
 
@@ -133,7 +126,7 @@ class SensorGCNEncoder(nn.Module):
     Each conv is a GCNConv over a chain temporal graph on T nodes.
     """
 
-    def __init__(self, input_dim: int = 6, latent_dim: int = 256,
+    def __init__(self, input_dim: int = len(IMU_FEATURE_NAMES), latent_dim: int = 256,
                  graph_type: str = "chain") -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -194,12 +187,12 @@ class IMUGraphEncoder(nn.Module):
     aligned timestep, so the TGNN can capture hip-wrist correlations explicitly.
 
     Args:
-        input_dim:  Feature dimension of each IMU stream after build_imu_features (default 6).
+        input_dim:  Feature dimension of each IMU stream after build_imu_features (default 10).
         latent_dim: Output embedding dimension per node (default 256).
         depth:      Number of TemporalGraphBlock layers applied to the combined graph.
     """
 
-    def __init__(self, input_dim: int = 6, latent_dim: int = 256, depth: int = 3,
+    def __init__(self, input_dim: int = len(IMU_FEATURE_NAMES), latent_dim: int = 256, depth: int = 3,
                  graph_type: str = "chain") -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -320,8 +313,8 @@ class IMULatentAligner(nn.Module):
         assert_shape(a_wrist_stream, [None, None, 3], "IMULatentAligner.a_wrist_stream")
         assert a_hip_stream.shape[:2] == a_wrist_stream.shape[:2], "Hip and wrist streams must share [B,T]"
 
-        hip_features = build_imu_features(a_hip_stream)    # [B, T, 6]
-        wrist_features = build_imu_features(a_wrist_stream)  # [B, T, 6]
+        hip_features = build_imu_features(a_hip_stream)      # [B, T, 10]
+        wrist_features = build_imu_features(a_wrist_stream)  # [B, T, 10]
 
         hip_tokens = self.hip_encoder(hip_features)        # [B, T, D]
         wrist_tokens = self.wrist_encoder(wrist_features)  # [B, T, D]

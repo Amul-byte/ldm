@@ -11,10 +11,31 @@ import torch.nn.functional as F
 
 from diffusion_model.diffusion import DiffusionProcess, extract
 from diffusion_model.gait_metrics import compute_gait_metrics_torch
-from diffusion_model.losses import motion_losses, supervised_contrastive_loss
+from diffusion_model.losses import motion_losses
+from diffusion_model.shared_features import (
+    SHARED_FEATURE_DIM,
+    SharedMotionLayer,
+    build_shared_motion_features,
+    compute_skeleton_acceleration,
+)
 from diffusion_model.sensor_model import IMULatentAligner
-from diffusion_model.skeleton_model import GraphDecoder, GraphDenoiserMasked, GraphEncoder, GraphEncoderGCN
+from diffusion_model.skeleton_model import (
+    GraphDecoder,
+    GraphDecoderGCN,
+    GraphDenoiserMasked,
+    GraphDenoiserMaskedGCN,
+    GraphEncoder,
+    GraphEncoderGCN,
+    SKELETON_FEATURE_DIM,
+)
 from diffusion_model.util import assert_shape
+
+
+def _normalize_graph_op_name(graph_op: str | None, default: str = "gat") -> str:
+    name = default if graph_op in {None, ""} else str(graph_op).lower()
+    if name not in {"gat", "gcn"}:
+        raise ValueError(f"Unsupported graph op: {graph_op}")
+    return name
 
 
 class SkeletonTransformerClassifier(nn.Module):
@@ -60,7 +81,8 @@ class Stage1Model(nn.Module):
         gait_metrics_dim: int = 0,
         use_gait_conditioning: bool = True,
         num_classes: int = 14,
-        encoder_type: str = "gat",
+        encoder_type: str | None = None,
+        skeleton_graph_op: str = "gat",
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -68,21 +90,25 @@ class Stage1Model(nn.Module):
         self.num_classes = num_classes
         self.gait_metrics_dim = gait_metrics_dim
         self.use_gait_conditioning = bool(use_gait_conditioning)
-        encoder_cls = GraphEncoderGCN if encoder_type == "gcn" else GraphEncoder
+        self.skeleton_graph_op = _normalize_graph_op_name(skeleton_graph_op)
+        self.encoder_graph_op = _normalize_graph_op_name(encoder_type, default=self.skeleton_graph_op)
+        encoder_cls = GraphEncoderGCN if self.encoder_graph_op == "gcn" else GraphEncoder
+        decoder_cls = GraphDecoderGCN if self.skeleton_graph_op == "gcn" else GraphDecoder
+        denoiser_cls = GraphDenoiserMaskedGCN if self.skeleton_graph_op == "gcn" else GraphDenoiserMasked
         self.encoder = encoder_cls(
-            input_dim=3,
+            input_dim=SKELETON_FEATURE_DIM,
             latent_dim=latent_dim,
             num_joints=num_joints,
             gait_metrics_dim=gait_metrics_dim,
             use_gait_conditioning=self.use_gait_conditioning,
         )
-        self.denoiser = GraphDenoiserMasked(
+        self.denoiser = denoiser_cls(
             latent_dim=latent_dim,
             num_joints=num_joints,
             gait_metrics_dim=gait_metrics_dim,
             use_gait_conditioning=self.use_gait_conditioning,
         )
-        self.decoder = GraphDecoder(latent_dim=latent_dim, output_dim=3, num_joints=num_joints)
+        self.decoder = decoder_cls(latent_dim=latent_dim, output_dim=3, num_joints=num_joints)
         self.diffusion = DiffusionProcess(timesteps=timesteps)
         # Auxiliary classification head — used only during Stage-1 training to
         # force discriminative latent structure; not used in Stage-2/3.
@@ -100,11 +126,8 @@ class Stage1Model(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Compute stage-1 losses: diffusion + optional classification + variance regularizer."""
         assert_shape(x, [None, None, self.num_joints, 3], "Stage1Model.x")
-        if self.gait_metrics_dim > 0 and self.use_gait_conditioning:
-            assert gait_metrics is not None, "gait_metrics are required when gait_metrics_dim > 0"
-            assert_shape(gait_metrics, [x.shape[0], self.gait_metrics_dim], "Stage1Model.gait_metrics")
-        active_gait = gait_metrics if self.use_gait_conditioning else None
-        z0 = self.encoder(x, gait_metrics=active_gait)
+        # Gait metrics no longer used as conditioning — only as eval/loss targets
+        z0 = self.encoder(x, gait_metrics=None)
         t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
         loss_diff = self.diffusion.predict_noise_loss(
             self.denoiser,
@@ -112,13 +135,13 @@ class Stage1Model(nn.Module):
             t,
             h_tokens=None,
             h_global=None,
-            gait_metrics=active_gait,
+            gait_metrics=None,
         )
 
         # Pool z0 over T and J → [B, D] for classification and variance losses
         z_pooled = z0.mean(dim=(1, 2))
 
-        # Classification loss: forces inter-class separation in latent space
+        # Classification loss: CE on pooled encoder latents
         if y is not None:
             loss_cls = F.cross_entropy(self.cls_head(z_pooled), y)
         else:
@@ -126,7 +149,7 @@ class Stage1Model(nn.Module):
 
         # Variance regulariser: penalise any latent dimension with var < 1
         # relu(1 - var) → 0 when spread out, positive when collapsed
-        var_per_dim = z_pooled.var(dim=0)                        # [D]
+        var_per_dim = z_pooled.var(dim=0,unbiased=False)                        # [D]
         loss_var = torch.relu(1.0 - var_per_dim).mean()
 
         return {
@@ -165,15 +188,26 @@ class Stage2Model(nn.Module):
         gait_metrics_dim: int = 0,
         num_classes: int = 14,
         imu_graph_type: str = "chain",
+        d_shared: int = 64,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.num_joints = num_joints
         self.gait_metrics_dim = gait_metrics_dim
         self.num_classes = num_classes
+        self.d_shared = d_shared
         self.encoder = encoder
         self.aligner = IMULatentAligner(latent_dim=latent_dim, gait_metrics_dim=0, graph_type=imu_graph_type)
+        self.shared_motion_layer = SharedMotionLayer(input_dim=SHARED_FEATURE_DIM, d_shared=d_shared)
         self.cls_head = nn.Linear(latent_dim, num_classes)
+        # Gait-metric prediction head: the primary supervised signal for Stage 2.
+        # Predicts the 9 gait metrics from h_global, giving a strong non-collapsing
+        # gradient because gait metrics vary significantly across subjects/activities.
+        self.gait_pred_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.GELU(),
+            nn.Linear(latent_dim // 2, gait_metrics_dim),
+        ) if gait_metrics_dim > 0 else None
         self.use_gait_conditioning = False
         self.freeze_encoder()
 
@@ -186,6 +220,28 @@ class Stage2Model(nn.Module):
         # into z0 (which the aligner would then merely need to memorise).
         self.encoder.use_gait_conditioning = False
         assert all(not p.requires_grad for p in self.encoder.parameters()), "encoder freeze verification failed"
+
+    def _encode_skeleton_shared(self, x: torch.Tensor) -> torch.Tensor:
+        """Project skeleton-derived acceleration features to the shared motion space."""
+        skel_accel = compute_skeleton_acceleration(x)
+        skel_shared = build_shared_motion_features(skel_accel)
+        skel_embed = self.shared_motion_layer(skel_shared, modality="skel").mean(dim=2)
+        assert_shape(skel_embed, [x.shape[0], x.shape[1], self.d_shared], "Stage2Model.skel_embed")
+        return skel_embed
+
+    def _encode_imu_shared(self, a_hip_stream: torch.Tensor, a_wrist_stream: torch.Tensor) -> torch.Tensor:
+        """Project raw hip/wrist acceleration streams into the shared motion space."""
+        hip_shared = build_shared_motion_features(a_hip_stream)
+        wrist_shared = build_shared_motion_features(a_wrist_stream)
+        hip_embed = self.shared_motion_layer(hip_shared, modality="imu")
+        wrist_embed = self.shared_motion_layer(wrist_shared, modality="imu")
+        imu_embed = 0.5 * (hip_embed + wrist_embed)
+        assert_shape(
+            imu_embed,
+            [a_hip_stream.shape[0], a_hip_stream.shape[1], self.d_shared],
+            "Stage2Model.imu_embed",
+        )
+        return imu_embed
 
     def forward(
         self,
@@ -202,36 +258,40 @@ class Stage2Model(nn.Module):
 
         with torch.no_grad():
             z0 = self.encoder(x, gait_metrics=None)
+            skel_embed = self._encode_skeleton_shared(x)
         assert_shape(z0, [x.shape[0], x.shape[1], self.num_joints, self.latent_dim], "Stage2Model.z0")
 
         h_tokens, h_global = self.aligner(a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
+        imu_embed = self._encode_imu_shared(a_hip_stream=a_hip_stream, a_wrist_stream=a_wrist_stream)
 
-        # Per-sample cosine alignment: align h_global direction to z0 global direction.
-        # Using cosine (not MSE) avoids magnitude collapse, and per-sample targets (not class
-        # means) preserve within-class variance so the encoder can still discriminate subjects.
-        # SupCon handles inter-class separation independently.
+        # MSE alignment: push h_global toward the pooled skeleton latent z0_global.
+        # MSE is used instead of cosine because the gait_pred_head anchors h_global
+        # to a meaningful magnitude scale, so magnitude collapse is no longer a risk.
+        # MSE penalises both direction and magnitude, giving a stronger gradient signal.
         z0_global = z0.mean(dim=(1, 2)).detach()     # [B, D] — pool over T and J
-        h_norm  = F.normalize(h_global, dim=-1)      # [B, D]
-        z0_norm = F.normalize(z0_global, dim=-1)     # [B, D]
-        loss_align = (1.0 - (h_norm * z0_norm).sum(dim=-1)).mean()
+        loss_align = F.mse_loss(h_global, z0_global)
+        loss_feature = F.mse_loss(imu_embed, skel_embed)
 
-        # SupCon loss — pulls same-activity IMU embeddings together across subjects
-        if y is not None:
-            loss_supcon = supervised_contrastive_loss(h_norm, y)
-        else:
-            loss_supcon = torch.zeros((), device=x.device, dtype=x.dtype)
-
-        # CE classification — directly forces linear separability of 14 classes in h_global;
-        # converges in ~10 epochs vs SupCon's slow metric learning
+        # CE classification — forces linear separability of 14 classes in h_global
         if y is not None:
             loss_cls = F.cross_entropy(self.cls_head(h_global), y)
         else:
             loss_cls = torch.zeros((), device=x.device, dtype=x.dtype)
 
+        # Gait-metric prediction: the primary supervised signal that forces h_global
+        # to encode motion-relevant information from IMU.  Unlike the cosine alignment
+        # target (z0, which is non-discriminative), gait metrics vary strongly across
+        # subjects and activities, providing a reliable gradient.
+        if self.gait_pred_head is not None and gait_metrics is not None:
+            loss_gait_pred = F.mse_loss(self.gait_pred_head(h_global), gait_metrics)
+        else:
+            loss_gait_pred = torch.zeros((), device=x.device, dtype=x.dtype)
+
         return {
             "loss_align": loss_align,
-            "loss_supcon": loss_supcon,
+            "loss_feature": loss_feature,
             "loss_cls": loss_cls,
+            "loss_gait_pred": loss_gait_pred,
             "h_global": h_global,
             "h_tokens": h_tokens,
             "sensor_tokens": h_tokens,
@@ -253,6 +313,8 @@ class Stage3Model(nn.Module):
         timesteps: int = 500,
         gait_metrics_dim: int = 0,
         use_gait_conditioning: bool = True,
+        d_shared: int = 64,
+        shared_motion_layer: SharedMotionLayer | None = None,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -266,6 +328,14 @@ class Stage3Model(nn.Module):
         self.diffusion = DiffusionProcess(timesteps=timesteps)
         self.class_embed = nn.Embedding(num_classes, latent_dim)
         self.classifier = SkeletonTransformerClassifier(num_joints=num_joints, num_classes=num_classes, d_model=latent_dim)
+        self.shared_motion_layer = shared_motion_layer or SharedMotionLayer(
+            input_dim=SHARED_FEATURE_DIM,
+            d_shared=d_shared,
+        )
+        self.d_shared = self.shared_motion_layer.d_shared
+        self.shared_to_latent = nn.Linear(self.d_shared, latent_dim)
+        nn.init.zeros_(self.shared_to_latent.weight)
+        nn.init.zeros_(self.shared_to_latent.bias)
 
     def condition_with_labels(
         self,
@@ -282,6 +352,42 @@ class Stage3Model(nn.Module):
         del y
         return h_tokens, h_global
 
+    def augment_conditioning(
+        self,
+        h_tokens: torch.Tensor,
+        h_global: torch.Tensor,
+        a_hip_stream: torch.Tensor | None = None,
+        a_wrist_stream: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Augment Stage-2 conditioning tokens with shared IMU motion features."""
+        assert_shape(h_tokens, [None, None, self.latent_dim], "Stage3Model.augment_conditioning.h_tokens")
+        assert_shape(h_global, [h_tokens.shape[0], self.latent_dim], "Stage3Model.augment_conditioning.h_global")
+        if a_hip_stream is None or a_wrist_stream is None:
+            return h_tokens, h_global
+
+        assert_shape(
+            a_hip_stream,
+            [h_tokens.shape[0], h_tokens.shape[1], 3],
+            "Stage3Model.augment_conditioning.a_hip_stream",
+        )
+        assert_shape(
+            a_wrist_stream,
+            [h_tokens.shape[0], h_tokens.shape[1], 3],
+            "Stage3Model.augment_conditioning.a_wrist_stream",
+        )
+        hip_shared = build_shared_motion_features(a_hip_stream)
+        wrist_shared = build_shared_motion_features(a_wrist_stream)
+        hip_embed = self.shared_motion_layer(hip_shared, modality="imu")
+        wrist_embed = self.shared_motion_layer(wrist_shared, modality="imu")
+        shared_proj = self.shared_to_latent(0.5 * (hip_embed + wrist_embed))
+        aug_tokens = h_tokens + shared_proj
+        assert_shape(
+            aug_tokens,
+            [h_tokens.shape[0], h_tokens.shape[1], self.latent_dim],
+            "Stage3Model.augment_conditioning.aug_tokens",
+        )
+        return aug_tokens, h_global
+
     def forward(
         self,
         x: torch.Tensor,
@@ -291,19 +397,27 @@ class Stage3Model(nn.Module):
         fps: float = 30.0,
         y: torch.Tensor | None = None,
         gait_metrics: torch.Tensor | None = None,
+        a_hip_stream: torch.Tensor | None = None,
+        a_wrist_stream: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """Run Stage 3 forward pass and return all loss-ready tensors."""
         assert_shape(x, [None, None, self.num_joints, 3], "Stage3Model.x")
 
         assert_shape(h_tokens, [x.shape[0], x.shape[1], self.latent_dim], "Stage3Model.h_tokens")
         assert_shape(h_global, [x.shape[0], self.latent_dim], "Stage3Model.h_global")
+        h_tokens, h_global = self.augment_conditioning(
+            h_tokens=h_tokens,
+            h_global=h_global,
+            a_hip_stream=a_hip_stream,
+            a_wrist_stream=a_wrist_stream,
+        )
         if gait_target is None and gait_metrics is not None:
             gait_target = gait_metrics
         if gait_target is not None:
             assert_shape(gait_target, [x.shape[0], self.gait_metrics_dim], "Stage3Model.gait_target")
 
         with torch.no_grad():
-            z0 = self.encoder(x, gait_metrics=gait_metrics if self.use_gait_conditioning else None)
+            z0 = self.encoder(x, gait_metrics=None)
 
         t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
         noise = torch.randn_like(z0)
@@ -314,7 +428,7 @@ class Stage3Model(nn.Module):
             sensor_tokens=h_tokens,
             h_tokens=h_tokens,
             h_global=h_global,
-            gait_metrics=gait_metrics if self.use_gait_conditioning else None,
+            gait_metrics=None,
         )
 
         sqrt_alpha_bar_t = extract(self.diffusion.sqrt_alphas_cumprod, t, zt.shape)

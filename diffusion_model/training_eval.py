@@ -415,6 +415,10 @@ def write_history(run_dir: Path, stage_name: str, history: list[dict[str, float]
         "val_loss_gait": "#10b981",
         "train_loss_motion": "#0f766e",
         "val_loss_motion": "#14b8a6",
+        "train_loss_bone":  "#b45309",
+        "val_loss_bone":    "#d97706",
+        "train_loss_skate": "#7e22ce",
+        "val_loss_skate":   "#a21caf",
     }
     _PLOT_KEYS = {"train_loss_total", "val_loss_total"}
     for key in history[0].keys():
@@ -422,6 +426,266 @@ def write_history(run_dir: Path, stage_name: str, history: list[dict[str, float]
             continue
         series.append((key, [row.get(key, float("nan")) for row in history], color_map.get(key, "#374151")))
     write_curve_plot(run_dir / stage_name / "loss_curves.png", f"{stage_name} Loss Curves", epochs, series, "Epoch", "Loss")
+
+    accuracy_series = []
+    accuracy_color_map = {
+        "train_acc_latent_cls": "#2563eb",
+        "val_acc_latent_cls": "#dc2626",
+        "train_acc_cls_aux": "#059669",
+        "val_acc_cls_aux": "#10b981",
+    }
+    accuracy_keys = [
+        key
+        for key in fieldnames
+        if key.startswith("train_acc_") or key.startswith("val_acc_")
+    ]
+    for key in accuracy_keys:
+        accuracy_series.append(
+            (key, [row.get(key, float("nan")) for row in history], accuracy_color_map.get(key, "#374151"))
+        )
+    if accuracy_series:
+        write_curve_plot(
+            run_dir / stage_name / "accuracy_curves.png",
+            f"{stage_name} Accuracy Curves",
+            epochs,
+            accuracy_series,
+            "Epoch",
+            "Accuracy",
+        )
+
+
+def _safe_divide(numerator: float, denominator: float) -> float:
+    if denominator == 0:
+        return 0.0
+    return float(numerator) / float(denominator)
+
+
+def _compute_classification_report(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    num_classes: int,
+) -> dict[str, object]:
+    y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.int64).reshape(-1)
+    confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for truth, pred in zip(y_true, y_pred):
+        if 0 <= truth < num_classes and 0 <= pred < num_classes:
+            confusion[truth, pred] += 1
+
+    support = confusion.sum(axis=1)
+    predicted = confusion.sum(axis=0)
+    true_positive = np.diag(confusion)
+
+    rows: list[dict[str, object]] = []
+    for class_idx in range(num_classes):
+        precision = _safe_divide(true_positive[class_idx], predicted[class_idx])
+        recall = _safe_divide(true_positive[class_idx], support[class_idx])
+        f1 = _safe_divide(2.0 * precision * recall, precision + recall)
+        rows.append(
+            {
+                "class_name": f"A{class_idx + 1:02d}",
+                "precision": precision,
+                "recall": recall,
+                "f1_score": f1,
+                "support": int(support[class_idx]),
+                "accuracy": recall,
+            }
+        )
+
+    accuracy = _safe_divide(float(true_positive.sum()), float(confusion.sum()))
+    macro_precision = float(np.mean([row["precision"] for row in rows])) if rows else 0.0
+    macro_recall = float(np.mean([row["recall"] for row in rows])) if rows else 0.0
+    macro_f1 = float(np.mean([row["f1_score"] for row in rows])) if rows else 0.0
+    weighted_precision = _safe_divide(
+        float(sum(float(row["precision"]) * int(row["support"]) for row in rows)),
+        float(sum(int(row["support"]) for row in rows)),
+    )
+    weighted_recall = _safe_divide(
+        float(sum(float(row["recall"]) * int(row["support"]) for row in rows)),
+        float(sum(int(row["support"]) for row in rows)),
+    )
+    weighted_f1 = _safe_divide(
+        float(sum(float(row["f1_score"]) * int(row["support"]) for row in rows)),
+        float(sum(int(row["support"]) for row in rows)),
+    )
+    return {
+        "accuracy": accuracy,
+        "macro_avg": {
+            "precision": macro_precision,
+            "recall": macro_recall,
+            "f1_score": macro_f1,
+            "support": int(support.sum()),
+        },
+        "weighted_avg": {
+            "precision": weighted_precision,
+            "recall": weighted_recall,
+            "f1_score": weighted_f1,
+            "support": int(support.sum()),
+        },
+        "per_class": {row["class_name"]: row for row in rows},
+        "rows": rows,
+        "confusion_matrix": confusion.tolist(),
+    }
+
+
+def _write_confusion_matrix_plot(out_path: Path, title: str, confusion: np.ndarray) -> None:
+    if plt is None:
+        return
+    ensure_dir(out_path.parent)
+    row_sums = confusion.sum(axis=1, keepdims=True)
+    normalized = np.divide(
+        confusion,
+        np.where(row_sums == 0, 1, row_sums),
+        out=np.zeros_like(confusion, dtype=np.float32),
+        where=np.ones_like(confusion, dtype=bool),
+    )
+    fig, ax = plt.subplots(figsize=(9, 7))
+    image = ax.imshow(normalized, cmap="Blues", vmin=0.0, vmax=1.0, aspect="auto")
+    ax.set_title(title)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    labels = [f"A{i + 1:02d}" for i in range(confusion.shape[0])]
+    ax.set_xticks(range(confusion.shape[0]))
+    ax.set_yticks(range(confusion.shape[0]))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticklabels(labels)
+    for row_idx in range(confusion.shape[0]):
+        for col_idx in range(confusion.shape[1]):
+            value = confusion[row_idx, col_idx]
+            ax.text(col_idx, row_idx, str(int(value)), ha="center", va="center", fontsize=7, color="#111827")
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def write_classification_artifacts(
+    out_dir: Path,
+    stem: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    num_classes: int = DEFAULT_NUM_CLASSES,
+    title: str | None = None,
+) -> dict[str, object]:
+    ensure_dir(out_dir)
+    report = _compute_classification_report(y_true=y_true, y_pred=y_pred, num_classes=num_classes)
+    base_name = stem.rstrip("_")
+    rows = list(report["rows"])
+    summary_rows = rows + [
+        {
+            "class_name": "macro_avg",
+            **report["macro_avg"],
+            "accuracy": report["accuracy"],
+        },
+        {
+            "class_name": "weighted_avg",
+            **report["weighted_avg"],
+            "accuracy": report["accuracy"],
+        },
+    ]
+    write_json(out_dir / f"{base_name}_report.json", report)
+    write_csv(
+        out_dir / f"{base_name}_report.csv",
+        summary_rows,
+        ["class_name", "precision", "recall", "f1_score", "support", "accuracy"],
+    )
+    confusion_rows = []
+    confusion = np.asarray(report["confusion_matrix"], dtype=np.int64)
+    labels = [f"A{i + 1:02d}" for i in range(num_classes)]
+    for class_idx, class_name in enumerate(labels):
+        confusion_rows.append(
+            {"true_class": class_name, **{pred_name: int(confusion[class_idx, pred_idx]) for pred_idx, pred_name in enumerate(labels)}}
+        )
+    write_csv(out_dir / f"{base_name}_confusion_matrix.csv", confusion_rows, ["true_class", *labels])
+    _write_confusion_matrix_plot(
+        out_dir / f"{base_name}_confusion_matrix.png",
+        title or f"{base_name.replace('_', ' ').title()} Confusion Matrix",
+        confusion,
+    )
+    return report
+
+
+def _safe_r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=np.float32).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.float32).reshape(-1)
+    if y_true.size == 0:
+        return 0.0
+    ss_res = float(np.square(y_true - y_pred).sum())
+    ss_tot = float(np.square(y_true - float(y_true.mean())).sum())
+    if ss_tot <= 1e-12:
+        return 0.0
+    return 1.0 - (ss_res / ss_tot)
+
+
+def write_stage2_gait_prediction_metrics(
+    out_dir: Path,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    metric_names: Sequence[str],
+) -> dict[str, object]:
+    ensure_dir(out_dir)
+    y_true = np.asarray(y_true, dtype=np.float32)
+    y_pred = np.asarray(y_pred, dtype=np.float32)
+    abs_err = np.abs(y_pred - y_true)
+    sq_err = np.square(y_pred - y_true)
+    rows = []
+    for idx, metric_name in enumerate(metric_names):
+        rows.append(
+            {
+                "metric_name": str(metric_name),
+                "mae": float(abs_err[:, idx].mean()),
+                "rmse": float(np.sqrt(sq_err[:, idx].mean())),
+                "r2": float(_safe_r2_score(y_true[:, idx], y_pred[:, idx])),
+            }
+        )
+    result = {
+        "overall_mean_mae": float(abs_err.mean()),
+        "overall_mean_rmse": float(np.sqrt(sq_err.mean())),
+        "metrics": rows,
+    }
+    write_json(out_dir / "gait_prediction_metrics.json", result)
+    write_csv(out_dir / "gait_prediction_metrics.csv", rows, ["metric_name", "mae", "rmse", "r2"])
+    return result
+
+
+def update_stage3_eval_history(stage3_dir: Path, epoch: int, eval_acc_cls_real: float, eval_acc_cls_generated: float) -> None:
+    history_path = stage3_dir / "eval_history.csv"
+    fieldnames = ["epoch", "eval_acc_cls_real", "eval_acc_cls_generated"]
+    existing: list[dict[str, object]] = []
+    if history_path.exists():
+        with history_path.open("r", newline="", encoding="utf-8") as f:
+            existing = list(csv.DictReader(f))
+    kept = [row for row in existing if int(float(row["epoch"])) != int(epoch)]
+    merged = kept + [
+        {
+            "epoch": int(epoch),
+            "eval_acc_cls_real": float(eval_acc_cls_real),
+            "eval_acc_cls_generated": float(eval_acc_cls_generated),
+        }
+    ]
+    merged.sort(key=lambda row: int(float(row["epoch"])))
+    write_csv(history_path, merged, fieldnames)
+    write_stage3_eval_accuracy_plot(stage3_dir / "eval_accuracy_curves.png", merged)
+
+
+def write_stage3_eval_accuracy_plot(out_path: Path, rows: list[dict[str, object]]) -> None:
+    if plt is None or not rows:
+        return
+    ensure_dir(out_path.parent)
+    epochs = [int(float(row["epoch"])) for row in rows]
+    real_acc = [float(row["eval_acc_cls_real"]) for row in rows]
+    generated_acc = [float(row["eval_acc_cls_generated"]) for row in rows]
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, real_acc, marker="o", linewidth=2.0, color="#2563eb", label="Real classifier accuracy")
+    plt.plot(epochs, generated_acc, marker="o", linewidth=2.0, color="#dc2626", label="Generated classifier accuracy")
+    plt.title("Stage3 Evaluation Classifier Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
 
 
 def update_stage3_metric_history(stage3_dir: Path, epoch: int, rows: list[dict[str, object]]) -> None:
@@ -496,6 +760,10 @@ def build_run_manifest(args, device: torch.device, runtime: dict[str, object] | 
             "sensor_normalization": False,
             "fps": args.fps,
         },
+        "model": {
+            "encoder_graph_op": getattr(args, "encoder_graph_op_resolved", getattr(args, "encoder_type", "gat") or "gat"),
+            "skeleton_graph_op": getattr(args, "skeleton_graph_op_resolved", getattr(args, "skeleton_graph_op", "gat") or "gat"),
+        },
         "optimization": {
             "epochs": args.epochs,
             "batch_size": args.batch_size,
@@ -548,11 +816,19 @@ def sample_stage3_latents(
     sample_steps: int,
     sampler: str = "ddim",
     sample_seed: int | None = None,
+    a_hip_stream: torch.Tensor | None = None,
+    a_wrist_stream: torch.Tensor | None = None,
 ) -> torch.Tensor:
     generator = None
     if sample_seed is not None:
         generator = torch.Generator(device=device)
         generator.manual_seed(int(sample_seed))
+    h_tokens, h_global = stage3.augment_conditioning(
+        h_tokens=h_tokens,
+        h_global=h_global,
+        a_hip_stream=a_hip_stream,
+        a_wrist_stream=a_wrist_stream,
+    )
     sampler_name = sampler.lower()
     if sampler_name == "ddim":
         return stage3.diffusion.p_sample_loop_ddim(
@@ -563,7 +839,7 @@ def sample_stage3_latents(
             eta=0.0,
             h_tokens=h_tokens,
             h_global=h_global,
-            gait_metrics=gait_metrics,
+            gait_metrics=None,
             generator=generator,
         )
     if sampler_name == "ddpm":
@@ -573,7 +849,7 @@ def sample_stage3_latents(
             device=device,
             h_tokens=h_tokens,
             h_global=h_global,
-            gait_metrics=gait_metrics,
+            gait_metrics=None,
             generator=generator,
         )
     raise ValueError(f"Unsupported sampler: {sampler}")
@@ -648,7 +924,7 @@ def evaluate_stage1(model, loader, device: torch.device, out_dir: Path, timestep
             x = batch["skeleton"].to(device)
             gait_metrics = batch["gait_metrics"].to(device)
             y = batch["label"].cpu().numpy()
-            z0 = model.encoder(x, gait_metrics=gait_metrics)
+            z0 = model.encoder(x, gait_metrics=None)
             if len(sample_sequences) < 3:
                 remaining = 3 - len(sample_sequences)
                 for seq, latent, label in zip(x[:remaining], z0[:remaining], y[:remaining]):
@@ -670,7 +946,7 @@ def evaluate_stage1(model, loader, device: torch.device, out_dir: Path, timestep
             t = torch.full((x.shape[0],), int(t_val), device=device, dtype=torch.long)
             noise = torch.randn_like(z0)
             zt = model.diffusion.q_sample(z0=z0, t=t, noise=noise)
-            pred_noise = model.denoiser(zt, t, gait_metrics=gait_metrics)
+            pred_noise = model.denoiser(zt, t, gait_metrics=None)
             mse = torch.mean((pred_noise - noise) ** 2, dim=(1, 2, 3)).cpu().numpy()
             vals.extend(mse.tolist())
         if vals:
@@ -728,6 +1004,68 @@ def evaluate_stage1(model, loader, device: torch.device, out_dir: Path, timestep
             label_arr,
         )
 
+    classifier_targets: list[np.ndarray] = []
+    classifier_preds: list[np.ndarray] = []
+    for batch in _iter_eval_batches(loader, max_batches=4):
+        x = batch["skeleton"].to(device)
+        y = batch["label"].cpu().numpy()
+        z0 = model.encoder(x, gait_metrics=None)
+        logits = model.cls_head(z0.mean(dim=(1, 2)).float())
+        classifier_targets.append(y)
+        classifier_preds.append(logits.argmax(dim=1).cpu().numpy())
+    if classifier_targets and classifier_preds:
+        write_classification_artifacts(
+            out_dir,
+            "latent_classifier",
+            np.concatenate(classifier_targets, axis=0),
+            np.concatenate(classifier_preds, axis=0),
+            num_classes=model.num_classes,
+            title="Stage1 Latent Classifier Confusion Matrix",
+        )
+
+
+@torch.no_grad()
+def evaluate_stage2_reports(
+    stage2,
+    loader,
+    device: torch.device,
+    out_dir: Path,
+    max_batches: int = 8,
+) -> None:
+    cls_targets: list[np.ndarray] = []
+    cls_preds: list[np.ndarray] = []
+    gait_targets: list[np.ndarray] = []
+    gait_preds: list[np.ndarray] = []
+    for batch in _iter_eval_batches(loader, max_batches=max_batches):
+        a_hip = batch["A_hip"].to(device)
+        a_wrist = batch["A_wrist"].to(device)
+        gait_metrics = batch["gait_metrics"].to(device)
+        y = batch["label"].to(device)
+        _, h_global = stage2.aligner(a_hip, a_wrist)
+        logits = stage2.cls_head(h_global.float())
+        cls_targets.append(y.cpu().numpy())
+        cls_preds.append(logits.argmax(dim=1).cpu().numpy())
+        if stage2.gait_pred_head is not None and gait_metrics.numel() > 0:
+            gait_pred = stage2.gait_pred_head(h_global.float())
+            gait_targets.append(gait_metrics.cpu().numpy())
+            gait_preds.append(gait_pred.cpu().numpy())
+
+    ensure_dir(out_dir)
+    if cls_targets and cls_preds:
+        write_classification_artifacts(
+            out_dir,
+            "imu_classifier",
+            np.concatenate(cls_targets, axis=0),
+            np.concatenate(cls_preds, axis=0),
+            num_classes=stage2.num_classes,
+            title="Stage2 IMU Classifier Confusion Matrix",
+        )
+    if gait_targets and gait_preds:
+        gait_true = np.concatenate(gait_targets, axis=0)
+        gait_pred = np.concatenate(gait_preds, axis=0)
+        metric_names = list(GAIT_METRIC_NAMES[: gait_true.shape[1]])
+        write_stage2_gait_prediction_metrics(out_dir, gait_true, gait_pred, metric_names=metric_names)
+
 
 @torch.no_grad()
 def evaluate_stage2(stage1, stage2, loader, device: torch.device, out_dir: Path, epoch: int | None = None) -> None:
@@ -744,7 +1082,7 @@ def evaluate_stage2(stage1, stage2, loader, device: torch.device, out_dir: Path,
         a_wrist = batch["A_wrist"].to(device)
         gait_metrics = batch["gait_metrics"].to(device)
         y = batch["label"].cpu().numpy()
-        z0 = stage1.encoder(x, gait_metrics=gait_metrics)
+        z0 = stage1.encoder(x, gait_metrics=None)
         _, h_global = stage2.aligner(a_hip, a_wrist)
         latent_batch = z0.mean(dim=(1, 2))
         sensor_batch = h_global
@@ -899,6 +1237,394 @@ def evaluate_stage2(stage1, stage2, loader, device: torch.device, out_dir: Path,
 
 
 @torch.no_grad()
+def plot_noise_pred_error_by_timestep(
+    stage2,
+    stage3,
+    loader,
+    device: torch.device,
+    out_dir: Path,
+    num_bins: int = 10,
+    max_batches: int = 4,
+) -> dict:
+    """Plot MSE of noise prediction per diffusion timestep bin.
+
+    Reveals which part of the noise schedule the denoiser struggles with.
+    High error at large t → denoiser can't handle high noise.
+    High error at small t → denoiser fails on fine detail.
+    """
+    total_timesteps = stage3.diffusion.timesteps
+    edges = np.linspace(0, total_timesteps, num_bins + 1, dtype=int)
+    bin_centers = [(int(edges[b]) + int(edges[b + 1])) // 2 for b in range(num_bins)]
+    bin_mses: list[list[float]] = [[] for _ in range(num_bins)]
+
+    for b in range(num_bins):
+        t_center = bin_centers[b]
+        for batch_idx, batch in enumerate(loader):
+            if batch_idx >= max_batches:
+                break
+            x = batch["skeleton"].to(device)
+            a_hip = batch["A_hip"].to(device)
+            a_wrist = batch["A_wrist"].to(device)
+            gait_metrics = batch["gait_metrics"].to(device)
+            B = x.shape[0]
+            z0 = stage3.encoder(x, gait_metrics=None)
+            h_tokens, h_global = stage2.aligner(a_hip_stream=a_hip, a_wrist_stream=a_wrist)
+            h_tokens, h_global = stage3.augment_conditioning(
+                h_tokens=h_tokens,
+                h_global=h_global,
+                a_hip_stream=a_hip,
+                a_wrist_stream=a_wrist,
+            )
+            t = torch.full((B,), t_center, device=device, dtype=torch.long)
+            noise = torch.randn_like(z0)
+            zt = stage3.diffusion.q_sample(z0, t, noise=noise)
+            pred = stage3.denoiser(zt, t, h_tokens=h_tokens, h_global=h_global, gait_metrics=None)
+            mse_per_sample = (pred - noise).pow(2).mean(dim=(1, 2, 3))
+            bin_mses[b].extend(mse_per_sample.cpu().tolist())
+
+    mean_mse = [float(np.mean(v)) if v else float("nan") for v in bin_mses]
+    std_mse = [float(np.std(v)) if v else float("nan") for v in bin_mses]
+
+    ensure_dir(out_dir)
+    write_curve_plot(
+        out_dir / "noise_pred_error_by_timestep.png",
+        "Noise Prediction MSE by Timestep Bin",
+        bin_centers,
+        [("Mean MSE", mean_mse, "#2563eb")],
+        "Timestep bin center",
+        "MSE (pred vs true noise)",
+    )
+    result = {"bin_centers": bin_centers, "mean_mse_per_bin": mean_mse, "std_mse_per_bin": std_mse}
+    write_json(out_dir / "noise_pred_error_by_timestep.json", result)
+    return result
+
+
+@torch.no_grad()
+def plot_generation_diversity(
+    stage2,
+    stage3,
+    loader,
+    device: torch.device,
+    out_dir: Path,
+    k_samples: int = 8,
+    sample_steps: int = 50,
+    sampler: str = "ddim",
+    max_batches: int = 2,
+) -> dict:
+    """Plot pairwise distance histogram of k samples generated from the same IMU input.
+
+    Low mean pairwise distance → mode collapse (model always generates the same output).
+    Uses existing _pairwise_distance_rows() helper.
+    """
+    all_pairwise: list[float] = []
+
+    for batch_idx, batch in enumerate(loader):
+        if batch_idx >= max_batches:
+            break
+        x = batch["skeleton"].to(device)
+        a_hip = batch["A_hip"][0:1].to(device)
+        a_wrist = batch["A_wrist"][0:1].to(device)
+        gait_metrics = batch["gait_metrics"][0:1].to(device)
+        x_ref = x[0:1]
+        shape = torch.Size((1, x_ref.shape[1], x_ref.shape[2], stage3.latent_dim))
+        h_tokens, h_global = stage2.aligner(a_hip_stream=a_hip, a_wrist_stream=a_wrist)
+
+        latents = []
+        for seed_i in range(k_samples):
+            z = sample_stage3_latents(
+                stage3=stage3,
+                shape=shape,
+                device=device,
+                h_tokens=h_tokens,
+                h_global=h_global,
+                a_hip_stream=a_hip,
+                a_wrist_stream=a_wrist,
+                gait_metrics=None,
+                sample_steps=sample_steps,
+                sampler=sampler,
+                sample_seed=seed_i,
+            )
+            latents.append(z.cpu().numpy().reshape(1, -1))
+
+        stacked = np.concatenate(latents, axis=0)  # [K, T*J*D]
+        dist_matrix = _pairwise_distance_rows(stacked)
+        idx = np.triu_indices(k_samples, k=1)
+        all_pairwise.extend(dist_matrix[idx].tolist())
+
+    all_pairwise_arr = np.array(all_pairwise, dtype=np.float32)
+    mean_dist = float(np.mean(all_pairwise_arr)) if len(all_pairwise_arr) > 0 else float("nan")
+    std_dist = float(np.std(all_pairwise_arr)) if len(all_pairwise_arr) > 0 else float("nan")
+
+    ensure_dir(out_dir)
+    _write_histogram(out_dir / "generation_diversity.png", "Generation Diversity (Pairwise Latent Distance)", all_pairwise_arr, "Pairwise L2 distance")
+    result = {"mean_pairwise_dist": mean_dist, "std_pairwise_dist": std_dist, "k_samples": k_samples, "n_pairs": len(all_pairwise)}
+    write_json(out_dir / "generation_diversity.json", result)
+    return result
+
+
+@torch.no_grad()
+def plot_per_class_accuracy(
+    stage2,
+    stage3,
+    loader,
+    device: torch.device,
+    out_dir: Path,
+    sample_steps: int = 50,
+    sampler: str = "ddim",
+    max_batches: int = 4,
+    num_classes: int = DEFAULT_NUM_CLASSES,
+) -> dict:
+    """Grouped bar chart: per-class classifier accuracy on raw real vs generated skeletons.
+
+    Classes where gen_acc << real_acc are the hardest for Stage 3 to reproduce.
+    Near-chance gen_acc across all classes → mode collapse or IMU conditioning failure.
+    """
+    correct_real = [0] * num_classes
+    correct_gen = [0] * num_classes
+    total = [0] * num_classes
+    all_targets: list[np.ndarray] = []
+    all_real_preds: list[np.ndarray] = []
+    all_generated_preds: list[np.ndarray] = []
+
+    for batch_idx, batch in enumerate(loader):
+        if batch_idx >= max_batches:
+            break
+        x = batch["skeleton"].to(device)
+        a_hip = batch["A_hip"].to(device)
+        a_wrist = batch["A_wrist"].to(device)
+        gait_metrics = batch["gait_metrics"].to(device)
+        y = batch["label"].to(device)
+        h_tokens, h_global = stage2.aligner(a_hip_stream=a_hip, a_wrist_stream=a_wrist)
+        shape = torch.Size((x.shape[0], x.shape[1], x.shape[2], stage3.latent_dim))
+
+        z0_gen = sample_stage3_latents(
+            stage3=stage3, shape=shape, device=device,
+            h_tokens=h_tokens, h_global=h_global,
+            a_hip_stream=a_hip, a_wrist_stream=a_wrist,
+            gait_metrics=None,
+            sample_steps=sample_steps, sampler=sampler,
+        )
+        x_hat_gen = stage3.decoder(z0_gen)
+
+        # Real accuracy monitors classifier quality on actual skeletons.
+        pred_real = stage3.classifier(x.float()).argmax(1)
+        pred_gen = stage3.classifier(x_hat_gen.float()).argmax(1)
+        all_targets.append(y.cpu().numpy())
+        all_real_preds.append(pred_real.cpu().numpy())
+        all_generated_preds.append(pred_gen.cpu().numpy())
+
+        for c in range(num_classes):
+            mask = (y == c)
+            n = int(mask.sum().item())
+            total[c] += n
+            correct_real[c] += int((pred_real[mask] == c).sum().item())
+            correct_gen[c] += int((pred_gen[mask] == c).sum().item())
+
+    real_acc = [correct_real[c] / max(total[c], 1) for c in range(num_classes)]
+    gen_acc = [correct_gen[c] / max(total[c], 1) for c in range(num_classes)]
+    overall_real = sum(correct_real) / max(sum(total), 1)
+    overall_gen = sum(correct_gen) / max(sum(total), 1)
+
+    ensure_dir(out_dir)
+    if plt is not None:
+        x_pos = np.arange(num_classes)
+        fig, ax = plt.subplots(figsize=(max(10, num_classes), 5))
+        ax.bar(x_pos - 0.2, real_acc, width=0.4, color="#2563eb", label=f"Real (overall={overall_real:.3f})")
+        ax.bar(x_pos + 0.2, gen_acc, width=0.4, color="#dc2626", label=f"Generated (overall={overall_gen:.3f})")
+        ax.axhline(1.0 / num_classes, color="#6b7280", linestyle="--", linewidth=1, label=f"Chance (1/{num_classes})")
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([f"A{c+1:02d}" for c in range(num_classes)], rotation=45, ha="right")
+        ax.set_ylabel("Accuracy")
+        ax.set_ylim(0, 1.05)
+        ax.set_title("Per-Class Classifier Accuracy: Real vs Generated Skeletons")
+        ax.legend()
+        ax.grid(True, alpha=0.25, axis="y")
+        fig.tight_layout()
+        fig.savefig(out_dir / "per_class_accuracy.png", dpi=180)
+        plt.close(fig)
+
+    result = {
+        "overall_real_acc": overall_real,
+        "overall_gen_acc": overall_gen,
+        "per_class": {
+            f"A{c+1:02d}": {"real_acc": real_acc[c], "gen_acc": gen_acc[c], "total_samples": total[c]}
+            for c in range(num_classes)
+        },
+        "real_metric_interpretation": "Classifier accuracy on raw real skeletons; low values can reflect a weak Stage3 classifier when lambda_cls is small.",
+        "generated_metric_interpretation": "Classifier accuracy on full reverse-diffusion generations; this is the generation-quality monitoring metric.",
+    }
+    write_json(out_dir / "per_class_accuracy.json", result)
+    if all_targets and all_real_preds:
+        y_true = np.concatenate(all_targets, axis=0)
+        write_classification_artifacts(
+            out_dir,
+            "real_classifier",
+            y_true,
+            np.concatenate(all_real_preds, axis=0),
+            num_classes=num_classes,
+            title="Stage3 Classifier Confusion Matrix on Real Skeletons",
+        )
+        write_classification_artifacts(
+            out_dir,
+            "generated_classifier",
+            y_true,
+            np.concatenate(all_generated_preds, axis=0),
+            num_classes=num_classes,
+            title="Stage3 Classifier Confusion Matrix on Generated Skeletons",
+        )
+    return result
+
+
+@torch.no_grad()
+def plot_latent_distribution_comparison(
+    stage2,
+    stage3,
+    loader,
+    device: torch.device,
+    out_dir: Path,
+    sample_steps: int = 50,
+    sampler: str = "ddim",
+    max_batches: int = 4,
+) -> dict:
+    """Compare per-channel statistics of real z0 vs generated z0.
+
+    Large gap in channel std → generated latents are OOD for the decoder,
+    causing corrupted skeleton output even if denoiser MSE looks acceptable.
+    """
+    z0_real_list: list[np.ndarray] = []
+    z0_gen_list: list[np.ndarray] = []
+
+    for batch_idx, batch in enumerate(loader):
+        if batch_idx >= max_batches:
+            break
+        x = batch["skeleton"].to(device)
+        a_hip = batch["A_hip"].to(device)
+        a_wrist = batch["A_wrist"].to(device)
+        gait_metrics = batch["gait_metrics"].to(device)
+        h_tokens, h_global = stage2.aligner(a_hip_stream=a_hip, a_wrist_stream=a_wrist)
+        shape = torch.Size((x.shape[0], x.shape[1], x.shape[2], stage3.latent_dim))
+
+        z0_real = stage3.encoder(x, gait_metrics=None)
+        z0_gen = sample_stage3_latents(
+            stage3=stage3, shape=shape, device=device,
+            h_tokens=h_tokens, h_global=h_global,
+            a_hip_stream=a_hip, a_wrist_stream=a_wrist,
+            gait_metrics=None,
+            sample_steps=sample_steps, sampler=sampler,
+        )
+        z0_real_list.append(z0_real.cpu().numpy())
+        z0_gen_list.append(z0_gen.cpu().numpy())
+
+    z0_real_all = np.concatenate(z0_real_list, axis=0)  # [N, T, J, D]
+    z0_gen_all = np.concatenate(z0_gen_list, axis=0)
+
+    real_ch_std = z0_real_all.std(axis=(0, 1, 2))   # [D]
+    gen_ch_std = z0_gen_all.std(axis=(0, 1, 2))
+    real_ch_mean = z0_real_all.mean(axis=(0, 1, 2))
+    gen_ch_mean = z0_gen_all.mean(axis=(0, 1, 2))
+
+    ensure_dir(out_dir)
+    if plt is not None:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        axes[0].hist(real_ch_std, bins=40, alpha=0.65, color="#2563eb", label="Real z0")
+        axes[0].hist(gen_ch_std, bins=40, alpha=0.65, color="#dc2626", label="Generated z0")
+        axes[0].set_title("Per-channel Std Distribution")
+        axes[0].set_xlabel("Channel std")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.25)
+        axes[1].hist(real_ch_mean, bins=40, alpha=0.65, color="#2563eb", label="Real z0")
+        axes[1].hist(gen_ch_mean, bins=40, alpha=0.65, color="#dc2626", label="Generated z0")
+        axes[1].set_title("Per-channel Mean Distribution")
+        axes[1].set_xlabel("Channel mean")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.25)
+        fig.suptitle("Latent Distribution: Real z0 vs Generated z0", fontsize=13)
+        fig.tight_layout()
+        fig.savefig(out_dir / "latent_distribution_comparison.png", dpi=180)
+        plt.close(fig)
+
+    result = {
+        "real_channel_std_mean": float(real_ch_std.mean()),
+        "gen_channel_std_mean": float(gen_ch_std.mean()),
+        "mean_channel_std_diff": float(np.abs(real_ch_std - gen_ch_std).mean()),
+        "real_channel_mean_mean": float(real_ch_mean.mean()),
+        "gen_channel_mean_mean": float(gen_ch_mean.mean()),
+        "mean_channel_mean_diff": float(np.abs(real_ch_mean - gen_ch_mean).mean()),
+    }
+    write_json(out_dir / "latent_distribution.json", result)
+    return result
+
+
+@torch.no_grad()
+def plot_conditioning_comparison_overlay(
+    stage2,
+    stage3,
+    loader,
+    device: torch.device,
+    out_dir: Path,
+    sample_steps: int = 50,
+    sampler: str = "ddim",
+    sample_seed: int | None = None,
+) -> dict:
+    """Visualize real vs conditional vs unconditional generation for a single sample.
+
+    If cond_vs_uncond_l2 ≈ 0 → the model completely ignores IMU conditioning.
+    Saves a 3-panel skeleton comparison and L2 distance metrics.
+    """
+    batch = next(_iter_eval_batches(loader, max_batches=1))
+    x = batch["skeleton"][0:1].to(device)
+    a_hip = batch["A_hip"][0:1].to(device)
+    a_wrist = batch["A_wrist"][0:1].to(device)
+    gait_metrics = batch["gait_metrics"][0:1].to(device)
+
+    h_tokens, h_global = stage2.aligner(a_hip_stream=a_hip, a_wrist_stream=a_wrist)
+    shape = torch.Size((1, x.shape[1], x.shape[2], stage3.latent_dim))
+
+    generator = torch.Generator(device=device).manual_seed(sample_seed) if sample_seed is not None else None
+
+    z0_cond = sample_stage3_latents(
+        stage3=stage3, shape=shape, device=device,
+        h_tokens=h_tokens, h_global=h_global,
+        a_hip_stream=a_hip, a_wrist_stream=a_wrist,
+        gait_metrics=None,
+        sample_steps=sample_steps, sampler=sampler, sample_seed=sample_seed,
+    )
+    z0_uncond = stage3.diffusion.p_sample_loop_ddim(
+        denoiser=stage3.denoiser, shape=shape, device=device,
+        sample_steps=sample_steps, eta=0.0,
+        h_tokens=None, h_global=None, gait_metrics=None,
+        generator=generator,
+    )
+
+    x_hat_cond = stage3.decoder(z0_cond)
+    x_hat_uncond = stage3.decoder(z0_uncond)
+
+    real_np = x[0].cpu().numpy()
+    cond_np = x_hat_cond[0].cpu().numpy()
+    uncond_np = x_hat_uncond[0].cpu().numpy()
+
+    ensure_dir(out_dir)
+    render_skeleton_panels(
+        out_dir / "conditioning_comparison_overlay.png",
+        [real_np, cond_np, uncond_np],
+        ["Real", "Conditional (IMU)", "Unconditional"],
+    )
+
+    cond_vs_real = float(np.linalg.norm(cond_np - real_np))
+    uncond_vs_real = float(np.linalg.norm(uncond_np - real_np))
+    cond_vs_uncond = float(np.linalg.norm(cond_np - uncond_np))
+
+    result = {
+        "cond_vs_real_l2": cond_vs_real,
+        "uncond_vs_real_l2": uncond_vs_real,
+        "cond_vs_uncond_l2": cond_vs_uncond,
+        "interpretation": "cond_vs_uncond_l2 near 0 means model ignores IMU conditioning",
+    }
+    write_json(out_dir / "conditioning_comparison.json", result)
+    return result
+
+
+@torch.no_grad()
 def evaluate_stage3(
     stage2,
     stage3,
@@ -932,7 +1658,9 @@ def evaluate_stage3(
             device=device,
             h_tokens=h_tokens,
             h_global=h_global,
-            gait_metrics=gait_metrics,
+            a_hip_stream=a_hip,
+            a_wrist_stream=a_wrist,
+            gait_metrics=None,
             sample_steps=sample_steps,
             sampler=sampler,
             sample_seed=sample_seed,
@@ -983,7 +1711,9 @@ def evaluate_stage3(
                     device=device,
                     h_tokens=s_tokens,
                     h_global=s_global,
-                    gait_metrics=sample_gait,
+                    a_hip_stream=hip_tensor,
+                    a_wrist_stream=wrist_tensor,
+                    gait_metrics=None,
                     sample_steps=sample_steps,
                     sampler=sampler,
                     sample_seed=sample_seed,
@@ -1076,3 +1806,37 @@ def evaluate_stage3(
         render_skeleton_panels(out_dir / "generated_motion_examples.png", gen_sequences, [f"sample_{i}" for i in range(len(gen_sequences))])
         for idx, seq in enumerate(gen_sequences):
             save_skeleton_gif(seq, out_dir / f"generated_motion_example_{idx}.gif", fps=max(1, int(round(fps / 2.5))))
+
+    per_class_result: dict[str, object] | None = None
+    try:
+        per_class_result = plot_per_class_accuracy(
+            stage2,
+            stage3,
+            loader,
+            device,
+            out_dir,
+            sample_steps=sample_steps,
+            sampler=sampler,
+            max_batches=4,
+        )
+    except Exception:
+        per_class_result = None
+    if epoch is not None and per_class_result is not None:
+        update_stage3_eval_history(
+            out_dir.parent,
+            epoch=epoch,
+            eval_acc_cls_real=float(per_class_result["overall_real_acc"]),
+            eval_acc_cls_generated=float(per_class_result["overall_gen_acc"]),
+        )
+
+    # Extended diagnostics — each runs independently; a failure in one does not abort the others.
+    for _diag_fn, _diag_kwargs in [
+        (plot_noise_pred_error_by_timestep,   {"num_bins": 10, "max_batches": 4}),
+        (plot_generation_diversity,           {"k_samples": 8, "sample_steps": sample_steps, "sampler": sampler, "max_batches": 2}),
+        (plot_latent_distribution_comparison, {"sample_steps": sample_steps, "sampler": sampler, "max_batches": 4}),
+        (plot_conditioning_comparison_overlay,{"sample_steps": sample_steps, "sampler": sampler, "sample_seed": sample_seed}),
+    ]:
+        try:
+            _diag_fn(stage2, stage3, loader, device, out_dir, **_diag_kwargs)
+        except Exception:
+            pass

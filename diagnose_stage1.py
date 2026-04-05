@@ -6,14 +6,14 @@ import argparse
 import json
 from pathlib import Path
 from typing import Optional
-
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from diffusion_model.dataset import create_dataset, parse_subject_list, split_train_val_dataset
 from diffusion_model.model import Stage1Model
-from diffusion_model.model_loader import load_checkpoint
+from diffusion_model.model_loader import infer_graph_ops_from_checkpoint, load_checkpoint
 from diffusion_model.util import (
     DEFAULT_JOINTS,
     DEFAULT_LATENT_DIM,
@@ -198,6 +198,7 @@ def main() -> None:
     plots_dir = out_dir / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
+    encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(args.stage1_ckpt)
 
     dataset = select_dataset(args)
     loader = DataLoader(
@@ -214,6 +215,8 @@ def main() -> None:
         num_joints=args.joints,
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
+        encoder_type=encoder_graph_op,
+        skeleton_graph_op=skeleton_graph_op,
     ).to(device)
     load_checkpoint(args.stage1_ckpt, model, strict=True)
     model.eval()

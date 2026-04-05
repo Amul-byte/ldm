@@ -189,6 +189,7 @@ class Stage2Model(nn.Module):
         num_classes: int = 14,
         imu_graph_type: str = "chain",
         d_shared: int = 64,
+        stage2_dropout: float = 0.25,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -196,8 +197,14 @@ class Stage2Model(nn.Module):
         self.gait_metrics_dim = gait_metrics_dim
         self.num_classes = num_classes
         self.d_shared = d_shared
+        self.stage2_dropout = float(stage2_dropout)
         self.encoder = encoder
-        self.aligner = IMULatentAligner(latent_dim=latent_dim, gait_metrics_dim=0, graph_type=imu_graph_type)
+        self.aligner = IMULatentAligner(
+            latent_dim=latent_dim,
+            gait_metrics_dim=0,
+            graph_type=imu_graph_type,
+            dropout=self.stage2_dropout,
+        )
         self.shared_motion_layer = SharedMotionLayer(input_dim=SHARED_FEATURE_DIM, d_shared=d_shared)
         self.cls_head = nn.Linear(latent_dim, num_classes)
         # Gait-metric prediction head: the primary supervised signal for Stage 2.

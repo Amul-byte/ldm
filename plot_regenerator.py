@@ -31,6 +31,7 @@ Stage1Model = None
 Stage2Model = None
 Stage3Model = None
 load_checkpoint = None
+infer_graph_ops_from_checkpoint = None
 evaluate_stage1 = None
 evaluate_stage2 = None
 evaluate_stage3 = None
@@ -53,7 +54,7 @@ def import_runtime_dependencies() -> None:
     global create_dataloader, create_dataset
     global DEFAULT_GAIT_METRICS_DIM, GAIT_METRIC_NAMES, compute_gait_metrics_torch
     global Stage1Model, Stage2Model, Stage3Model
-    global load_checkpoint
+    global load_checkpoint, infer_graph_ops_from_checkpoint
     global evaluate_stage1, evaluate_stage2, evaluate_stage3
     global sample_stage3_latents
     global write_curve_plot, write_embedding_projection_plot, write_hist_grid, write_scatter, write_stage3_metric_trend_plot
@@ -74,7 +75,10 @@ def import_runtime_dependencies() -> None:
         compute_gait_metrics_torch as compute_gait_metrics_torch_mod,
     )
     from diffusion_model.model import Stage1Model as Stage1Model_mod, Stage2Model as Stage2Model_mod, Stage3Model as Stage3Model_mod
-    from diffusion_model.model_loader import load_checkpoint as load_checkpoint_mod
+    from diffusion_model.model_loader import (
+        infer_graph_ops_from_checkpoint as infer_graph_ops_from_checkpoint_mod,
+        load_checkpoint as load_checkpoint_mod,
+    )
     from diffusion_model.training_eval import (
         evaluate_stage1 as evaluate_stage1_mod,
         evaluate_stage2 as evaluate_stage2_mod,
@@ -107,6 +111,7 @@ def import_runtime_dependencies() -> None:
     Stage2Model = Stage2Model_mod
     Stage3Model = Stage3Model_mod
     load_checkpoint = load_checkpoint_mod
+    infer_graph_ops_from_checkpoint = infer_graph_ops_from_checkpoint_mod
     evaluate_stage1 = evaluate_stage1_mod
     evaluate_stage2 = evaluate_stage2_mod
     evaluate_stage3 = evaluate_stage3_mod
@@ -231,11 +236,14 @@ def build_dataset_and_loader(args: argparse.Namespace):
 def load_stage1(args: argparse.Namespace, device: torch.device) -> Stage1Model:
     if not args.stage1_ckpt:
         raise ValueError("--stage1_ckpt is required for Stage 1/2/3 checkpoint-based plots.")
+    encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(args.stage1_ckpt)
     model = Stage1Model(
         latent_dim=args.latent_dim,
         num_joints=args.joints,
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
+        encoder_type=encoder_graph_op,
+        skeleton_graph_op=skeleton_graph_op,
     ).to(device)
     load_checkpoint(args.stage1_ckpt, model, strict=True)
     model.eval()
@@ -389,6 +397,8 @@ def collect_real_and_generated_gait(
                 device=device,
                 h_tokens=cond_tokens,
                 h_global=cond_global,
+                a_hip_stream=a_hip,
+                a_wrist_stream=a_wrist,
                 gait_metrics=None,
                 sample_steps=sample_steps,
                 sampler=sampler,

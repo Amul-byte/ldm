@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 from diffusion_model.dataset import create_dataloader
 from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM, compute_gait_metrics_torch
 from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model
-from diffusion_model.model_loader import load_checkpoint
+from diffusion_model.model_loader import infer_graph_ops_from_checkpoint, load_checkpoint
 from diffusion_model.training_eval import sample_stage3_latents
 from diffusion_model.util import DEFAULT_JOINTS, DEFAULT_LATENT_DIM, DEFAULT_TIMESTEPS, DEFAULT_WINDOW, get_skeleton_edges
 
@@ -141,6 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gait_metrics_dim", type=int, default=DEFAULT_GAIT_METRICS_DIM)
     parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument("--num_classes", type=int, default=14)
+    parser.add_argument("--d_shared", type=int, default=64)
     parser.add_argument("--stride", type=int, default=30)
     parser.add_argument("--disable_sensor_norm", action="store_true")
     parser.add_argument("--save_gif", action="store_true")
@@ -163,6 +164,7 @@ def main() -> None:
             f"--gait_metrics_dim must equal the fixed auto-computed gait-summary size ({DEFAULT_GAIT_METRICS_DIM})."
         )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(args.stage1_ckpt)
 
     stage1 = Stage1Model(
         latent_dim=args.latent_dim,
@@ -170,6 +172,8 @@ def main() -> None:
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
         use_gait_conditioning=False,
+        encoder_type=encoder_graph_op,
+        skeleton_graph_op=skeleton_graph_op,
     ).to(device)
     load_checkpoint(args.stage1_ckpt, stage1, strict=True)
 
@@ -178,6 +182,7 @@ def main() -> None:
         latent_dim=args.latent_dim,
         num_joints=args.joints,
         gait_metrics_dim=args.gait_metrics_dim,
+        d_shared=args.d_shared,
     ).to(device)
     load_checkpoint(args.stage2_ckpt, stage2, strict=True)
 
@@ -191,6 +196,7 @@ def main() -> None:
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
         use_gait_conditioning=False,
+        d_shared=args.d_shared,
     ).to(device)
     load_checkpoint(args.stage3_ckpt, stage3, strict=True)
 
@@ -224,7 +230,9 @@ def main() -> None:
         device=device,
         h_tokens=h_tokens,
         h_global=h_global,
-        gait_metrics=gait_target,
+        a_hip_stream=a_hip_stream,
+        a_wrist_stream=a_wrist_stream,
+        gait_metrics=None,
         sample_steps=args.sample_steps,
         sampler=args.sampler,
         sample_seed=args.sample_seed,

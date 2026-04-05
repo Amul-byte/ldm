@@ -35,7 +35,7 @@ import torch.nn as nn
 # ── project imports ────────────────────────────────────────────────────────────
 from diffusion_model.dataset import create_dataset, split_train_val_dataset
 from diffusion_model.model import Stage2Model
-from diffusion_model.model_loader import load_checkpoint
+from diffusion_model.model_loader import infer_graph_ops_from_checkpoint, load_checkpoint
 from diffusion_model.sensor_model import (
     IMULatentAligner,
     build_imu_features,
@@ -521,7 +521,12 @@ def main():
     # ── 2. Load Stage 2 model ──────────────────────────────────────────────
     print("Loading Stage 2 model...")
     from diffusion_model.model import Stage1Model, Stage2Model
-    stage1 = Stage1Model(latent_dim=args.latent_dim).to(device)
+    encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(args.stage1_ckpt)
+    stage1 = Stage1Model(
+        latent_dim=args.latent_dim,
+        encoder_type=encoder_graph_op,
+        skeleton_graph_op=skeleton_graph_op,
+    ).to(device)
     load_checkpoint(args.stage1_ckpt, stage1, strict=False)
 
     model = Stage2Model(

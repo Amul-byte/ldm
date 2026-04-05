@@ -221,12 +221,17 @@ def _print_run_summary(args: argparse.Namespace, device: torch.device) -> None:
         )
     if args.stage == 2:
         LOGGER.info(
-            "Stage2 objective: lambda_feature=%s lambda_align=%s lambda_cls=%s lambda_gait_pred=%s d_shared=%s",
+            "Stage2 objective: lambda_feature=%s lambda_align=%s lambda_cls=%s lambda_gait_pred=%s d_shared=%s dropout=%s weight_decay=%s aug_noise_std=%s aug_scale=%s aug_mask_prob=%s",
             args.lambda_feature,
             args.lambda_align,
             args.lambda_cls_s2,
             args.lambda_gait_s2,
             args.d_shared,
+            args.stage2_dropout,
+            args.stage2_weight_decay,
+            args.stage2_aug_noise_std,
+            args.stage2_aug_scale,
+            args.stage2_aug_mask_prob,
         )
 
 
@@ -266,6 +271,122 @@ def _resolve_graph_ops(args: argparse.Namespace, stage1_ckpt: str = "") -> tuple
     skeleton_graph_op = _normalize_graph_op_arg(args.skeleton_graph_op, default=ckpt_skeleton or "gat")
     encoder_graph_op = _normalize_graph_op_arg(args.encoder_type, default=ckpt_encoder or skeleton_graph_op)
     return encoder_graph_op, skeleton_graph_op
+
+
+def _sensor_locations_from_args(args: argparse.Namespace) -> list[str]:
+    return [
+        Path(args.hip_folder).name if args.hip_folder else "",
+        Path(args.wrist_folder).name if args.wrist_folder else "",
+    ]
+
+
+def _build_stage2_optimizer_and_scheduler(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+) -> tuple[optim.Optimizer, torch.optim.lr_scheduler.ReduceLROnPlateau]:
+    trainable_params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
+    optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.stage2_weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=args.stage2_scheduler_factor,
+        patience=args.stage2_scheduler_patience,
+        min_lr=args.stage2_scheduler_min_lr,
+        cooldown=1,
+        threshold=1e-3,
+    )
+    return optimizer, scheduler
+
+
+def _augment_single_imu_stream(
+    stream: torch.Tensor,
+    noise_std: float,
+    scale: float,
+    mask_prob: float,
+) -> torch.Tensor:
+    aug = stream.clone()
+    if noise_std > 0.0:
+        batch_std = max(float(stream.std(unbiased=False).item()), 0.0)
+        applied_std = max(noise_std * batch_std, 1e-4)
+        aug = aug + torch.randn_like(aug) * applied_std
+    if scale > 0.0:
+        amp = 1.0 + torch.empty(
+            (stream.shape[0], 1, 1),
+            device=stream.device,
+            dtype=stream.dtype,
+        ).uniform_(-scale, scale)
+        aug = aug * amp
+    if mask_prob > 0.0 and stream.shape[1] > 1:
+        mask = torch.rand((stream.shape[0], stream.shape[1]), device=stream.device) < mask_prob
+        mask[:, 0] = False
+        for t in range(1, aug.shape[1]):
+            cur_mask = mask[:, t].unsqueeze(-1)
+            aug[:, t] = torch.where(cur_mask, aug[:, t - 1], aug[:, t])
+    return aug
+
+
+def _maybe_augment_stage2_streams(
+    a_hip_stream: torch.Tensor,
+    a_wrist_stream: torch.Tensor,
+    args: argparse.Namespace,
+    training: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not training:
+        return a_hip_stream, a_wrist_stream
+    if (
+        args.stage2_aug_noise_std <= 0.0
+        and args.stage2_aug_scale <= 0.0
+        and args.stage2_aug_mask_prob <= 0.0
+    ):
+        return a_hip_stream, a_wrist_stream
+    return (
+        _augment_single_imu_stream(
+            a_hip_stream,
+            noise_std=args.stage2_aug_noise_std,
+            scale=args.stage2_aug_scale,
+            mask_prob=args.stage2_aug_mask_prob,
+        ),
+        _augment_single_imu_stream(
+            a_wrist_stream,
+            noise_std=args.stage2_aug_noise_std,
+            scale=args.stage2_aug_scale,
+            mask_prob=args.stage2_aug_mask_prob,
+        ),
+    )
+
+
+def _warn_stage2_stage3_sensor_domain_mismatch(checkpoint: Dict[str, object], args: argparse.Namespace) -> bool:
+    if not isinstance(checkpoint, dict):
+        return False
+    extra = checkpoint.get("extra", {})
+    if not isinstance(extra, dict):
+        return False
+    stage2_sensor_locations = extra.get("sensor_locations", [])
+    if not isinstance(stage2_sensor_locations, (list, tuple)):
+        return False
+    current_sensor_locations = _sensor_locations_from_args(args)
+    if not any(current_sensor_locations):
+        return False
+    stage2_sensor_locations = [str(x) for x in stage2_sensor_locations]
+    if stage2_sensor_locations == current_sensor_locations:
+        return False
+    LOGGER.warning(
+        "Stage2/Stage3 sensor domain mismatch: Stage2 sensor_locations=%s vs Stage3 sensor_locations=%s",
+        stage2_sensor_locations,
+        current_sensor_locations,
+    )
+    return True
+
+
+def _stage2_checkpoint_metadata(args: argparse.Namespace) -> Dict[str, object]:
+    return {
+        "encoder_graph_op": args.encoder_graph_op_resolved,
+        "skeleton_graph_op": args.skeleton_graph_op_resolved,
+        "gait_metric_names": list(GAIT_METRIC_NAMES),
+        "imu_feature_names": list(IMU_FEATURE_NAMES),
+        "sensor_locations": _sensor_locations_from_args(args),
+        "run_dir": args.run_dir,
+    }
 
 
 def _build_train_val_loaders(
@@ -356,7 +477,7 @@ def _print_epoch_summary(stage_name: str, epoch: int, total_epochs: int, metrics
     LOGGER.info("[%s] epoch=%s/%s %s epoch_time=%.1fs", stage_name, epoch, total_epochs, items, sec)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description="Train 3-stage joint-aware latent diffusion")
     parser.add_argument("--stage", type=int, required=True, choices=[1, 2, 3])
@@ -416,6 +537,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_cls_s2", type=float, default=1, help="Weight for CE classification loss in Stage-2.")
     parser.add_argument("--lambda_gait_s2", type=float, default=1, help="Weight for gait-metric prediction loss in Stage-2 (primary supervised signal).")
     parser.add_argument("--lambda_feature", type=float, default=1.0, help="Weight for shared-motion feature alignment loss in Stage-2.")
+    parser.add_argument("--stage2_dropout", type=float, default=0.25, help="Dropout rate used by the Stage-2 IMU encoders.")
+    parser.add_argument("--stage2_weight_decay", type=float, default=3e-3, help="AdamW weight decay used only for Stage-2 training.")
+    parser.add_argument("--stage2_aug_noise_std", type=float, default=0.01, help="Stage-2 IMU augmentation Gaussian noise scale as a fraction of per-batch stream std.")
+    parser.add_argument("--stage2_aug_scale", type=float, default=0.05, help="Stage-2 IMU augmentation amplitude scaling range; uses [1-scale, 1+scale].")
+    parser.add_argument("--stage2_aug_mask_prob", type=float, default=0.05, help="Stage-2 IMU augmentation timestep masking probability.")
+    parser.add_argument("--stage2_scheduler_patience", type=int, default=3, help="ReduceLROnPlateau patience for Stage-2.")
+    parser.add_argument("--stage2_scheduler_factor", type=float, default=0.5, help="ReduceLROnPlateau multiplicative decay factor for Stage-2.")
+    parser.add_argument("--stage2_scheduler_min_lr", type=float, default=1e-6, help="ReduceLROnPlateau minimum learning rate for Stage-2.")
     parser.add_argument("--lambda_pose", type=float, default=1.0, help="Weight for paired skeleton reconstruction loss (Stage-3 only).")
     parser.add_argument("--lambda_latent", type=float, default=0.5, help="Weight for latent reconstruction loss (Stage-3 only).")
     parser.add_argument("--lambda_vel", type=float, default=0.5, help="Weight for velocity reconstruction loss (Stage-3 only).")
@@ -432,7 +561,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_every_stage3", type=int, default=5, help="Epoch interval for Stage-3 evaluation artifacts.")
     parser.add_argument("--max_train_batches", type=int, default=0, help="Cap batches per training epoch for smoke runs (0 disables).")
     parser.add_argument("--max_val_batches", type=int, default=0, help="Cap batches per validation epoch for smoke runs (0 disables).")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bool, local_rank: int) -> None:
@@ -690,6 +819,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         num_classes=args.num_classes,
         imu_graph_type=args.imu_graph,
         d_shared=args.d_shared,
+        stage2_dropout=args.stage2_dropout,
     ).to(device)
     assert all(not p.requires_grad for p in model.encoder.parameters()), "stage2 encoder must be frozen"
     if distributed:
@@ -708,11 +838,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         disable_gait_cache=args.disable_gait_cache,
     )
     train_loader, val_loader = _build_train_val_loaders(args, dataset=dataset, distributed=distributed)
-    trainable_params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
-    optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-3)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6
-    )
+    optimizer, scheduler = _build_stage2_optimizer_and_scheduler(model, args)
     if _is_main_process():
         save_run_manifest(
             Path(args.run_dir),
@@ -720,9 +846,15 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
             device,
             runtime={
                 "optimizer": optimizer.__class__.__name__,
-                "scheduler": "ReduceLROnPlateau(factor=0.5, patience=5)",
+                "scheduler": (
+                    "ReduceLROnPlateau("
+                    f"factor={args.stage2_scheduler_factor}, "
+                    f"patience={args.stage2_scheduler_patience}, "
+                    f"min_lr={args.stage2_scheduler_min_lr}, "
+                    "cooldown=1, threshold=1e-3)"
+                ),
                 "sensor_modality": "accelerometer only",
-                "sensor_locations": [Path(args.hip_folder).name if args.hip_folder else "", Path(args.wrist_folder).name if args.wrist_folder else ""],
+                "sensor_locations": _sensor_locations_from_args(args),
             },
         )
     model.train()
@@ -765,6 +897,12 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
             x = batch["skeleton"].to(device)
             a_hip_stream = batch["A_hip"].to(device)
             a_wrist_stream = batch["A_wrist"].to(device)
+            a_hip_stream, a_wrist_stream = _maybe_augment_stage2_streams(
+                a_hip_stream,
+                a_wrist_stream,
+                args,
+                training=True,
+            )
             gait_metrics = batch["gait_metrics"].to(device)
             y = batch["label"].to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -942,14 +1080,10 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
                 best_ckpt,
                 _unwrap_model(model),
                 extra={
+                    **_stage2_checkpoint_metadata(args),
                     "best_monitor_loss": best_loss,
                     "best_monitor_name": "val_loss_total" if avg_val_loss is not None else "train_loss_total",
                     "best_epoch": epoch + 1,
-                    "encoder_graph_op": args.encoder_graph_op_resolved,
-                    "skeleton_graph_op": args.skeleton_graph_op_resolved,
-                    "gait_metric_names": list(GAIT_METRIC_NAMES),
-                    "imu_feature_names": list(IMU_FEATURE_NAMES),
-                    "run_dir": args.run_dir,
                 },
             )
             LOGGER.info("[Stage2] new best checkpoint: %s (epoch=%s monitor_loss=%.6f)", best_ckpt, epoch + 1, best_loss)
@@ -959,13 +1093,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         save_checkpoint(
             ckpt,
             _unwrap_model(model),
-            extra={
-                "encoder_graph_op": args.encoder_graph_op_resolved,
-                "skeleton_graph_op": args.skeleton_graph_op_resolved,
-                "gait_metric_names": list(GAIT_METRIC_NAMES),
-                "imu_feature_names": list(IMU_FEATURE_NAMES),
-                "run_dir": args.run_dir,
-            },
+            extra=_stage2_checkpoint_metadata(args),
         )
         LOGGER.info("[Stage2] saved checkpoint: %s", ckpt)
 
@@ -995,9 +1123,11 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         gait_metrics_dim=args.gait_metrics_dim,
         imu_graph_type=args.imu_graph,
         d_shared=args.d_shared,
+        stage2_dropout=args.stage2_dropout,
     ).to(device)
     if args.stage2_ckpt:
-        load_checkpoint(args.stage2_ckpt, stage2, strict=True)
+        stage2_checkpoint = load_checkpoint(args.stage2_ckpt, stage2, strict=True)
+        _warn_stage2_stage3_sensor_domain_mismatch(stage2_checkpoint, args)
     stage2.eval()
 
     # Decoder was never called during Stage 1 (no reconstruction loss), so its

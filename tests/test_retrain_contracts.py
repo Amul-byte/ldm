@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 import pytest
+import sys
 import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
 from diffusion_model.dataset import (
     TorchFileGaitDataset,
@@ -16,14 +20,33 @@ from diffusion_model.dataset import (
 )
 from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM, GAIT_CACHE_VERSION, GAIT_METRIC_NAMES, rotate_and_align_torch
 from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model
+from diffusion_model.model_loader import infer_graph_ops_from_checkpoint, save_checkpoint
+from diffusion_model.shared_features import build_shared_motion_features, compute_skeleton_acceleration
 from diffusion_model.sensor_model import (
     IMU_FEATURE_NAMES,
     IMUGraphEncoder,
     IMULatentAligner,
+    SensorGCNEncoder,
     build_imu_features,
     build_imu_graph_adjacency,
 )
-from diffusion_model.training_eval import sample_stage3_latents
+from diffusion_model.skeleton_model import (
+    GraphDecoder,
+    GraphDecoderGCN,
+    GraphDenoiserMasked,
+    GraphDenoiserMaskedGCN,
+    GraphEncoder,
+    GraphEncoderGCN,
+)
+from diffusion_model.training_eval import (
+    evaluate_stage1,
+    evaluate_stage2_reports,
+    evaluate_stage3,
+    plot_per_class_accuracy,
+    sample_stage3_latents,
+    write_classification_artifacts,
+    write_history,
+)
 
 
 def _dummy_batch(batch_size: int = 2, frames: int = 32, joints: int = 32):
@@ -33,6 +56,28 @@ def _dummy_batch(batch_size: int = 2, frames: int = 32, joints: int = 32):
     gait = torch.randn(batch_size, DEFAULT_GAIT_METRICS_DIM)
     y = torch.randint(0, 14, (batch_size,))
     return x, a_hip, a_wrist, gait, y
+
+
+class _EvalDummyDataset(Dataset):
+    def __init__(self, length: int = 4, frames: int = 8, joints: int = 32):
+        self.length = length
+        self.frames = frames
+        self.joints = joints
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        label = idx % 14
+        return {
+            "skeleton": torch.randn(self.frames, self.joints, 3),
+            "A_hip": torch.randn(self.frames, 3),
+            "A_wrist": torch.randn(self.frames, 3),
+            "gait_metrics": torch.randn(DEFAULT_GAIT_METRICS_DIM),
+            "label": torch.tensor(label, dtype=torch.long),
+            "fps": torch.tensor(30.0),
+            "joint_labels": tuple(str(i) for i in range(self.joints)),
+        }
 
 
 def test_gait_metric_contract_is_exact_9_metrics():
@@ -112,12 +157,82 @@ def test_torchfile_dataset_raises_when_label_is_missing():
 
 
 def test_imu_feature_builder_outputs_expected_channels_and_finite_angles():
-    accel = torch.tensor([[[1.0, 2.0, 3.0], [0.5, -0.5, 0.25]]], dtype=torch.float32)
+    accel = torch.tensor(
+        [[[1.0, 2.0, 3.0], [0.5, -0.5, 0.25], [-1.0, 0.25, 2.0], [0.0, 1.5, -0.75]]],
+        dtype=torch.float32,
+    )
     feats = build_imu_features(accel)
-    assert feats.shape == (1, 2, len(IMU_FEATURE_NAMES))
-    assert torch.allclose(feats[..., :3], accel)
-    assert torch.all(feats[..., 3] >= 0)
+    assert feats.shape == (1, accel.shape[1], len(IMU_FEATURE_NAMES))
     assert torch.isfinite(feats).all()
+    assert torch.allclose(feats.mean(dim=1), torch.zeros_like(feats.mean(dim=1)), atol=1e-5)
+
+
+def test_build_shared_motion_features_shapes_and_normalization():
+    accel = torch.tensor(
+        [[[1.0, 2.0, 3.0], [2.5, -1.0, 0.5], [0.5, 0.25, -1.5], [-0.5, 1.0, 2.0], [1.5, 3.0, -0.75]]],
+        dtype=torch.float32,
+    )
+    feats_imu = build_shared_motion_features(accel)
+    feats_skel = build_shared_motion_features(accel.unsqueeze(2).repeat(1, 1, 2, 1))
+
+    assert feats_imu.shape == (1, accel.shape[1], len(IMU_FEATURE_NAMES))
+    assert feats_skel.shape == (1, accel.shape[1], 2, len(IMU_FEATURE_NAMES))
+    assert torch.isfinite(feats_imu).all()
+    assert torch.isfinite(feats_skel).all()
+    assert torch.allclose(feats_imu.mean(dim=1), torch.zeros_like(feats_imu.mean(dim=1)), atol=1e-5)
+    assert torch.allclose(feats_skel.mean(dim=1), torch.zeros_like(feats_skel.mean(dim=1)), atol=1e-5)
+    assert torch.allclose(
+        feats_imu.std(dim=1, unbiased=False),
+        torch.ones_like(feats_imu.std(dim=1, unbiased=False)),
+        atol=1e-4,
+    )
+
+
+def test_compute_skeleton_acceleration_exact_shape_and_values():
+    positions = torch.tensor(
+        [[[[0.0, 0.0, 0.0]], [[1.0, 0.0, 0.0]], [[3.0, 0.0, 0.0]], [[6.0, 0.0, 0.0]]]],
+        dtype=torch.float32,
+    )
+    accel = compute_skeleton_acceleration(positions)
+    expected = torch.tensor(
+        [[[[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]], [[1.0, 0.0, 0.0]], [[1.0, 0.0, 0.0]]]],
+        dtype=torch.float32,
+    )
+    assert accel.shape == positions.shape
+    assert torch.allclose(accel, expected)
+
+
+def test_skeleton_graph_variants_have_shape_parity():
+    x, _, _, _, _ = _dummy_batch(batch_size=2, frames=8, joints=32)
+    latent_dim = 32
+    z = torch.randn(x.shape[0], x.shape[1], x.shape[2], latent_dim)
+    t = torch.randint(0, 10, (x.shape[0],), dtype=torch.long)
+    h_tokens = torch.randn(x.shape[0], x.shape[1], latent_dim)
+    h_global = torch.randn(x.shape[0], latent_dim)
+
+    enc_gat = GraphEncoder(latent_dim=latent_dim, num_joints=32, depth=2)
+    enc_gcn = GraphEncoderGCN(latent_dim=latent_dim, num_joints=32, depth=2)
+    z_gat = enc_gat(x)
+    z_gcn = enc_gcn(x)
+    assert z_gat.shape == z_gcn.shape == (x.shape[0], x.shape[1], x.shape[2], latent_dim)
+
+    dec_gat = GraphDecoder(latent_dim=latent_dim, num_joints=32, depth=2)
+    dec_gcn = GraphDecoderGCN(latent_dim=latent_dim, num_joints=32, depth=2)
+    x_hat_gat = dec_gat(z)
+    x_hat_gcn = dec_gcn(z)
+    assert x_hat_gat.shape == x_hat_gcn.shape == x.shape
+
+    den_gat = GraphDenoiserMasked(latent_dim=latent_dim, num_joints=32, depth=2)
+    den_gcn = GraphDenoiserMaskedGCN(latent_dim=latent_dim, num_joints=32, depth=2)
+    eps_gat = den_gat(z, t, h_tokens=h_tokens, h_global=h_global)
+    eps_gcn = den_gcn(z, t, h_tokens=h_tokens, h_global=h_global)
+    assert eps_gat.shape == eps_gcn.shape == z.shape
+    assert torch.isfinite(z_gat).all()
+    assert torch.isfinite(z_gcn).all()
+    assert torch.isfinite(x_hat_gat).all()
+    assert torch.isfinite(x_hat_gcn).all()
+    assert torch.isfinite(eps_gat).all()
+    assert torch.isfinite(eps_gcn).all()
 
 
 def test_stage_forward_smoke_losses_are_finite():
@@ -136,6 +251,7 @@ def test_stage_forward_smoke_losses_are_finite():
     stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=32, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
     out2 = stage2(x=x, a_hip_stream=a_hip, a_wrist_stream=a_wrist, gait_metrics=gait)
     assert torch.isfinite(out2["loss_align"])
+    assert torch.isfinite(out2["loss_feature"])
 
     stage3 = Stage3Model(
         encoder=stage1.encoder,
@@ -147,12 +263,73 @@ def test_stage_forward_smoke_losses_are_finite():
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
         use_gait_conditioning=False,
+        shared_motion_layer=stage2.shared_motion_layer,
     )
-    out3 = stage3(x=x, h_tokens=out2["h_tokens"], h_global=out2["h_global"], gait_target=gait, fps=30.0)
+    out3 = stage3(
+        x=x,
+        h_tokens=out2["h_tokens"],
+        h_global=out2["h_global"],
+        gait_target=gait,
+        fps=30.0,
+        a_hip_stream=a_hip,
+        a_wrist_stream=a_wrist,
+    )
     for key in ["loss_diff", "loss_pose", "loss_latent", "loss_vel", "loss_gait", "loss_motion", "loss_bone", "loss_skate", "loss_smooth", "loss_instab"]:
         assert torch.isfinite(out3[key]), key
     assert out3["gait_gen"].shape == (x.shape[0], DEFAULT_GAIT_METRICS_DIM)
     assert out3["z0_target"].shape == out3["z0_gen"].shape
+
+
+def test_stage_forward_smoke_losses_are_finite_full_gcn():
+    x, a_hip, a_wrist, gait, _ = _dummy_batch()
+
+    stage1 = Stage1Model(
+        latent_dim=32,
+        num_joints=32,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+        skeleton_graph_op="gcn",
+    )
+    assert isinstance(stage1.encoder, GraphEncoderGCN)
+    assert isinstance(stage1.decoder, GraphDecoderGCN)
+    assert isinstance(stage1.denoiser, GraphDenoiserMaskedGCN)
+    out1 = stage1(x, gait_metrics=gait)
+    assert torch.isfinite(out1["loss_diff"])
+
+    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=32, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    out2 = stage2(x=x, a_hip_stream=a_hip, a_wrist_stream=a_wrist, gait_metrics=gait)
+
+    stage3 = Stage3Model(
+        encoder=stage1.encoder,
+        decoder=stage1.decoder,
+        denoiser=stage1.denoiser,
+        latent_dim=32,
+        num_joints=32,
+        num_classes=14,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+        shared_motion_layer=stage2.shared_motion_layer,
+    )
+    out3 = stage3(
+        x=x,
+        h_tokens=out2["h_tokens"],
+        h_global=out2["h_global"],
+        gait_target=gait,
+        fps=30.0,
+        a_hip_stream=a_hip,
+        a_wrist_stream=a_wrist,
+    )
+    assert torch.isfinite(out3["loss_diff"])
+    assert torch.isfinite(out3["loss_pose"])
+
+
+def test_stage1_supports_partial_gcn_encoder_override():
+    stage1 = Stage1Model(latent_dim=32, skeleton_graph_op="gat", encoder_type="gcn")
+    assert isinstance(stage1.encoder, GraphEncoderGCN)
+    assert isinstance(stage1.decoder, GraphDecoder)
+    assert isinstance(stage1.denoiser, GraphDenoiserMasked)
 
 
 def test_stage3_sampling_is_deterministic_for_fixed_seed():
@@ -175,15 +352,41 @@ def test_stage3_sampling_is_deterministic_for_fixed_seed():
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
         use_gait_conditioning=False,
+        shared_motion_layer=stage2.shared_motion_layer,
     )
     h_tokens, h_global = stage2.aligner(a_hip, a_wrist)
     shape = torch.Size((1, x.shape[1], x.shape[2], 32))
     # Pass real gait metrics (instead of None) to match the train/eval conditioning contract.
-    z_a = sample_stage3_latents(stage3, shape, x.device, h_tokens, h_global, gait_metrics=gait, sample_steps=5, sampler="ddim", sample_seed=7)
-    z_b = sample_stage3_latents(stage3, shape, x.device, h_tokens, h_global, gait_metrics=gait, sample_steps=5, sampler="ddim", sample_seed=7)
-    z_c = sample_stage3_latents(stage3, shape, x.device, h_tokens, h_global, gait_metrics=gait, sample_steps=5, sampler="ddim", sample_seed=8)
+    z_a = sample_stage3_latents(stage3, shape, x.device, h_tokens, h_global, gait_metrics=gait, sample_steps=5, sampler="ddim", sample_seed=7, a_hip_stream=a_hip, a_wrist_stream=a_wrist)
+    z_b = sample_stage3_latents(stage3, shape, x.device, h_tokens, h_global, gait_metrics=gait, sample_steps=5, sampler="ddim", sample_seed=7, a_hip_stream=a_hip, a_wrist_stream=a_wrist)
+    z_c = sample_stage3_latents(stage3, shape, x.device, h_tokens, h_global, gait_metrics=gait, sample_steps=5, sampler="ddim", sample_seed=8, a_hip_stream=a_hip, a_wrist_stream=a_wrist)
     assert torch.allclose(z_a, z_b)
     assert not torch.allclose(z_a, z_c)
+
+
+def test_checkpoint_graph_metadata_and_inference():
+    stage1 = Stage1Model(latent_dim=32, skeleton_graph_op="gcn")
+    with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
+        save_checkpoint(
+            handle.name,
+            stage1,
+            extra={
+                "encoder_graph_op": stage1.encoder_graph_op,
+                "skeleton_graph_op": stage1.skeleton_graph_op,
+            },
+        )
+        encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(handle.name)
+    assert encoder_graph_op == "gcn"
+    assert skeleton_graph_op == "gcn"
+
+
+def test_checkpoint_graph_inference_supports_old_partial_variant_without_metadata():
+    stage1 = Stage1Model(latent_dim=32, skeleton_graph_op="gat", encoder_type="gcn")
+    with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
+        torch.save({"state_dict": stage1.state_dict()}, handle.name)
+        encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(handle.name)
+    assert encoder_graph_op == "gcn"
+    assert skeleton_graph_op == "gat"
 
 
 def test_imu_graph_adjacency_shape_and_edges():
@@ -212,9 +415,9 @@ def test_imu_graph_adjacency_shape_and_edges():
 def test_imu_graph_encoder_output_shapes():
     """IMUGraphEncoder must return per-sensor tokens of the expected shape."""
     B, T, D = 2, 8, 32
-    encoder = IMUGraphEncoder(input_dim=6, latent_dim=D, depth=2)
-    hip = torch.randn(B, T, 6)
-    wrist = torch.randn(B, T, 6)
+    encoder = IMUGraphEncoder(input_dim=len(IMU_FEATURE_NAMES), latent_dim=D, depth=2)
+    hip = torch.randn(B, T, len(IMU_FEATURE_NAMES))
+    wrist = torch.randn(B, T, len(IMU_FEATURE_NAMES))
     hip_out, wrist_out = encoder(hip, wrist)
     assert hip_out.shape == (B, T, D), f"hip_out shape mismatch: {hip_out.shape}"
     assert wrist_out.shape == (B, T, D), f"wrist_out shape mismatch: {wrist_out.shape}"
@@ -222,11 +425,13 @@ def test_imu_graph_encoder_output_shapes():
     assert torch.isfinite(wrist_out).all()
 
 
-def test_imu_aligner_uses_graph_encoder():
-    """IMULatentAligner must expose graph_encoder and produce correct output shapes."""
+def test_imu_aligner_uses_dual_sensor_encoders():
+    """IMULatentAligner must expose the current dual-encoder contract and produce correct output shapes."""
     B, T, D = 2, 8, 32
     aligner = IMULatentAligner(latent_dim=D)
-    assert hasattr(aligner, "graph_encoder"), "IMULatentAligner must have graph_encoder attribute"
+    assert hasattr(aligner, "hip_encoder")
+    assert hasattr(aligner, "wrist_encoder")
+    assert aligner.imu_feature_dim == len(IMU_FEATURE_NAMES)
     a_hip = torch.randn(B, T, 3)
     a_wrist = torch.randn(B, T, 3)
     sensor_tokens, h_global = aligner(a_hip, a_wrist)
@@ -236,8 +441,329 @@ def test_imu_aligner_uses_graph_encoder():
     assert torch.isfinite(h_global).all()
 
 
+def test_stage3_augment_conditioning_is_noop_without_or_before_shared_signal():
+    x, a_hip, a_wrist, gait, _ = _dummy_batch(batch_size=1)
+    stage1 = Stage1Model(
+        latent_dim=32,
+        num_joints=32,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+    )
+    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=32, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage3 = Stage3Model(
+        encoder=stage1.encoder,
+        decoder=stage1.decoder,
+        denoiser=stage1.denoiser,
+        latent_dim=32,
+        num_joints=32,
+        num_classes=14,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+        shared_motion_layer=stage2.shared_motion_layer,
+    )
+    h_tokens, h_global = stage2.aligner(a_hip, a_wrist)
+    same_tokens, same_global = stage3.augment_conditioning(h_tokens, h_global)
+    aug_tokens, aug_global = stage3.augment_conditioning(h_tokens, h_global, a_hip_stream=a_hip, a_wrist_stream=a_wrist)
+
+    assert torch.allclose(same_tokens, h_tokens)
+    assert torch.allclose(same_global, h_global)
+    assert aug_tokens.shape == h_tokens.shape
+    assert aug_global.shape == h_global.shape
+    assert torch.allclose(aug_tokens, h_tokens)
+    assert torch.allclose(aug_global, h_global)
+
+
 def test_rotate_and_align_torch_handles_degenerate_sequences():
     pose = torch.zeros(90, 32, 3)
     aligned = rotate_and_align_torch(pose)
     assert aligned.shape == (90, 16, 3)
     assert torch.isfinite(aligned).all()
+
+
+def test_write_classification_artifacts_outputs_expected_files():
+    y_true = np.array([0, 1, 1, 2], dtype=np.int64)
+    y_pred = np.array([0, 1, 0, 2], dtype=np.int64)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir)
+        report = write_classification_artifacts(out_dir, "demo_classifier", y_true, y_pred, num_classes=3)
+        assert report["accuracy"] == pytest.approx(0.75)
+        assert (out_dir / "demo_classifier_report.json").exists()
+        assert (out_dir / "demo_classifier_report.csv").exists()
+        assert (out_dir / "demo_classifier_confusion_matrix.csv").exists()
+        assert (out_dir / "demo_classifier_confusion_matrix.png").exists()
+
+
+def test_write_history_emits_accuracy_curves_when_accuracy_columns_exist():
+    history = [
+        {
+            "epoch": 1.0,
+            "train_loss_total": 1.0,
+            "val_loss_total": 1.2,
+            "train_acc_latent_cls": 0.5,
+            "val_acc_latent_cls": 0.4,
+        },
+        {
+            "epoch": 2.0,
+            "train_loss_total": 0.8,
+            "val_loss_total": 1.0,
+            "train_acc_latent_cls": 0.6,
+            "val_acc_latent_cls": 0.5,
+        },
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        run_dir = Path(tmpdir)
+        write_history(run_dir, "stage1", history)
+        assert (run_dir / "stage1" / "history.csv").exists()
+        assert (run_dir / "stage1" / "accuracy_curves.png").exists()
+
+
+def test_stage1_evaluator_writes_latent_classifier_artifacts():
+    loader = DataLoader(_EvalDummyDataset(length=4, frames=8), batch_size=2, shuffle=False)
+    stage1 = Stage1Model(
+        latent_dim=16,
+        num_joints=32,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir)
+        evaluate_stage1(stage1, loader, torch.device("cpu"), out_dir, timestep_values=[0, 9])
+        assert (out_dir / "latent_classifier_report.json").exists()
+        assert (out_dir / "latent_classifier_confusion_matrix.csv").exists()
+
+
+def test_stage2_lightweight_evaluator_writes_classifier_and_gait_reports():
+    loader = DataLoader(_EvalDummyDataset(length=4, frames=8), batch_size=2, shuffle=False)
+    stage1 = Stage1Model(
+        latent_dim=16,
+        num_joints=32,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+    )
+    stage2 = Stage2Model(
+        encoder=stage1.encoder,
+        latent_dim=16,
+        num_joints=32,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir)
+        evaluate_stage2_reports(stage2, loader, torch.device("cpu"), out_dir, max_batches=2)
+        assert (out_dir / "imu_classifier_report.json").exists()
+        assert (out_dir / "imu_classifier_confusion_matrix.csv").exists()
+        assert (out_dir / "gait_prediction_metrics.json").exists()
+        assert (out_dir / "gait_prediction_metrics.csv").exists()
+
+
+def test_stage2_cli_defaults_preserve_heavy_eval_and_add_light_report_interval(monkeypatch):
+    import train as train_module
+
+    monkeypatch.setattr(sys, "argv", ["train.py", "--stage", "1"])
+    args = train_module.parse_args()
+    assert args.eval_every_stage2 == 500
+    assert args.eval_every_stage2_reports == 10
+
+
+def test_stage2_cli_defaults_include_regularization_knobs():
+    import train as train_module
+
+    args = train_module.parse_args(["--stage", "2"])
+    assert args.stage2_dropout == pytest.approx(0.25)
+    assert args.stage2_weight_decay == pytest.approx(3e-3)
+    assert args.stage2_aug_noise_std == pytest.approx(0.01)
+    assert args.stage2_aug_scale == pytest.approx(0.05)
+    assert args.stage2_aug_mask_prob == pytest.approx(0.05)
+    assert args.stage2_scheduler_patience == 3
+    assert args.stage2_scheduler_factor == pytest.approx(0.5)
+    assert args.stage2_scheduler_min_lr == pytest.approx(1e-6)
+
+
+def test_stage2_optimizer_and_scheduler_use_stage2_specific_defaults():
+    import train as train_module
+
+    args = train_module.parse_args(["--stage", "2"])
+    stage1 = Stage1Model(latent_dim=16, num_joints=32, timesteps=10, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage2 = Stage2Model(
+        encoder=stage1.encoder,
+        latent_dim=16,
+        num_joints=32,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        stage2_dropout=args.stage2_dropout,
+    )
+    optimizer, scheduler = train_module._build_stage2_optimizer_and_scheduler(stage2, args)
+
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(3e-3)
+    assert scheduler.factor == pytest.approx(0.5)
+    assert scheduler.patience == 3
+    assert scheduler.cooldown == 1
+    assert scheduler.threshold == pytest.approx(1e-3)
+    assert scheduler.min_lrs == [pytest.approx(1e-6)]
+
+
+def test_stage2_sensor_encoder_dropout_defaults_and_overrides():
+    encoder = SensorGCNEncoder(input_dim=len(IMU_FEATURE_NAMES), latent_dim=16)
+    assert encoder.drop1.p == pytest.approx(0.25)
+    assert encoder.drop2.p == pytest.approx(0.25)
+    assert encoder.drop3.p == pytest.approx(0.25)
+
+    aligner = IMULatentAligner(latent_dim=16, dropout=0.4)
+    assert aligner.hip_encoder.drop1.p == pytest.approx(0.4)
+    assert aligner.wrist_encoder.drop3.p == pytest.approx(0.4)
+
+
+def test_stage2_augmentation_changes_train_streams_but_not_eval_streams():
+    import train as train_module
+
+    a_hip = torch.randn(2, 8, 3)
+    a_wrist = torch.randn(2, 8, 3)
+    args = SimpleNamespace(
+        stage2_aug_noise_std=0.01,
+        stage2_aug_scale=0.05,
+        stage2_aug_mask_prob=0.05,
+    )
+
+    torch.manual_seed(0)
+    aug_hip, aug_wrist = train_module._maybe_augment_stage2_streams(a_hip, a_wrist, args, training=True)
+    same_hip, same_wrist = train_module._maybe_augment_stage2_streams(a_hip, a_wrist, args, training=False)
+
+    assert torch.allclose(same_hip, a_hip)
+    assert torch.allclose(same_wrist, a_wrist)
+    assert not torch.allclose(aug_hip, a_hip)
+    assert not torch.allclose(aug_wrist, a_wrist)
+
+
+def test_stage2_checkpoint_metadata_saves_sensor_locations():
+    import train as train_module
+
+    args = train_module.parse_args(
+        ["--stage", "2", "--hip_folder", "/tmp/meta_hip", "--wrist_folder", "/tmp/meta_wrist"]
+    )
+    args.encoder_graph_op_resolved = "gcn"
+    args.skeleton_graph_op_resolved = "gcn"
+    args.run_dir = "outputs/test_stage2"
+    metadata = train_module._stage2_checkpoint_metadata(args)
+
+    stage1 = Stage1Model(latent_dim=16, num_joints=32, timesteps=10, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=16, num_joints=32, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
+        save_checkpoint(handle.name, stage2, extra=metadata)
+        payload = torch.load(handle.name, map_location="cpu")
+
+    assert payload["extra"]["sensor_locations"] == ["meta_hip", "meta_wrist"]
+
+
+def test_stage3_warns_on_stage2_sensor_domain_mismatch(caplog):
+    import train as train_module
+
+    args = train_module.parse_args(
+        ["--stage", "3", "--hip_folder", "/tmp/phone", "--wrist_folder", "/tmp/watch"]
+    )
+    checkpoint = {"extra": {"sensor_locations": ["meta_hip", "meta_wrist"]}}
+
+    with caplog.at_level(logging.WARNING, logger="train"):
+        warned = train_module._warn_stage2_stage3_sensor_domain_mismatch(checkpoint, args)
+
+    assert warned is True
+    assert "Stage2 sensor_locations=['meta_hip', 'meta_wrist']" in caplog.text
+    assert "Stage3 sensor_locations=['phone', 'watch']" in caplog.text
+
+
+def test_stage3_evaluator_writes_eval_history_and_classifier_reports():
+    loader = DataLoader(_EvalDummyDataset(length=4, frames=8), batch_size=2, shuffle=False)
+    stage1 = Stage1Model(
+        latent_dim=16,
+        num_joints=32,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+    )
+    stage2 = Stage2Model(
+        encoder=stage1.encoder,
+        latent_dim=16,
+        num_joints=32,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+    )
+    stage3 = Stage3Model(
+        encoder=stage1.encoder,
+        decoder=stage1.decoder,
+        denoiser=stage1.denoiser,
+        latent_dim=16,
+        num_joints=32,
+        num_classes=14,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+        shared_motion_layer=stage2.shared_motion_layer,
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir) / "epoch_001"
+        evaluate_stage3(
+            stage2,
+            stage3,
+            loader,
+            torch.device("cpu"),
+            out_dir,
+            sample_steps=2,
+            fps=30.0,
+            epoch=1,
+            sampler="ddim",
+            sample_seed=0,
+        )
+        assert (out_dir / "real_classifier_report.json").exists()
+        assert (out_dir / "generated_classifier_report.json").exists()
+        assert (out_dir.parent / "eval_history.csv").exists()
+        assert (out_dir.parent / "eval_accuracy_curves.png").exists()
+        assert (out_dir / "per_class_accuracy.json").exists()
+
+
+def test_stage3_per_class_accuracy_uses_raw_real_skeletons_for_real_accuracy():
+    loader = DataLoader(_EvalDummyDataset(length=4, frames=8), batch_size=2, shuffle=False)
+    stage1 = Stage1Model(
+        latent_dim=16,
+        num_joints=32,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+    )
+    stage2 = Stage2Model(
+        encoder=stage1.encoder,
+        latent_dim=16,
+        num_joints=32,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+    )
+    stage3 = Stage3Model(
+        encoder=stage1.encoder,
+        decoder=stage1.decoder,
+        denoiser=stage1.denoiser,
+        latent_dim=16,
+        num_joints=32,
+        num_classes=14,
+        timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+        shared_motion_layer=stage2.shared_motion_layer,
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = plot_per_class_accuracy(
+            stage2,
+            stage3,
+            loader,
+            torch.device("cpu"),
+            Path(tmpdir),
+            sample_steps=2,
+            sampler="ddim",
+            max_batches=2,
+        )
+        manual_correct = 0
+        manual_total = 0
+        for batch in loader:
+            x = batch["skeleton"]
+            y = batch["label"]
+            pred_real = stage3.classifier(x.float()).argmax(1)
+            manual_correct += int((pred_real == y).sum().item())
+            manual_total += int(y.numel())
+        assert result["overall_real_acc"] == pytest.approx(manual_correct / max(manual_total, 1))

@@ -126,22 +126,28 @@ class SensorGCNEncoder(nn.Module):
     Each conv is a GCNConv over a chain temporal graph on T nodes.
     """
 
-    def __init__(self, input_dim: int = len(IMU_FEATURE_NAMES), latent_dim: int = 256,
-                 graph_type: str = "chain") -> None:
+    def __init__(
+        self,
+        input_dim: int = len(IMU_FEATURE_NAMES),
+        latent_dim: int = 256,
+        graph_type: str = "chain",
+        dropout: float = 0.25,
+    ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.graph_type = graph_type
-        # Hidden dims match checkpoint: 6→32→32→64→256
-        self.conv1 = GCNConv(input_dim, 32, add_self_loops=False)
-        self.conv2 = GCNConv(32, 32, add_self_loops=False)
-        self.conv3 = GCNConv(32, 64, add_self_loops=False)
-        self.norm1 = nn.LayerNorm(32)
-        self.norm2 = nn.LayerNorm(32)
-        self.norm3 = nn.LayerNorm(64)
-        self.drop1 = nn.Dropout(p=0.1)
-        self.drop2 = nn.Dropout(p=0.1)
-        self.drop3 = nn.Dropout(p=0.1)
-        self.out_proj = nn.Linear(64, latent_dim)
+        self.dropout = float(dropout)
+        # Hidden dims match the saved Stage-2 branch family: input_dim→32→32→64→latent_dim
+        self.conv1 = GCNConv(input_dim, 12, add_self_loops=False)
+        self.conv2 = GCNConv(12, 12, add_self_loops=False)
+        self.conv3 = GCNConv(12, 24, add_self_loops=False)
+        self.norm1 = nn.LayerNorm(12)
+        self.norm2 = nn.LayerNorm(12)
+        self.norm3 = nn.LayerNorm(24)
+        self.drop1 = nn.Dropout(p=0.5)
+        self.drop2 = nn.Dropout(p=0.5)
+        self.drop3 = nn.Dropout(p=0.5)
+        self.out_proj = nn.Linear(24, latent_dim)
         self._edge_cache: dict = {}
 
     def _get_batched_edge_index(self, b: int, t: int, device: torch.device) -> torch.Tensor:
@@ -276,18 +282,35 @@ class IMULatentAligner(nn.Module):
     Stage-1 checkpoints are unaffected (they do not contain the aligner).
     """
 
-    def __init__(self, latent_dim: int = 256, gait_metrics_dim: int = 0,
-                 graph_type: str = "chain") -> None:
+    def __init__(
+        self,
+        latent_dim: int = 256,
+        gait_metrics_dim: int = 0,
+        graph_type: str = "chain",
+        dropout: float = 0.25,
+    ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.gait_metrics_dim = gait_metrics_dim
         self.imu_feature_dim = len(IMU_FEATURE_NAMES)
+        self.dropout = float(dropout)
         # Separate per-sensor encoders matching checkpoint architecture
-        self.hip_encoder   = SensorGCNEncoder(input_dim=self.imu_feature_dim, latent_dim=latent_dim, graph_type=graph_type)
-        self.wrist_encoder = SensorGCNEncoder(input_dim=self.imu_feature_dim, latent_dim=latent_dim, graph_type=graph_type)
+        self.hip_encoder = SensorGCNEncoder(
+            input_dim=self.imu_feature_dim,
+            latent_dim=latent_dim,
+            graph_type=graph_type,
+            dropout=self.dropout,
+        )
+        self.wrist_encoder = SensorGCNEncoder(
+            input_dim=self.imu_feature_dim,
+            latent_dim=latent_dim,
+            graph_type=graph_type,
+            dropout=self.dropout,
+        )
         self.fuse_tokens = nn.Sequential(
             nn.Linear(latent_dim * 2, latent_dim),
             nn.GELU(),
+            nn.Dropout(p=0.5),
             nn.Linear(latent_dim, latent_dim),
         )
 

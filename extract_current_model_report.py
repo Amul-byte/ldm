@@ -38,7 +38,7 @@ try:
     from diffusion_model.dataset import create_dataloader, create_dataset
     from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM, compute_gait_metrics_torch
     from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model
-    from diffusion_model.model_loader import load_checkpoint
+    from diffusion_model.model_loader import infer_graph_ops_from_checkpoint, load_checkpoint
     from diffusion_model.util import DEFAULT_JOINTS, DEFAULT_LATENT_DIM, DEFAULT_NUM_CLASSES, DEFAULT_TIMESTEPS, DEFAULT_WINDOW, get_skeleton_edges
 
     HAS_RICH_STACK = True
@@ -663,6 +663,32 @@ def _load_checkpoint_from_candidates(model: torch.nn.Module, filename: str) -> P
     raise FileNotFoundError(f"Could not find a compatible checkpoint named {filename!r} in {CHECKPOINT_SEARCH_DIRS!r}")
 
 
+def _load_stage1_checkpoint_from_candidates(device: torch.device) -> tuple[Stage1Model, Path]:
+    last_error: Exception | None = None
+    for directory in CHECKPOINT_SEARCH_DIRS:
+        path = directory / "stage1_best.pt"
+        if not path.exists():
+            continue
+        try:
+            encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(str(path))
+            stage1 = Stage1Model(
+                latent_dim=DEFAULT_LATENT_DIM,
+                num_joints=DEFAULT_JOINTS,
+                timesteps=DEFAULT_TIMESTEPS,
+                gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+                use_gait_conditioning=False,
+                encoder_type=encoder_graph_op,
+                skeleton_graph_op=skeleton_graph_op,
+            ).to(device)
+            load_checkpoint(str(path), stage1, strict=True)
+            return stage1, path
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise FileNotFoundError(f"Could not find a compatible checkpoint named 'stage1_best.pt' in {CHECKPOINT_SEARCH_DIRS!r}")
+
+
 def render_skeleton_panels(
     out_path: Path,
     sequences: list[np.ndarray],
@@ -1167,14 +1193,7 @@ def run_rich_analysis(report_dir: Path, gait_metric_names: list[str]) -> dict[st
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    stage1 = Stage1Model(
-        latent_dim=DEFAULT_LATENT_DIM,
-        num_joints=DEFAULT_JOINTS,
-        timesteps=DEFAULT_TIMESTEPS,
-        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
-        use_gait_conditioning=False,
-    ).to(device)
-    stage1_ckpt_path = _load_checkpoint_from_candidates(stage1, "stage1_best.pt")
+    stage1, stage1_ckpt_path = _load_stage1_checkpoint_from_candidates(device)
     stage2 = Stage2Model(
         encoder=stage1.encoder,
         latent_dim=DEFAULT_LATENT_DIM,

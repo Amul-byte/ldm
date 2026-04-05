@@ -44,6 +44,7 @@ from torch.utils.data import DataLoader, Subset
 
 from diffusion_model.dataset import create_dataset, create_dataloader, split_train_val_dataset
 from diffusion_model.model import Stage1Model
+from diffusion_model.model_loader import infer_graph_ops_from_checkpoint
 from diffusion_model.util import DEFAULT_LATENT_DIM, DEFAULT_NUM_CLASSES, DEFAULT_WINDOW, DEFAULT_JOINTS
 
 
@@ -287,7 +288,13 @@ def main() -> None:
     # ── Stage-1 encoder (frozen) ─────────────────────────────────────────────
     print(f"Loading Stage-1 checkpoint: {args.stage1_ckpt}")
     ckpt  = torch.load(args.stage1_ckpt, map_location="cpu", weights_only=False)
-    model = Stage1Model(latent_dim=args.latent_dim)
+    encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(args.stage1_ckpt)
+    print(f"  inferred graph ops: encoder={encoder_graph_op} full_skeleton={skeleton_graph_op}")
+    model = Stage1Model(
+        latent_dim=args.latent_dim,
+        encoder_type=encoder_graph_op,
+        skeleton_graph_op=skeleton_graph_op,
+    )
     model.load_state_dict(ckpt["state_dict"], strict=False)
     model.eval().to(device)
     for p in model.parameters():

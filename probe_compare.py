@@ -40,6 +40,7 @@ from diffusion_model.dataset import (
     extract_subject_ids,
 )
 from diffusion_model.model import Stage1Model, Stage2Model
+from diffusion_model.model_loader import infer_graph_ops_from_checkpoint
 from diffusion_model.util import DEFAULT_LATENT_DIM, DEFAULT_NUM_CLASSES, DEFAULT_WINDOW, DEFAULT_JOINTS
 
 
@@ -228,7 +229,12 @@ def main() -> None:
     # ── load Stage-1 ─────────────────────────────────────────────────────────
     print(f"Loading Stage-1: {args.stage1_ckpt}")
     ckpt1   = torch.load(args.stage1_ckpt, map_location="cpu", weights_only=False)
-    stage1  = Stage1Model(latent_dim=args.latent_dim)
+    encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(args.stage1_ckpt)
+    stage1  = Stage1Model(
+        latent_dim=args.latent_dim,
+        encoder_type=encoder_graph_op,
+        skeleton_graph_op=skeleton_graph_op,
+    )
     stage1.load_state_dict(ckpt1["state_dict"], strict=False)
     stage1.eval().to(device)
     for p in stage1.parameters():

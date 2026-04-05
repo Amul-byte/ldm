@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw
 from diffusion_model.dataset import create_dataloader
 from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM
 from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model
+from diffusion_model.model_loader import infer_graph_ops_from_checkpoint
 from diffusion_model.util import (
     DEFAULT_JOINTS,
     DEFAULT_LATENT_DIM,
@@ -141,12 +142,15 @@ def _enter_all(items: list[contextmanager], fn: Callable[[], None]) -> None:
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(args.stage1_ckpt)
 
     stage1 = Stage1Model(
         latent_dim=args.latent_dim,
         num_joints=args.joints,
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
+        encoder_type=encoder_graph_op,
+        skeleton_graph_op=skeleton_graph_op,
     ).to(device)
     _load_state(args.stage1_ckpt, stage1, strict=True)
 
@@ -217,6 +221,8 @@ def main() -> None:
                 h_tokens=h_tokens,
                 h_global=h_global,
                 gait_metrics=gait_metrics,
+                a_hip_stream=a_hip,
+                a_wrist_stream=a_wrist,
             )
             _ = stage3.classifier(out["x_hat"])
 

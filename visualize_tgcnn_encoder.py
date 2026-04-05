@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
 from diffusion_model.dataset import create_dataset
 from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM
 from diffusion_model.model import Stage1Model, Stage2Model
-from diffusion_model.model_loader import load_checkpoint
+from diffusion_model.model_loader import infer_graph_ops_from_checkpoint, load_checkpoint
 from diffusion_model.sensor_model import IMU_FEATURE_NAMES, build_imu_features
 from diffusion_model.util import DEFAULT_JOINTS, DEFAULT_LATENT_DIM, DEFAULT_TIMESTEPS, DEFAULT_WINDOW
 
@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument("--gait_metrics_dim", type=int, default=DEFAULT_GAIT_METRICS_DIM)
     parser.add_argument("--num_classes", type=int, default=14)
+    parser.add_argument("--encoder_type", type=str, default="gat", choices=["gat", "gcn"])
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -82,11 +83,14 @@ def validate_data_mode(args: argparse.Namespace) -> None:
 
 
 def load_models(args: argparse.Namespace, device: torch.device) -> tuple[Stage1Model, Stage2Model]:
+    encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(args.stage1_ckpt)
     stage1 = Stage1Model(
         latent_dim=args.latent_dim,
         num_joints=args.joints,
         timesteps=args.timesteps,
         gait_metrics_dim=args.gait_metrics_dim,
+        encoder_type=encoder_graph_op,
+        skeleton_graph_op=skeleton_graph_op,
     ).to(device)
     load_checkpoint(args.stage1_ckpt, stage1, strict=True)
     stage1.eval()
@@ -402,8 +406,8 @@ def main() -> None:
 
     hip_features = build_imu_features(a_hip)
     wrist_features = build_imu_features(a_wrist)
-    hip_tokens = stage2.aligner.a_branch(hip_features)
-    wrist_tokens = stage2.aligner.omega_branch(wrist_features)
+    hip_tokens = stage2.aligner.hip_encoder(hip_features)
+    wrist_tokens = stage2.aligner.wrist_encoder(wrist_features)
     sensor_tokens, h_global = stage2.aligner(a_hip, a_wrist, gait_metrics=gait_metrics)
     z0 = stage1.encoder(skeleton, gait_metrics=gait_metrics)
 

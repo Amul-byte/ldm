@@ -21,12 +21,22 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+
+try:
+    from matplotlib import pyplot as plt
+except Exception:
+    plt = None
 
 from diffusion_model.dataset import create_dataset
 from diffusion_model.diffusion import extract
 from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM
 from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model  # noqa: E402
-from diffusion_model.model_loader import load_checkpoint
+from diffusion_model.model_loader import (
+    infer_graph_ops_from_checkpoint,
+    infer_temporal_block_type_from_checkpoint,
+    load_checkpoint,
+)
 from diffusion_model.training_eval import render_skeleton_panels, sample_stage3_latents
 from diffusion_model.util import (
     DEFAULT_JOINTS,
@@ -77,6 +87,109 @@ def project_latent_through_decoder_layers(
     return results
 
 
+def _latent_norm_map(z: torch.Tensor) -> np.ndarray:
+    return torch.linalg.norm(z.float(), dim=-1).cpu().numpy()
+
+
+def _safe_corrcoef(a: np.ndarray, b: np.ndarray) -> float:
+    a_flat = np.asarray(a, dtype=np.float32).reshape(-1)
+    b_flat = np.asarray(b, dtype=np.float32).reshape(-1)
+    if a_flat.size == 0 or b_flat.size == 0:
+        return float("nan")
+    if np.std(a_flat) < 1e-8 or np.std(b_flat) < 1e-8:
+        return float("nan")
+    return float(np.corrcoef(a_flat, b_flat)[0, 1])
+
+
+def _latent_pair_metrics(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float]:
+    ref = reference.float()
+    cand = candidate.float()
+    delta = cand - ref
+
+    ref_flat = ref.reshape(ref.shape[0], -1)
+    cand_flat = cand.reshape(cand.shape[0], -1)
+    ref_token = ref.reshape(-1, ref.shape[-1])
+    cand_token = cand.reshape(-1, cand.shape[-1])
+
+    ref_channel_mean = ref.mean(dim=(0, 1, 2))
+    cand_channel_mean = cand.mean(dim=(0, 1, 2))
+    ref_channel_std = ref.std(dim=(0, 1, 2), unbiased=False)
+    cand_channel_std = cand.std(dim=(0, 1, 2), unbiased=False)
+
+    delta_norm = torch.linalg.norm(delta, dim=-1)
+    ref_norm_map = torch.linalg.norm(ref, dim=-1)
+    cand_norm_map = torch.linalg.norm(cand, dim=-1)
+
+    ref_norm_mean = float(torch.linalg.norm(ref_flat, dim=1).mean().item())
+    cand_norm_mean = float(torch.linalg.norm(cand_flat, dim=1).mean().item())
+
+    return {
+        "mse": float(F.mse_loss(cand, ref).item()),
+        "mae": float(F.l1_loss(cand, ref).item()),
+        "delta_l2_mean": float(delta_norm.mean().item()),
+        "delta_l2_p95": float(torch.quantile(delta_norm.reshape(-1), 0.95).item()),
+        "token_cosine_mean": float(F.cosine_similarity(ref_token, cand_token, dim=-1).mean().item()),
+        "token_cosine_std": float(F.cosine_similarity(ref_token, cand_token, dim=-1).std(unbiased=False).item()),
+        "sample_cosine_mean": float(F.cosine_similarity(ref_flat, cand_flat, dim=-1).mean().item()),
+        "reference_norm_mean": ref_norm_mean,
+        "candidate_norm_mean": cand_norm_mean,
+        "norm_ratio": cand_norm_mean / max(ref_norm_mean, 1e-6),
+        "channel_mean_abs_diff": float(torch.mean(torch.abs(cand_channel_mean - ref_channel_mean)).item()),
+        "channel_std_abs_diff": float(torch.mean(torch.abs(cand_channel_std - ref_channel_std)).item()),
+        "norm_map_mae": float(torch.mean(torch.abs(cand_norm_map - ref_norm_map)).item()),
+        "norm_map_corr": _safe_corrcoef(ref_norm_map.cpu().numpy(), cand_norm_map.cpu().numpy()),
+    }
+
+
+def _write_latent_comparison_grid(
+    out_path: Path,
+    title: str,
+    reference_name: str,
+    reference: torch.Tensor,
+    comparisons: list[tuple[str, torch.Tensor]],
+    sample_index: int,
+) -> None:
+    if plt is None:
+        return
+
+    entries = [(reference_name, reference)] + comparisons
+    norm_maps = [
+        _latent_norm_map(tensor[sample_index : sample_index + 1])[0].T
+        for _, tensor in entries
+    ]
+    delta_maps = [np.zeros_like(norm_maps[0])]
+    for _, tensor in comparisons:
+        delta_map = _latent_norm_map((tensor - reference)[sample_index : sample_index + 1])[0].T
+        delta_maps.append(delta_map)
+
+    norm_vmax = max(float(arr.max()) for arr in norm_maps) if norm_maps else 1.0
+    delta_vmax = max([float(arr.max()) for arr in delta_maps[1:]] + [1.0])
+
+    fig, axes = plt.subplots(2, len(entries), figsize=(4.2 * len(entries), 7.2), constrained_layout=True)
+    if len(entries) == 1:
+        axes = np.asarray(axes).reshape(2, 1)
+
+    top_im = None
+    bottom_im = None
+    for col, (name, _) in enumerate(entries):
+        top_im = axes[0, col].imshow(norm_maps[col], aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=norm_vmax)
+        axes[0, col].set_title(name, fontsize=10)
+        axes[0, col].set_xlabel("Frame")
+        axes[0, col].set_ylabel("Joint" if col == 0 else "")
+
+        bottom_im = axes[1, col].imshow(delta_maps[col], aspect="auto", origin="lower", cmap="viridis", vmin=0.0, vmax=delta_vmax)
+        axes[1, col].set_xlabel("Frame")
+        axes[1, col].set_ylabel(f"Delta vs\n{reference_name}" if col == 0 else "")
+
+    if top_im is not None:
+        fig.colorbar(top_im, ax=list(axes[0, :]), shrink=0.8, pad=0.02, label="||z||2")
+    if bottom_im is not None:
+        fig.colorbar(bottom_im, ax=list(axes[1, :]), shrink=0.8, pad=0.02, label="||delta z||2")
+    fig.suptitle(title, fontsize=13)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description="End-to-end pipeline trace")
     parser.add_argument("--stage1_ckpt", type=str, required=True)
@@ -93,11 +206,11 @@ def main():
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW)
     parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument("--num_classes", type=int, default=DEFAULT_NUM_CLASSES)
-    parser.add_argument("--sample_steps", type=int, default=50)
+    parser.add_argument("--sample_steps", type=int, default=1000)
     parser.add_argument("--sampler", type=str, default="ddpm")
     parser.add_argument("--sample_seed", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--encoder_type", type=str, default="gcn")
+    parser.add_argument("--encoder_type", type=str, default="", help="Optional override; auto-inferred from stage1 ckpt when omitted")
     parser.add_argument("--sample_index", type=int, default=0, help="Which sample in the batch to plot")
     # Forward diffusion timesteps to visualize
     parser.add_argument(
@@ -114,17 +227,24 @@ def main():
     # Auto-infer dimensions from checkpoints
     latent_dim = args.latent_dim or _infer_latent_dim(args.stage1_ckpt)
     d_shared = args.d_shared or _infer_d_shared(args.stage2_ckpt)
-    graph_op = args.encoder_type
-    print(f"Config: latent_dim={latent_dim}, d_shared={d_shared}, graph_op={graph_op}")
+    encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(args.stage1_ckpt)
+    temporal_block_type = infer_temporal_block_type_from_checkpoint(args.stage1_ckpt)
+    graph_op = args.encoder_type or encoder_graph_op
+    print(
+        f"Config: latent_dim={latent_dim}, d_shared={d_shared}, "
+        f"encoder_graph_op={graph_op}, skeleton_graph_op={skeleton_graph_op}, "
+        f"temporal_block_type={temporal_block_type}"
+    )
 
     # ── Load models ──────────────────────────────────────────────────────
     print("Loading Stage 1...")
     stage1 = Stage1Model(
         latent_dim=latent_dim, num_joints=args.num_joints,
         num_classes=args.num_classes, timesteps=args.timesteps,
-        encoder_type=graph_op, skeleton_graph_op=graph_op,
+        encoder_type=graph_op, skeleton_graph_op=skeleton_graph_op,
         gait_metrics_dim=args.gait_metrics_dim,
         use_gait_conditioning=False,
+        temporal_block_type=temporal_block_type,
     ).to(device)
     load_checkpoint(args.stage1_ckpt, stage1, strict=False)
     stage1.eval()
@@ -185,23 +305,31 @@ def main():
         # STEP 2: Encoder → z0 (clean latent)
         # ════════════════════════════════════════════════════════════════
         z0_real = stage3.encoder(x, gait_metrics=None)
+        z0_real_norm = stage3.latent_normalizer.normalize(z0_real)
         z0_proj = project_latent_to_3d(z0_real, stage3.decoder)
         z0_proj_np = z0_proj[idx].cpu().numpy()
         print(f"[2] Encoder z0: shape={tuple(z0_real.shape)}, mean={z0_real.mean():.4f}, std={z0_real.std():.4f}")
         summary["z0_real"] = {"mean": float(z0_real.mean()), "std": float(z0_real.std())}
+        summary["z0_real_norm"] = {"mean": float(z0_real_norm.mean()), "std": float(z0_real_norm.std())}
 
         # ════════════════════════════════════════════════════════════════
         # STEP 3: Forward diffusion — noise z0 at various timesteps
         # ════════════════════════════════════════════════════════════════
-        noise = torch.randn_like(z0_real)
+        noise = torch.randn_like(z0_real_norm)
         noised_projections = {}
         print(f"\n[3] Forward diffusion (adding noise):")
         for t_val in args.noise_timesteps:
             t_tensor = torch.full((x.shape[0],), t_val, device=device, dtype=torch.long)
-            zt = stage3.diffusion.q_sample(z0=z0_real, t=t_tensor, noise=noise)
+            zt_norm = stage3.diffusion.q_sample(z0=z0_real_norm, t=t_tensor, noise=noise)
+            zt = stage3.latent_normalizer.denormalize(zt_norm)
             zt_proj = project_latent_to_3d(zt, stage3.decoder)
             noised_projections[t_val] = zt_proj[idx].cpu().numpy()
-            zt_stats = {"mean": float(zt.mean()), "std": float(zt.std())}
+            zt_stats = {
+                "mean": float(zt.mean()),
+                "std": float(zt.std()),
+                "mean_norm": float(zt_norm.mean()),
+                "std_norm": float(zt_norm.std()),
+            }
             print(f"    t={t_val:3d}: mean={zt_stats['mean']:.4f}, std={zt_stats['std']:.4f}")
             summary[f"zt_t{t_val}"] = zt_stats
 
@@ -229,30 +357,34 @@ def main():
         single_step_results = {}
         for t_val in [50, 250]:
             t_tensor = torch.full((x.shape[0],), t_val, device=device, dtype=torch.long)
-            zt = stage3.diffusion.q_sample(z0=z0_real, t=t_tensor, noise=noise)
+            zt_norm = stage3.diffusion.q_sample(z0=z0_real_norm, t=t_tensor, noise=noise)
 
             # WITH conditioning
             pred_noise_cond = stage3.denoiser(
-                zt, t_tensor, sensor_tokens=h_tokens_aug,
+                zt_norm, t_tensor, sensor_tokens=h_tokens_aug,
                 h_tokens=h_tokens_aug, h_global=h_global_aug, gait_metrics=None,
             )
-            sqrt_alpha = extract(stage3.diffusion.sqrt_alphas_cumprod, t_tensor, zt.shape)
-            sqrt_one_minus = extract(stage3.diffusion.sqrt_one_minus_alphas_cumprod, t_tensor, zt.shape)
-            z0_gen_cond = (zt - sqrt_one_minus * pred_noise_cond) / torch.clamp(sqrt_alpha, min=1e-20)
+            sqrt_alpha = extract(stage3.diffusion.sqrt_alphas_cumprod, t_tensor, zt_norm.shape)
+            sqrt_one_minus = extract(stage3.diffusion.sqrt_one_minus_alphas_cumprod, t_tensor, zt_norm.shape)
+            z0_gen_cond_norm = (zt_norm - sqrt_one_minus * pred_noise_cond) / torch.clamp(sqrt_alpha, min=1e-20)
+            z0_gen_cond = stage3.latent_normalizer.denormalize(z0_gen_cond_norm)
 
             # WITHOUT conditioning (zeros)
             h_zeros = torch.zeros_like(h_tokens_aug)
             h_global_zeros = torch.zeros_like(h_global_aug)
             pred_noise_uncond = stage3.denoiser(
-                zt, t_tensor, sensor_tokens=h_zeros,
+                zt_norm, t_tensor, sensor_tokens=h_zeros,
                 h_tokens=h_zeros, h_global=h_global_zeros, gait_metrics=None,
             )
-            z0_gen_uncond = (zt - sqrt_one_minus * pred_noise_uncond) / torch.clamp(sqrt_alpha, min=1e-20)
+            z0_gen_uncond_norm = (zt_norm - sqrt_one_minus * pred_noise_uncond) / torch.clamp(sqrt_alpha, min=1e-20)
+            z0_gen_uncond = stage3.latent_normalizer.denormalize(z0_gen_uncond_norm)
 
             z0_gen_cond_proj = project_latent_to_3d(z0_gen_cond, stage3.decoder)
             z0_gen_uncond_proj = project_latent_to_3d(z0_gen_uncond, stage3.decoder)
 
             single_step_results[t_val] = {
+                "cond_latent": z0_gen_cond,
+                "uncond_latent": z0_gen_uncond,
                 "cond_proj": z0_gen_cond_proj[idx].cpu().numpy(),
                 "uncond_proj": z0_gen_uncond_proj[idx].cpu().numpy(),
                 "cond_l2_to_z0": float(torch.linalg.norm(z0_gen_cond - z0_real, dim=-1).mean()),
@@ -296,6 +428,29 @@ def main():
         print(f"    WITHOUT conditioning: L2 to z0 = {uncond_l2:.4f}, mean={z0_diff_uncond.mean():.4f}, std={z0_diff_uncond.std():.4f}")
         summary["full_reverse_cond"] = {"l2_to_z0": cond_l2, "mean": float(z0_diff_cond.mean()), "std": float(z0_diff_cond.std())}
         summary["full_reverse_uncond"] = {"l2_to_z0": uncond_l2, "mean": float(z0_diff_uncond.mean()), "std": float(z0_diff_uncond.std())}
+
+        # ════════════════════════════════════════════════════════════════
+        # STEP 6B: Direct latent comparison — Stage1 z0 vs denoised latents
+        # ════════════════════════════════════════════════════════════════
+        latent_comparisons = {
+            "single_step_t50_cond": _latent_pair_metrics(z0_real, single_step_results[50]["cond_latent"]),
+            "single_step_t50_uncond": _latent_pair_metrics(z0_real, single_step_results[50]["uncond_latent"]),
+            "single_step_t250_cond": _latent_pair_metrics(z0_real, single_step_results[250]["cond_latent"]),
+            "single_step_t250_uncond": _latent_pair_metrics(z0_real, single_step_results[250]["uncond_latent"]),
+            "full_reverse_cond": _latent_pair_metrics(z0_real, z0_diff_cond),
+            "full_reverse_uncond": _latent_pair_metrics(z0_real, z0_diff_uncond),
+            "full_reverse_cond_vs_uncond": _latent_pair_metrics(z0_diff_uncond, z0_diff_cond),
+        }
+        summary["latent_comparisons"] = latent_comparisons
+        print("\n[6B] Latent comparison vs Stage-1 encoder z0:")
+        for name, metrics in latent_comparisons.items():
+            print(
+                f"    {name:26s} "
+                f"token_cos={metrics['token_cosine_mean']:.4f}  "
+                f"delta_l2={metrics['delta_l2_mean']:.4f}  "
+                f"norm_ratio={metrics['norm_ratio']:.4f}  "
+                f"std_diff={metrics['channel_std_abs_diff']:.4f}"
+            )
 
         # ════════════════════════════════════════════════════════════════
         # STEP 7: Decoder outputs
@@ -438,6 +593,46 @@ def main():
             titles_compare.append(f"diffused\n{trace_diff[li][0]}")
     render_skeleton_panels(out_dir / "07_decoder_trace_comparison.png", seqs_compare, titles_compare)
     print("  -> 07_decoder_trace_comparison.png")
+
+    # ── Plot 8: Latent comparison grids ────────────────────────────────
+    _write_latent_comparison_grid(
+        out_dir / "08_latent_comparison_conditioned.png",
+        "Stage-1 Encoder Latent vs Denoised Latents (Conditioned)",
+        "Stage1 z0",
+        z0_real,
+        [
+            ("1-step cond\nt=50", single_step_results[50]["cond_latent"]),
+            ("1-step cond\nt=250", single_step_results[250]["cond_latent"]),
+            ("full reverse\ncond", z0_diff_cond),
+        ],
+        sample_index=idx,
+    )
+    print("  -> 08_latent_comparison_conditioned.png")
+    _write_latent_comparison_grid(
+        out_dir / "09_latent_comparison_unconditioned.png",
+        "Stage-1 Encoder Latent vs Denoised Latents (Unconditioned)",
+        "Stage1 z0",
+        z0_real,
+        [
+            ("1-step uncond\nt=50", single_step_results[50]["uncond_latent"]),
+            ("1-step uncond\nt=250", single_step_results[250]["uncond_latent"]),
+            ("full reverse\nuncond", z0_diff_uncond),
+        ],
+        sample_index=idx,
+    )
+    print("  -> 09_latent_comparison_unconditioned.png")
+
+    np.savez_compressed(
+        out_dir / "latent_sample_comparison.npz",
+        z0_real=z0_real[idx].cpu().numpy().astype(np.float32),
+        z0_single_step_cond_t50=single_step_results[50]["cond_latent"][idx].cpu().numpy().astype(np.float32),
+        z0_single_step_uncond_t50=single_step_results[50]["uncond_latent"][idx].cpu().numpy().astype(np.float32),
+        z0_single_step_cond_t250=single_step_results[250]["cond_latent"][idx].cpu().numpy().astype(np.float32),
+        z0_single_step_uncond_t250=single_step_results[250]["uncond_latent"][idx].cpu().numpy().astype(np.float32),
+        z0_full_reverse_cond=z0_diff_cond[idx].cpu().numpy().astype(np.float32),
+        z0_full_reverse_uncond=z0_diff_uncond[idx].cpu().numpy().astype(np.float32),
+    )
+    print("  -> latent_sample_comparison.npz")
 
     # ── Save summary ─────────────────────────────────────────────────────
     summary_path = out_dir / "trace_summary.json"

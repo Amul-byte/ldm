@@ -37,7 +37,7 @@ except Exception:  # pragma: no cover - optional plotting dependency
 from diffusion_model.gait_metrics import GAIT_METRIC_NAMES, compute_gait_metrics_torch
 from diffusion_model.losses import motion_losses
 from diffusion_model.sensor_model import IMU_FEATURE_NAMES
-from diffusion_model.util import DEFAULT_NUM_CLASSES, get_skeleton_edges
+from diffusion_model.util import DEFAULT_NUM_CLASSES, JOINT_LABELS, SKELETON_LAYOUT_VERSION, get_skeleton_edges
 
 
 def ensure_dir(path: Path) -> Path:
@@ -61,6 +61,10 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
 
 def _sensor_name(path: str) -> str:
     return Path(path).name if path else ""
+
+
+def _short_joint_labels(labels: Sequence[str]) -> list[str]:
+    return ["".join(part[:2].title() for part in label.split("_"))[:4] for label in labels]
 
 
 def write_curve_plot(out_path: Path, title: str, x_values: Sequence[float], series: Sequence[tuple[str, Sequence[float], str]], x_label: str, y_label: str) -> None:
@@ -306,11 +310,17 @@ def _mean_within_class_scatter(features: np.ndarray, labels: np.ndarray) -> floa
     return float(np.mean(scatters)) if scatters else 0.0
 
 
-def render_skeleton_panels(out_path: Path, sequences: Sequence[np.ndarray], titles: Sequence[str]) -> None:
+def render_skeleton_panels(
+    out_path: Path,
+    sequences: Sequence[np.ndarray],
+    titles: Sequence[str],
+    label_joints: bool = True,
+) -> None:
     if plt is None or not sequences:
         return
     ensure_dir(out_path.parent)
     edges = [(i, j) for i, j in get_skeleton_edges() if i < sequences[0].shape[1] and j < sequences[0].shape[1]]
+    _short = _short_joint_labels(JOINT_LABELS)
     n = len(sequences)
     fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 5.5))
     axes = np.atleast_1d(axes)
@@ -327,7 +337,15 @@ def render_skeleton_panels(out_path: Path, sequences: Sequence[np.ndarray], titl
         ys = frame[:, 1]
         for i, j in edges:
             ax.plot([xs[i], xs[j]], [ys[i], ys[j]], color="#222", linewidth=1.6)
-        ax.scatter(xs, ys, s=20, color="#2563eb")
+        ax.scatter(xs, ys, s=20, color="#2563eb", zorder=5)
+        if label_joints:
+            num_joints = min(len(xs), len(_short))
+            for ji in range(num_joints):
+                ax.annotate(
+                    f"{ji}:{_short[ji]}", (xs[ji], ys[ji]),
+                    textcoords="offset points", xytext=(4, -4),
+                    fontsize=4.5, color="#555", zorder=6,
+                )
         ax.set_title(title)
         ax.set_aspect("equal")
         ax.set_xlim(0, 512)
@@ -756,6 +774,8 @@ def build_run_manifest(args, device: torch.device, runtime: dict[str, object] | 
             "sensor_locations": runtime.get("sensor_locations", [_sensor_name(args.hip_folder), _sensor_name(args.wrist_folder)]),
             "imu_feature_names": list(IMU_FEATURE_NAMES),
             "gait_metric_names": list(GAIT_METRIC_NAMES),
+            "joint_labels": list(JOINT_LABELS),
+            "skeleton_layout_version": SKELETON_LAYOUT_VERSION,
             "skeleton_scaling": "millimeters_to_meters",
             "sensor_normalization": False,
             "fps": args.fps,
@@ -773,6 +793,8 @@ def build_run_manifest(args, device: torch.device, runtime: dict[str, object] | 
             "lambda_pose": getattr(args, "lambda_pose", None),
             "lambda_latent": getattr(args, "lambda_latent", None),
             "lambda_vel": getattr(args, "lambda_vel", None),
+            "lambda_angle": getattr(args, "lambda_angle", None),
+            "lambda_angvel": getattr(args, "lambda_angvel", None),
             "lambda_motion": getattr(args, "lambda_motion", None),
             "lambda_gait": getattr(args, "lambda_gait", None),
         },
@@ -831,7 +853,7 @@ def sample_stage3_latents(
     )
     sampler_name = sampler.lower()
     if sampler_name == "ddim":
-        return stage3.diffusion.p_sample_loop_ddim(
+        z0_norm = stage3.diffusion.p_sample_loop_ddim(
             stage3.denoiser,
             shape=shape,
             device=device,
@@ -842,8 +864,8 @@ def sample_stage3_latents(
             gait_metrics=None,
             generator=generator,
         )
-    if sampler_name == "ddpm":
-        return stage3.diffusion.p_sample_loop(
+    elif sampler_name == "ddpm":
+        z0_norm = stage3.diffusion.p_sample_loop(
             stage3.denoiser,
             shape=shape,
             device=device,
@@ -852,7 +874,10 @@ def sample_stage3_latents(
             gait_metrics=None,
             generator=generator,
         )
-    raise ValueError(f"Unsupported sampler: {sampler}")
+    else:
+        raise ValueError(f"Unsupported sampler: {sampler}")
+    # Reverse process produces normalized latents; denormalize to encoder scale
+    return stage3.latent_normalizer.denormalize(z0_norm)
 
 
 def _mpjpe(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -943,9 +968,11 @@ def evaluate_stage1(model, loader, device: torch.device, out_dir: Path, timestep
                     "bone_length_drift": float(motion_losses(x_recon.float())["loss_bone"].item()),
                 }
             )
+            # Normalize z0 for noise prediction eval (matches training)
+            z0_norm = model.latent_normalizer.normalize(z0)
             t = torch.full((x.shape[0],), int(t_val), device=device, dtype=torch.long)
-            noise = torch.randn_like(z0)
-            zt = model.diffusion.q_sample(z0=z0, t=t, noise=noise)
+            noise = torch.randn_like(z0_norm)
+            zt = model.diffusion.q_sample(z0=z0_norm, t=t, noise=noise)
             pred_noise = model.denoiser(zt, t, gait_metrics=None)
             mse = torch.mean((pred_noise - noise) ** 2, dim=(1, 2, 3)).cpu().numpy()
             vals.extend(mse.tolist())

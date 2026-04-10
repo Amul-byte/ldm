@@ -144,9 +144,9 @@ class SensorGCNEncoder(nn.Module):
         self.norm1 = nn.LayerNorm(12)
         self.norm2 = nn.LayerNorm(12)
         self.norm3 = nn.LayerNorm(24)
-        self.drop1 = nn.Dropout(p=0.5)
-        self.drop2 = nn.Dropout(p=0.5)
-        self.drop3 = nn.Dropout(p=0.5)
+        self.drop1 = nn.Dropout(p=self.dropout)
+        self.drop2 = nn.Dropout(p=self.dropout)
+        self.drop3 = nn.Dropout(p=self.dropout)
         self.out_proj = nn.Linear(24, latent_dim)
         self._edge_cache: dict = {}
 

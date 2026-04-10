@@ -28,7 +28,7 @@ from diffusion_model.skeleton_model import (
     GraphEncoderGCN,
     SKELETON_FEATURE_DIM,
 )
-from diffusion_model.util import assert_shape
+from diffusion_model.util import DEFAULT_JOINTS, assert_shape, require_canonical_joint_count
 
 
 def _normalize_graph_op_name(graph_op: str | None, default: str = "gat") -> str:
@@ -41,8 +41,9 @@ def _normalize_graph_op_name(graph_op: str | None, default: str = "gat") -> str:
 class SkeletonTransformerClassifier(nn.Module):
     """Transformer classifier over decoded skeleton trajectories."""
 
-    def __init__(self, num_joints: int = 32, num_classes: int = 14, d_model: int = 256) -> None:
+    def __init__(self, num_joints: int = DEFAULT_JOINTS, num_classes: int = 14, d_model: int = 256) -> None:
         super().__init__()
+        require_canonical_joint_count(num_joints, "SkeletonTransformerClassifier")
         self.num_joints = num_joints
         self.num_classes = num_classes
         self.d_model = d_model
@@ -70,21 +71,84 @@ class SkeletonTransformerClassifier(nn.Module):
         return logits
 
 
+def _joint_corr_matrix(z: torch.Tensor) -> torch.Tensor:
+    """Compute mean pairwise joint correlation matrix [J, J] from z [B, T, J, D].
+
+    Always computed in float32 to avoid AMP float16 overflow in the
+    covariance / standard-deviation division.
+    """
+    z = z.float()                                                        # force fp32
+    b, t, j, d = z.shape
+    z_flat = z.reshape(b * t, j, d)                                     # [BT, J, D]
+    z_centered = z_flat - z_flat.mean(dim=2, keepdim=True)              # center over D
+    cov = torch.bmm(z_centered, z_centered.transpose(1, 2)) / d        # [BT, J, J]
+    std = z_centered.pow(2).sum(dim=2, keepdim=True).sqrt().clamp(min=1e-3)  # [BT, J, 1]
+    corr = cov / (std * std.transpose(1, 2))                            # [BT, J, J]
+    return corr.mean(dim=0).clamp(-1.0, 1.0)                            # [J, J]
+
+
+class LatentNormalizer(nn.Module):
+    """Normalize encoder latents to ~N(0,1) per dimension before diffusion.
+
+    Tracks running mean/var of z0 [B, T, J, D] across all non-D dims using
+    exponential moving average.  Stats are registered buffers so they persist
+    in state_dict and are automatically saved/loaded with checkpoints.
+    """
+
+    def __init__(self, latent_dim: int, momentum: float = 0.01, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.momentum = momentum
+        self.eps = eps
+        self.register_buffer("running_mean", torch.zeros(latent_dim))
+        self.register_buffer("running_var", torch.ones(latent_dim))
+        self.register_buffer("num_batches_tracked", torch.tensor(0, dtype=torch.long))
+
+    @property
+    def running_std(self) -> torch.Tensor:
+        return torch.sqrt(self.running_var + self.eps)
+
+    def _update_stats(self, z: torch.Tensor) -> None:
+        flat = z.detach().float().reshape(-1, self.latent_dim)
+        batch_mean = flat.mean(dim=0)
+        batch_var = flat.var(dim=0, unbiased=False)
+        self.num_batches_tracked += 1
+        momentum = 1.0 if self.num_batches_tracked.item() <= 1 else self.momentum
+        self.running_mean.mul_(1 - momentum).add_(batch_mean * momentum)
+        self.running_var.mul_(1 - momentum).add_(batch_var * momentum)
+
+    def normalize(self, z: torch.Tensor) -> torch.Tensor:
+        """Normalize z [B, T, J, D] to approximately N(0, I)."""
+        if self.training:
+            self._update_stats(z)
+        mean = self.running_mean.reshape(1, 1, 1, -1)
+        std = self.running_std.reshape(1, 1, 1, -1)
+        return (z - mean) / std
+
+    def denormalize(self, z: torch.Tensor) -> torch.Tensor:
+        """Map normalized latents back to encoder scale."""
+        mean = self.running_mean.reshape(1, 1, 1, -1)
+        std = self.running_std.reshape(1, 1, 1, -1)
+        return z * std + mean
+
+
 class Stage1Model(nn.Module):
     """Stage 1 model: skeleton latent diffusion pre-training."""
 
     def __init__(
         self,
         latent_dim: int = 256,
-        num_joints: int = 32,
+        num_joints: int = DEFAULT_JOINTS,
         timesteps: int = 500,
         gait_metrics_dim: int = 0,
         use_gait_conditioning: bool = True,
         num_classes: int = 14,
         encoder_type: str | None = None,
         skeleton_graph_op: str = "gat",
+        temporal_block_type: str = "conv",
     ) -> None:
         super().__init__()
+        require_canonical_joint_count(num_joints, "Stage1Model")
         self.latent_dim = latent_dim
         self.num_joints = num_joints
         self.num_classes = num_classes
@@ -107,9 +171,11 @@ class Stage1Model(nn.Module):
             num_joints=num_joints,
             gait_metrics_dim=gait_metrics_dim,
             use_gait_conditioning=self.use_gait_conditioning,
+            temporal_block_type=temporal_block_type,
         )
         self.decoder = decoder_cls(latent_dim=latent_dim, output_dim=3, num_joints=num_joints)
         self.diffusion = DiffusionProcess(timesteps=timesteps)
+        self.latent_normalizer = LatentNormalizer(latent_dim=latent_dim)
         # Auxiliary classification head — used only during Stage-1 training to
         # force discriminative latent structure; not used in Stage-2/3.
         self.cls_head = nn.Sequential(
@@ -127,19 +193,44 @@ class Stage1Model(nn.Module):
         """Compute stage-1 losses: diffusion + optional classification + variance regularizer."""
         assert_shape(x, [None, None, self.num_joints, 3], "Stage1Model.x")
         # Gait metrics no longer used as conditioning — only as eval/loss targets
-        z0 = self.encoder(x, gait_metrics=None)
+        z0_raw = self.encoder(x, gait_metrics=None)
+        z0 = self.latent_normalizer.normalize(z0_raw)
         t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
-        loss_diff = self.diffusion.predict_noise_loss(
-            self.denoiser,
-            z0,
-            t,
-            h_tokens=None,
-            h_global=None,
-            gait_metrics=None,
-        )
 
-        # Pool z0 over T and J → [B, D] for classification and variance losses
-        z_pooled = z0.mean(dim=(1, 2))
+        # Inline diffusion forward (matches Stage3Model pattern) so we can
+        # compute structural losses on the predicted clean latent z0_pred.
+        noise = torch.randn_like(z0)
+        zt = self.diffusion.q_sample(z0=z0, t=t, noise=noise)
+        pred_noise = self.denoiser(zt, t, h_tokens=None, h_global=None, gait_metrics=None)
+        loss_diff = F.mse_loss(pred_noise, noise)
+
+        # One-step z0 estimate from predicted noise.
+        # Compute entirely in float32 to avoid AMP float16 overflow — the
+        # division by sqrt_alpha (near zero for large t) and subsequent
+        # correlation / smoothness ops are numerically fragile in half precision.
+        with torch.cuda.amp.autocast(enabled=False):
+            _zt = zt.float()
+            _pred = pred_noise.float()
+            _z0 = z0.float()
+            sqrt_alpha = extract(self.diffusion.sqrt_alphas_cumprod, t, _zt.shape)
+            sqrt_one_minus = extract(self.diffusion.sqrt_one_minus_alphas_cumprod, t, _zt.shape)
+            z0_pred = (_zt - sqrt_one_minus * _pred) / sqrt_alpha.clamp(min=0.1)
+            z0_pred = z0_pred.clamp(-50.0, 50.0)
+
+            # Temporal smoothness: match the temporal smoothness of the real z0.
+            # Use Smooth-L1 to be robust to outliers from high-t estimates.
+            delta_pred = z0_pred[:, 1:] - z0_pred[:, :-1]
+            delta_real = (_z0[:, 1:] - _z0[:, :-1]).detach()
+            loss_temporal = F.smooth_l1_loss(delta_pred, delta_real)
+
+            # Joint correlation structure: push predicted z0 to match encoder z0's
+            # inter-joint correlations
+            corr_target = _joint_corr_matrix(_z0.detach())
+            corr_pred = _joint_corr_matrix(z0_pred)
+            loss_joint_corr = F.mse_loss(corr_pred, corr_target)
+
+        # Pool RAW z0 over T and J → [B, D] for classification and variance losses
+        z_pooled = z0_raw.mean(dim=(1, 2))
 
         # Classification loss: CE on pooled encoder latents
         if y is not None:
@@ -149,14 +240,16 @@ class Stage1Model(nn.Module):
 
         # Variance regulariser: penalise any latent dimension with var < 1
         # relu(1 - var) → 0 when spread out, positive when collapsed
-        var_per_dim = z_pooled.var(dim=0,unbiased=False)                        # [D]
+        var_per_dim = z_pooled.var(dim=0, unbiased=False)                       # [D]
         loss_var = torch.relu(1.0 - var_per_dim).mean()
 
         return {
             "loss_diff": loss_diff,
+            "loss_temporal": loss_temporal,
+            "loss_joint_corr": loss_joint_corr,
             "loss_cls": loss_cls,
             "loss_var": loss_var,
-            "z0": z0,
+            "z0": z0_raw,
         }
 
 
@@ -184,7 +277,7 @@ class Stage2Model(nn.Module):
         self,
         encoder: GraphEncoder,
         latent_dim: int = 256,
-        num_joints: int = 32,
+        num_joints: int = DEFAULT_JOINTS,
         gait_metrics_dim: int = 0,
         num_classes: int = 14,
         imu_graph_type: str = "chain",
@@ -192,6 +285,7 @@ class Stage2Model(nn.Module):
         stage2_dropout: float = 0.25,
     ) -> None:
         super().__init__()
+        require_canonical_joint_count(num_joints, "Stage2Model")
         self.latent_dim = latent_dim
         self.num_joints = num_joints
         self.gait_metrics_dim = gait_metrics_dim
@@ -314,8 +408,9 @@ class Stage3Model(nn.Module):
         encoder: GraphEncoder,
         decoder: GraphDecoder,
         denoiser: GraphDenoiserMasked,
+        latent_normalizer: LatentNormalizer | None = None,
         latent_dim: int = 256,
-        num_joints: int = 32,
+        num_joints: int = DEFAULT_JOINTS,
         num_classes: int = 14,
         timesteps: int = 500,
         gait_metrics_dim: int = 0,
@@ -324,6 +419,7 @@ class Stage3Model(nn.Module):
         shared_motion_layer: SharedMotionLayer | None = None,
     ) -> None:
         super().__init__()
+        require_canonical_joint_count(num_joints, "Stage3Model")
         self.latent_dim = latent_dim
         self.num_joints = num_joints
         self.gait_metrics_dim = gait_metrics_dim
@@ -332,6 +428,7 @@ class Stage3Model(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.denoiser = denoiser
+        self.latent_normalizer = latent_normalizer or LatentNormalizer(latent_dim=latent_dim)
         self.diffusion = DiffusionProcess(timesteps=timesteps)
         self.class_embed = nn.Embedding(num_classes, latent_dim)
         self.classifier = SkeletonTransformerClassifier(num_joints=num_joints, num_classes=num_classes, d_model=latent_dim)
@@ -343,6 +440,12 @@ class Stage3Model(nn.Module):
         self.shared_to_latent = nn.Linear(self.d_shared, latent_dim)
         nn.init.zeros_(self.shared_to_latent.weight)
         nn.init.zeros_(self.shared_to_latent.bias)
+
+    def train(self, mode: bool = True) -> "Stage3Model":
+        super().train(mode)
+        # Keep normalizer in eval: running stats are frozen from Stage 1
+        self.latent_normalizer.eval()
+        return self
 
     def condition_with_labels(
         self,
@@ -424,7 +527,8 @@ class Stage3Model(nn.Module):
             assert_shape(gait_target, [x.shape[0], self.gait_metrics_dim], "Stage3Model.gait_target")
 
         with torch.no_grad():
-            z0 = self.encoder(x, gait_metrics=None)
+            z0_raw = self.encoder(x, gait_metrics=None)
+            z0 = self.latent_normalizer.normalize(z0_raw)
 
         t = torch.randint(0, self.diffusion.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
         noise = torch.randn_like(z0)
@@ -442,25 +546,28 @@ class Stage3Model(nn.Module):
         sqrt_one_minus_alpha_bar_t = extract(self.diffusion.sqrt_one_minus_alphas_cumprod, t, zt.shape)
         z0_gen = (zt - sqrt_one_minus_alpha_bar_t * pred_noise) / torch.clamp(sqrt_alpha_bar_t, min=1e-20)
 
+        # Denormalize before decoder: decoder expects encoder-scale latents
+        z0_gen_denorm = self.latent_normalizer.denormalize(z0_gen)
+
         amp_off_ctx = (
             torch.autocast(device_type=x.device.type, enabled=False)
             if x.device.type in {"cuda", "cpu"}
             else nullcontext()
         )
         with amp_off_ctx:
-            x_hat = self.decoder(z0_gen.float())
+            x_hat = self.decoder(z0_gen_denorm.float())
         gait_gen = compute_gait_metrics_torch(x_hat.float(), fps=fps)
         loss_diff = F.mse_loss(pred_noise, noise)
         loss_latent = F.mse_loss(z0_gen, z0.detach())
         loss_pose = F.smooth_l1_loss(x_hat, x)
         loss_vel = F.smooth_l1_loss(x_hat[:, 1:] - x_hat[:, :-1], x[:, 1:] - x[:, :-1])
         loss_gait = F.mse_loss(gait_gen, gait_target) if gait_target is not None else torch.zeros((), device=x.device, dtype=x.dtype)
-        loss_terms = motion_losses(x_hat.float())
+        loss_terms = motion_losses(x_hat.float(), target=x.float())
 
         return {
             "x_hat": x_hat,
-            "z0_gen": z0_gen,
-            "z0_target": z0.detach(),
+            "z0_gen": z0_gen_denorm,
+            "z0_target": z0_raw.detach(),
             "gait_gen": gait_gen,
             "pred_noise": pred_noise,
             "noise": noise,

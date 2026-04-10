@@ -209,12 +209,14 @@ def _print_run_summary(args: argparse.Namespace, device: torch.device) -> None:
     LOGGER.info("One-to-one mode: %s", args.one_to_one)
     if args.stage == 3:
         LOGGER.info(
-            "Stage3 objective: lambda_pose=%s lambda_latent=%s lambda_vel=%s lambda_gait=%s lambda_motion=%s fps=%s sample_steps=%s d_shared=%s",
+            "Stage3 objective: lambda_pose=%s lambda_latent=%s lambda_vel=%s lambda_angle=%s lambda_angvel=%s lambda_gait=%s lambda_motion=%s fps=%s sample_steps=%s d_shared=%s",
             args.lambda_pose,
             args.lambda_latent,
             args.lambda_vel,
-            args.lambda_motion,
+            args.lambda_angle,
+            args.lambda_angvel,
             args.lambda_gait,
+            args.lambda_motion,
             args.fps,
             args.sample_steps,
             args.d_shared,
@@ -528,11 +530,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Skeleton graph family for decoder/denoiser and the default encoder choice. Leave empty to use checkpoint/default behavior.")
     parser.add_argument("--encoder_type", choices=["gat", "gcn"], default="gcn",
                         help="Deprecated encoder-only override. Use with --skeleton_graph_op gat to reproduce the old mixed GCN-encoder/GAT-decoder-denoiser ablation.")
+    parser.add_argument("--temporal_block_type", choices=["conv", "attention"], default="conv",
+                        help="Temporal block type for skeleton denoiser: 'conv' (kernel=3, local) or 'attention' (self-attention, global receptive field).")
     parser.add_argument("--imu_graph", choices=["chain", "multiscale"], default="multiscale",
                         help="IMU temporal graph type for Stage-2 encoder: 'chain' (j→j+1 only, simpler) or 'multiscale' (gaps 1,5,15,30, wider receptive field).")
     parser.add_argument("--lambda_cls", type=float, default=0.01, help="Weight for classification loss (Stage-3 only).")
     parser.add_argument("--lambda_cls_s1", type=float, default=0.1, help="Weight for classification loss in Stage-1 (discriminative latent training).")
     parser.add_argument("--lambda_var", type=float, default=0.01, help="Weight for variance regulariser in Stage-1 (prevents embedding collapse).")
+    parser.add_argument("--lambda_temporal_s1", type=float, default=0.1, help="Weight for temporal smoothness loss on predicted z0 in Stage-1.")
+    parser.add_argument("--lambda_joint_corr_s1", type=float, default=0.01, help="Weight for joint correlation structure loss in Stage-1.")
     parser.add_argument("--lambda_align", type=float, default=0.1, help="Weight for pooled IMU-vs-skeleton latent MSE in Stage-2 (weak auxiliary regulariser).")
     parser.add_argument("--lambda_cls_s2", type=float, default=1, help="Weight for CE classification loss in Stage-2.")
     parser.add_argument("--lambda_gait_s2", type=float, default=1, help="Weight for gait-metric prediction loss in Stage-2 (primary supervised signal).")
@@ -545,9 +551,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stage2_scheduler_patience", type=int, default=3, help="ReduceLROnPlateau patience for Stage-2.")
     parser.add_argument("--stage2_scheduler_factor", type=float, default=0.5, help="ReduceLROnPlateau multiplicative decay factor for Stage-2.")
     parser.add_argument("--stage2_scheduler_min_lr", type=float, default=1e-6, help="ReduceLROnPlateau minimum learning rate for Stage-2.")
-    parser.add_argument("--lambda_pose", type=float, default=1.0, help="Weight for paired skeleton reconstruction loss (Stage-3 only).")
+    parser.add_argument("--lambda_pose", type=float, default=0.0, help="Weight for paired skeleton reconstruction loss (Stage-3 only).")
     parser.add_argument("--lambda_latent", type=float, default=0.5, help="Weight for latent reconstruction loss (Stage-3 only).")
-    parser.add_argument("--lambda_vel", type=float, default=0.5, help="Weight for velocity reconstruction loss (Stage-3 only).")
+    parser.add_argument("--lambda_vel", type=float, default=0.0, help="Weight for velocity reconstruction loss (Stage-3 only).")
+    parser.add_argument("--lambda_angle", type=float, default=1.0, help="Weight for key-joint angle supervision plus soft angle-limit penalty (Stage-3 only).")
+    parser.add_argument("--lambda_angvel", type=float, default=1, help="Weight for key-joint angular-velocity matching loss (Stage-3 only).")
     parser.add_argument("--lambda_motion", type=float, default=1.0, help="Weight for motion regularization loss (Stage-3 only).")
     parser.add_argument("--lambda-gait", type=float, default=1.0, help="Weight for generated-vs-real gait-summary MSE loss (Stage-3 only).")
     parser.add_argument("--d_shared", type=int, default=64, help="Hidden dimension of the shared IMU/skeleton motion projection layer.")
@@ -575,6 +583,7 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         num_classes=args.num_classes,
         encoder_type=args.encoder_graph_op_resolved,
         skeleton_graph_op=args.skeleton_graph_op_resolved,
+        temporal_block_type=args.temporal_block_type,
     ).to(device)
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -628,6 +637,8 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         sum_diff = 0.0
         sum_cls  = 0.0
         sum_var  = 0.0
+        sum_temporal = 0.0
+        sum_joint_corr = 0.0
         sum_cls_correct = 0.0
         sum_cls_count = 0.0
         n_batches = 0
@@ -647,10 +658,14 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
                 out = model(x, gait_metrics=None, y=y)
                 loss = (
                     out["loss_diff"]
-                    + args.lambda_cls_s1 * out["loss_cls"]
-                    + args.lambda_var    * out["loss_var"]
+                    + args.lambda_cls_s1        * out["loss_cls"]
+                    + args.lambda_var            * out["loss_var"]
+                    + args.lambda_temporal_s1    * out["loss_temporal"]
+                    + args.lambda_joint_corr_s1  * out["loss_joint_corr"]
                 )
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             logits = _unwrap_model(model).cls_head(out["z0"].mean(dim=(1, 2)).float())
@@ -658,6 +673,8 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
             sum_diff += float(out["loss_diff"].item())
             sum_cls  += float(out["loss_cls"].item())
             sum_var  += float(out["loss_var"].item())
+            sum_temporal += float(out["loss_temporal"].item())
+            sum_joint_corr += float(out["loss_joint_corr"].item())
             sum_cls_correct += float((logits.argmax(dim=1) == y).sum().item())
             sum_cls_count += float(y.numel())
             n_batches += 1
@@ -666,7 +683,8 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
                     total=f"{sum_loss/n_batches:.4f}",
                     diff=f"{sum_diff/n_batches:.4f}",
                     cls=f"{sum_cls/n_batches:.4f}",
-                    var=f"{sum_var/n_batches:.4f}",
+                    tmp=f"{sum_temporal/n_batches:.4f}",
+                    jcr=f"{sum_joint_corr/n_batches:.4f}",
                 )
             elif _is_main_process() and (
                 n_batches == 1
@@ -674,19 +692,24 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
                 or n_batches == total_steps
             ):
                 LOGGER.info(
-                    "[Stage1] epoch=%s/%s step=%s/%s  total=%.4f  diff=%.4f  cls=%.4f  var=%.4f",
+                    "[Stage1] epoch=%s/%s step=%s/%s  total=%.4f  diff=%.4f  cls=%.4f  var=%.4f  tmp=%.4f  jcr=%.4f",
                     epoch + 1, args.epochs, n_batches, total_steps,
                     sum_loss / n_batches, sum_diff / n_batches,
                     sum_cls  / n_batches, sum_var  / n_batches,
+                    sum_temporal / n_batches, sum_joint_corr / n_batches,
                 )
-        avg_train_total = sum_loss / max(n_batches, 1)
-        avg_train_diff  = sum_diff / max(n_batches, 1)
-        avg_train_cls   = sum_cls  / max(n_batches, 1)
-        avg_train_var   = sum_var  / max(n_batches, 1)
-        avg_train_total = _sync_mean(avg_train_total, device)
-        avg_train_diff  = _sync_mean(avg_train_diff,  device)
-        avg_train_cls   = _sync_mean(avg_train_cls,   device)
-        avg_train_var   = _sync_mean(avg_train_var,   device)
+        avg_train_total      = sum_loss / max(n_batches, 1)
+        avg_train_diff       = sum_diff / max(n_batches, 1)
+        avg_train_cls        = sum_cls  / max(n_batches, 1)
+        avg_train_var        = sum_var  / max(n_batches, 1)
+        avg_train_temporal   = sum_temporal / max(n_batches, 1)
+        avg_train_joint_corr = sum_joint_corr / max(n_batches, 1)
+        avg_train_total      = _sync_mean(avg_train_total, device)
+        avg_train_diff       = _sync_mean(avg_train_diff,  device)
+        avg_train_cls        = _sync_mean(avg_train_cls,   device)
+        avg_train_var        = _sync_mean(avg_train_var,   device)
+        avg_train_temporal   = _sync_mean(avg_train_temporal, device)
+        avg_train_joint_corr = _sync_mean(avg_train_joint_corr, device)
         avg_train_acc_latent_cls = _sync_ratio(sum_cls_correct, sum_cls_count, device)
         avg_train_loss  = avg_train_total  # kept for checkpoint monitor compat
 
@@ -694,7 +717,7 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         avg_val_total = avg_val_diff = avg_val_cls = avg_val_var = avg_val_acc_latent_cls = None
         if val_loader is not None:
             model.eval()
-            val_sum = val_diff = val_cls = val_var = 0.0
+            val_sum = val_diff = val_cls = val_var = val_temporal = val_joint_corr = 0.0
             val_cls_correct = 0.0
             val_cls_count = 0.0
             val_n = 0
@@ -709,22 +732,28 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
                         out = model(x, gait_metrics=None, y=y)
                         loss = (
                             out["loss_diff"]
-                            + args.lambda_cls_s1 * out["loss_cls"]
-                            + args.lambda_var    * out["loss_var"]
+                            + args.lambda_cls_s1        * out["loss_cls"]
+                            + args.lambda_var            * out["loss_var"]
+                            + args.lambda_temporal_s1    * out["loss_temporal"]
+                            + args.lambda_joint_corr_s1  * out["loss_joint_corr"]
                         )
                     logits = _unwrap_model(model).cls_head(out["z0"].mean(dim=(1, 2)).float())
-                    val_sum  += float(loss.item())
-                    val_diff += float(out["loss_diff"].item())
-                    val_cls  += float(out["loss_cls"].item())
-                    val_var  += float(out["loss_var"].item())
+                    val_sum        += float(loss.item())
+                    val_diff       += float(out["loss_diff"].item())
+                    val_cls        += float(out["loss_cls"].item())
+                    val_var        += float(out["loss_var"].item())
+                    val_temporal   += float(out["loss_temporal"].item())
+                    val_joint_corr += float(out["loss_joint_corr"].item())
                     val_cls_correct += float((logits.argmax(dim=1) == y).sum().item())
                     val_cls_count += float(y.numel())
                     val_n += 1
             model.train()
-            avg_val_total = _sync_mean(val_sum  / max(val_n, 1), device)
-            avg_val_diff  = _sync_mean(val_diff / max(val_n, 1), device)
-            avg_val_cls   = _sync_mean(val_cls  / max(val_n, 1), device)
-            avg_val_var   = _sync_mean(val_var  / max(val_n, 1), device)
+            avg_val_total      = _sync_mean(val_sum  / max(val_n, 1), device)
+            avg_val_diff       = _sync_mean(val_diff / max(val_n, 1), device)
+            avg_val_cls        = _sync_mean(val_cls  / max(val_n, 1), device)
+            avg_val_var        = _sync_mean(val_var  / max(val_n, 1), device)
+            avg_val_temporal   = _sync_mean(val_temporal / max(val_n, 1), device)
+            avg_val_joint_corr = _sync_mean(val_joint_corr / max(val_n, 1), device)
             avg_val_acc_latent_cls = _sync_ratio(val_cls_correct, val_cls_count, device)
             avg_val_loss  = avg_val_total
 
@@ -733,6 +762,8 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
             "train_loss_diff":  avg_train_diff,
             "train_loss_cls":   avg_train_cls,
             "train_loss_var":   avg_train_var,
+            "train_loss_temporal":   avg_train_temporal,
+            "train_loss_joint_corr": avg_train_joint_corr,
             "train_acc_latent_cls": avg_train_acc_latent_cls,
         }
         if avg_val_total is not None:
@@ -740,6 +771,8 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
             metrics["val_loss_diff"]  = avg_val_diff
             metrics["val_loss_cls"]   = avg_val_cls
             metrics["val_loss_var"]   = avg_val_var
+            metrics["val_loss_temporal"]   = avg_val_temporal
+            metrics["val_loss_joint_corr"] = avg_val_joint_corr
             metrics["val_acc_latent_cls"] = avg_val_acc_latent_cls
         history.append({"epoch": float(epoch + 1), **metrics})
         if _is_main_process():
@@ -762,9 +795,10 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
         if _is_main_process() and monitor_loss < best_loss:
             best_loss = monitor_loss
             best_ckpt = os.path.join(args.save_dir, "stage1_best.pt")
+            _m = _unwrap_model(model)
             save_checkpoint(
                 best_ckpt,
-                _unwrap_model(model),
+                _m,
                 extra={
                     "best_monitor_loss": best_loss,
                     "best_monitor_name": "val_loss_total" if avg_val_loss is not None else "train_loss_total",
@@ -774,21 +808,26 @@ def train_stage1(args: argparse.Namespace, device: torch.device, distributed: bo
                     "gait_metric_names": list(GAIT_METRIC_NAMES),
                     "imu_feature_names": list(IMU_FEATURE_NAMES),
                     "run_dir": args.run_dir,
+                    "z0_running_mean": _m.latent_normalizer.running_mean.tolist(),
+                    "z0_running_std": _m.latent_normalizer.running_std.tolist(),
                 },
             )
             LOGGER.info("[Stage1] new best checkpoint: %s (epoch=%s monitor_loss=%.6f)", best_ckpt, epoch + 1, best_loss)
 
     if _is_main_process():
         ckpt = os.path.join(args.save_dir, "stage1.pt")
+        _m = _unwrap_model(model)
         save_checkpoint(
             ckpt,
-            _unwrap_model(model),
+            _m,
             extra={
                 "encoder_graph_op": args.encoder_graph_op_resolved,
                 "skeleton_graph_op": args.skeleton_graph_op_resolved,
                 "gait_metric_names": list(GAIT_METRIC_NAMES),
                 "imu_feature_names": list(IMU_FEATURE_NAMES),
                 "run_dir": args.run_dir,
+                "z0_running_mean": _m.latent_normalizer.running_mean.tolist(),
+                "z0_running_std": _m.latent_normalizer.running_std.tolist(),
             },
         )
         LOGGER.info("[Stage1] saved checkpoint: %s", ckpt)
@@ -806,6 +845,7 @@ def train_stage2(args: argparse.Namespace, device: torch.device, distributed: bo
         use_gait_conditioning=False,
         encoder_type=args.encoder_graph_op_resolved,
         skeleton_graph_op=args.skeleton_graph_op_resolved,
+        temporal_block_type=args.temporal_block_type,
     ).to(device)
     if args.stage1_ckpt:
         # strict=False: checkpoint may predate Stage-1 cls_head; only encoder weights matter here
@@ -1112,6 +1152,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         use_gait_conditioning=False,
         encoder_type=args.encoder_graph_op_resolved,
         skeleton_graph_op=args.skeleton_graph_op_resolved,
+        temporal_block_type=args.temporal_block_type,
     ).to(device)
     if args.stage1_ckpt:
         load_checkpoint(args.stage1_ckpt, stage1, strict=True)
@@ -1164,6 +1205,7 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         encoder=stage1.encoder,
         decoder=stage1.decoder,
         denoiser=stage1.denoiser,
+        latent_normalizer=stage1.latent_normalizer,
         latent_dim=args.latent_dim,
         num_joints=args.joints,
         num_classes=args.num_classes,
@@ -1232,12 +1274,15 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         sum_pose = 0.0
         sum_latent = 0.0
         sum_vel = 0.0
+        sum_angle = 0.0
+        sum_angvel = 0.0
         sum_gait = 0.0
         sum_motion = 0.0
         sum_bone = 0.0
         sum_skate = 0.0
         sum_smooth = 0.0
         sum_instab = 0.0
+        sum_angle_limit = 0.0
         n_batches = 0
         total_steps = len(train_loader)
         progress_enabled = _is_main_process() and sys.stdout.isatty()
@@ -1273,6 +1318,8 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                 loss_pose = out["loss_pose"]
                 loss_latent = out["loss_latent"]
                 loss_vel = out["loss_vel"]
+                loss_angle = out["loss_angle"]
+                loss_angvel = out["loss_angvel"]
                 loss_gait = out["loss_gait"]
                 loss_motion = out["loss_motion"]
                 loss_cls = F.cross_entropy(
@@ -1284,6 +1331,8 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     + args.lambda_pose   * loss_pose
                     + args.lambda_latent * loss_latent
                     + args.lambda_vel    * loss_vel
+                    + args.lambda_angle  * loss_angle
+                    + args.lambda_angvel * loss_angvel
                     + args.lambda_motion * loss_motion
                     + args.lambda_gait   * loss_gait
                 )
@@ -1296,12 +1345,15 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             sum_pose += float(loss_pose.item())
             sum_latent += float(loss_latent.item())
             sum_vel += float(loss_vel.item())
+            sum_angle += float(loss_angle.item())
+            sum_angvel += float(loss_angvel.item())
             sum_gait += float(loss_gait.item())
             sum_motion += float(loss_motion.item())
             sum_bone += float(out["loss_bone"].item())
             sum_skate += float(out["loss_skate"].item())
             sum_smooth += float(out["loss_smooth"].item())
             sum_instab += float(out["loss_instab"].item())
+            sum_angle_limit += float(out["loss_angle_limit"].item())
             n_batches += 1
             if tqdm is not None and progress_enabled:
                 pbar.set_postfix(
@@ -1337,24 +1389,30 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
         avg_train_pose = sum_pose / max(n_batches, 1)
         avg_train_latent = sum_latent / max(n_batches, 1)
         avg_train_vel = sum_vel / max(n_batches, 1)
+        avg_train_angle = sum_angle / max(n_batches, 1)
+        avg_train_angvel = sum_angvel / max(n_batches, 1)
         avg_train_gait = sum_gait / max(n_batches, 1)
         avg_train_motion = sum_motion / max(n_batches, 1)
         avg_train_bone = sum_bone / max(n_batches, 1)
         avg_train_skate = sum_skate / max(n_batches, 1)
         avg_train_smooth = sum_smooth / max(n_batches, 1)
         avg_train_instab = sum_instab / max(n_batches, 1)
+        avg_train_angle_limit = sum_angle_limit / max(n_batches, 1)
         avg_train_total = _sync_mean(avg_train_total, device)
         avg_train_diff = _sync_mean(avg_train_diff, device)
         avg_train_cls = _sync_mean(avg_train_cls, device)
         avg_train_pose = _sync_mean(avg_train_pose, device)
         avg_train_latent = _sync_mean(avg_train_latent, device)
         avg_train_vel = _sync_mean(avg_train_vel, device)
+        avg_train_angle = _sync_mean(avg_train_angle, device)
+        avg_train_angvel = _sync_mean(avg_train_angvel, device)
         avg_train_gait = _sync_mean(avg_train_gait, device)
         avg_train_motion = _sync_mean(avg_train_motion, device)
         avg_train_bone = _sync_mean(avg_train_bone, device)
         avg_train_skate = _sync_mean(avg_train_skate, device)
         avg_train_smooth = _sync_mean(avg_train_smooth, device)
         avg_train_instab = _sync_mean(avg_train_instab, device)
+        avg_train_angle_limit = _sync_mean(avg_train_angle_limit, device)
 
         avg_val_total = None
         avg_val_diff = None
@@ -1376,12 +1434,15 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             val_pose_sum = 0.0
             val_latent_sum = 0.0
             val_vel_sum = 0.0
+            val_angle_sum = 0.0
+            val_angvel_sum = 0.0
             val_gait_sum = 0.0
             val_motion_sum = 0.0
             val_bone_sum = 0.0
             val_skate_sum = 0.0
             val_smooth_sum = 0.0
             val_instab_sum = 0.0
+            val_angle_limit_sum = 0.0
             val_n = 0
             with torch.no_grad():
                 for batch_idx, batch in enumerate(val_loader):
@@ -1408,6 +1469,8 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                         val_loss_pose = out["loss_pose"]
                         val_loss_latent = out["loss_latent"]
                         val_loss_vel = out["loss_vel"]
+                        val_loss_angle = out["loss_angle"]
+                        val_loss_angvel = out["loss_angvel"]
                         val_loss_gait = out["loss_gait"]
                         val_loss_motion = out["loss_motion"]
                         val_loss_cls = F.cross_entropy(
@@ -1415,10 +1478,12 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                         )
                         val_total = (
                             val_loss_diff
-                            + val_loss_cls
+                            + args.lambda_cls    * val_loss_cls
                             + args.lambda_pose   * val_loss_pose
                             + args.lambda_latent * val_loss_latent
                             + args.lambda_vel    * val_loss_vel
+                            + args.lambda_angle  * val_loss_angle
+                            + args.lambda_angvel * val_loss_angvel
                             + args.lambda_motion * val_loss_motion
                             + args.lambda_gait   * val_loss_gait
                         )
@@ -1428,12 +1493,15 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
                     val_pose_sum += float(val_loss_pose.item())
                     val_latent_sum += float(val_loss_latent.item())
                     val_vel_sum += float(val_loss_vel.item())
+                    val_angle_sum += float(val_loss_angle.item())
+                    val_angvel_sum += float(val_loss_angvel.item())
                     val_gait_sum += float(val_loss_gait.item())
                     val_motion_sum += float(val_loss_motion.item())
                     val_bone_sum += float(out["loss_bone"].item())
                     val_skate_sum += float(out["loss_skate"].item())
                     val_smooth_sum += float(out["loss_smooth"].item())
                     val_instab_sum += float(out["loss_instab"].item())
+                    val_angle_limit_sum += float(out["loss_angle_limit"].item())
                     val_n += 1
             model.train()
             avg_val_total = _sync_mean(val_total_sum / max(val_n, 1), device)
@@ -1442,12 +1510,15 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             avg_val_pose = _sync_mean(val_pose_sum / max(val_n, 1), device)
             avg_val_latent = _sync_mean(val_latent_sum / max(val_n, 1), device)
             avg_val_vel = _sync_mean(val_vel_sum / max(val_n, 1), device)
+            avg_val_angle = _sync_mean(val_angle_sum / max(val_n, 1), device)
+            avg_val_angvel = _sync_mean(val_angvel_sum / max(val_n, 1), device)
             avg_val_gait = _sync_mean(val_gait_sum / max(val_n, 1), device)
             avg_val_motion = _sync_mean(val_motion_sum / max(val_n, 1), device)
             avg_val_bone = _sync_mean(val_bone_sum / max(val_n, 1), device)
             avg_val_skate = _sync_mean(val_skate_sum / max(val_n, 1), device)
             avg_val_smooth = _sync_mean(val_smooth_sum / max(val_n, 1), device)
             avg_val_instab = _sync_mean(val_instab_sum / max(val_n, 1), device)
+            avg_val_angle_limit = _sync_mean(val_angle_limit_sum / max(val_n, 1), device)
 
         metrics = {
             "train_loss_total":  avg_train_total,
@@ -1456,6 +1527,9 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             "train_loss_pose":   avg_train_pose,
             "train_loss_latent": avg_train_latent,
             "train_loss_vel":    avg_train_vel,
+            "train_loss_angle":  avg_train_angle,
+            "train_loss_angvel": avg_train_angvel,
+            "train_loss_angle_limit": avg_train_angle_limit,
             "train_loss_gait":   avg_train_gait,
             "train_loss_motion": avg_train_motion,
             "train_loss_bone":   avg_train_bone,
@@ -1468,6 +1542,9 @@ def train_stage3(args: argparse.Namespace, device: torch.device, distributed: bo
             metrics["val_loss_pose"]   = avg_val_pose
             metrics["val_loss_latent"] = avg_val_latent
             metrics["val_loss_vel"]    = avg_val_vel
+            metrics["val_loss_angle"]  = avg_val_angle
+            metrics["val_loss_angvel"] = avg_val_angvel
+            metrics["val_loss_angle_limit"] = avg_val_angle_limit
             metrics["val_loss_gait"]   = avg_val_gait
             metrics["val_loss_motion"] = avg_val_motion
             metrics["val_loss_bone"]   = avg_val_bone

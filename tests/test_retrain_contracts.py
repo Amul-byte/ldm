@@ -20,7 +20,12 @@ from diffusion_model.dataset import (
 )
 from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM, GAIT_CACHE_VERSION, GAIT_METRIC_NAMES, rotate_and_align_torch
 from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model
-from diffusion_model.model_loader import infer_graph_ops_from_checkpoint, save_checkpoint
+from diffusion_model.model_loader import (
+    infer_graph_ops_from_checkpoint,
+    infer_temporal_block_type_from_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+)
 from diffusion_model.shared_features import build_shared_motion_features, compute_skeleton_acceleration
 from diffusion_model.sensor_model import (
     IMU_FEATURE_NAMES,
@@ -47,9 +52,10 @@ from diffusion_model.training_eval import (
     write_classification_artifacts,
     write_history,
 )
+from diffusion_model.util import DEFAULT_JOINTS, SOURCE_JOINTS_32, get_joint_labels, get_source_joint_labels_32
 
 
-def _dummy_batch(batch_size: int = 2, frames: int = 32, joints: int = 32):
+def _dummy_batch(batch_size: int = 2, frames: int = 32, joints: int = DEFAULT_JOINTS):
     x = torch.randn(batch_size, frames, joints, 3)
     a_hip = torch.randn(batch_size, frames, 3)
     a_wrist = torch.randn(batch_size, frames, 3)
@@ -59,7 +65,7 @@ def _dummy_batch(batch_size: int = 2, frames: int = 32, joints: int = 32):
 
 
 class _EvalDummyDataset(Dataset):
-    def __init__(self, length: int = 4, frames: int = 8, joints: int = 32):
+    def __init__(self, length: int = 4, frames: int = 8, joints: int = DEFAULT_JOINTS):
         self.length = length
         self.frames = frames
         self.joints = joints
@@ -76,7 +82,7 @@ class _EvalDummyDataset(Dataset):
             "gait_metrics": torch.randn(DEFAULT_GAIT_METRICS_DIM),
             "label": torch.tensor(label, dtype=torch.long),
             "fps": torch.tensor(30.0),
-            "joint_labels": tuple(str(i) for i in range(self.joints)),
+            "joint_labels": get_joint_labels(),
         }
 
 
@@ -143,17 +149,40 @@ def test_subject_wise_split_keeps_subjects_disjoint():
 
 def test_torchfile_dataset_raises_when_label_is_missing():
     payload = {
-        "skeleton": torch.randn(2, 32, 32, 3),
+        "skeleton": torch.randn(2, 32, SOURCE_JOINTS_32, 3),
         "A_hip": torch.randn(2, 32, 3),
         "A_wrist": torch.randn(2, 32, 3),
         "gait_metrics": torch.randn(2, DEFAULT_GAIT_METRICS_DIM),
         "fps": 30,
-        "joint_labels": tuple(str(i) for i in range(32)),
+        "joint_labels": get_source_joint_labels_32(),
     }
     with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
         torch.save(payload, handle.name)
         with pytest.raises(ValueError, match="Missing required 'label'"):
-            TorchFileGaitDataset(handle.name, window=32, joints=32)
+            TorchFileGaitDataset(handle.name, window=32, joints=DEFAULT_JOINTS)
+
+
+def test_torchfile_dataset_projects_legacy_32_joint_payloads_to_canonical_16():
+    payload = {
+        "skeleton": torch.randn(2, 32, SOURCE_JOINTS_32, 3),
+        "A_hip": torch.randn(2, 32, 3),
+        "A_wrist": torch.randn(2, 32, 3),
+        "gait_metrics": torch.randn(2, DEFAULT_GAIT_METRICS_DIM),
+        "label": torch.tensor([1, 2], dtype=torch.long),
+        "fps": 30,
+        "joint_labels": get_source_joint_labels_32(),
+    }
+    with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
+        torch.save(payload, handle.name)
+        dataset = TorchFileGaitDataset(handle.name, window=32, joints=DEFAULT_JOINTS)
+    sample = dataset[0]
+    assert sample["skeleton"].shape == (32, DEFAULT_JOINTS, 3)
+    assert tuple(sample["joint_labels"]) == get_joint_labels()
+
+
+def test_torchfile_dataset_rejects_noncanonical_requested_joint_count():
+    with pytest.raises(ValueError, match="canonical 16-joint layout"):
+        TorchFileGaitDataset("/tmp/unused.pt", window=32, joints=SOURCE_JOINTS_32)
 
 
 def test_imu_feature_builder_outputs_expected_channels_and_finite_angles():
@@ -164,10 +193,11 @@ def test_imu_feature_builder_outputs_expected_channels_and_finite_angles():
     feats = build_imu_features(accel)
     assert feats.shape == (1, accel.shape[1], len(IMU_FEATURE_NAMES))
     assert torch.isfinite(feats).all()
-    assert torch.allclose(feats.mean(dim=1), torch.zeros_like(feats.mean(dim=1)), atol=1e-5)
+    assert torch.allclose(feats[..., :3], accel)
+    assert torch.all(feats[..., 3] > 0.0)
 
 
-def test_build_shared_motion_features_shapes_and_normalization():
+def test_build_shared_motion_features_shapes_and_expected_channels():
     accel = torch.tensor(
         [[[1.0, 2.0, 3.0], [2.5, -1.0, 0.5], [0.5, 0.25, -1.5], [-0.5, 1.0, 2.0], [1.5, 3.0, -0.75]]],
         dtype=torch.float32,
@@ -179,13 +209,10 @@ def test_build_shared_motion_features_shapes_and_normalization():
     assert feats_skel.shape == (1, accel.shape[1], 2, len(IMU_FEATURE_NAMES))
     assert torch.isfinite(feats_imu).all()
     assert torch.isfinite(feats_skel).all()
-    assert torch.allclose(feats_imu.mean(dim=1), torch.zeros_like(feats_imu.mean(dim=1)), atol=1e-5)
-    assert torch.allclose(feats_skel.mean(dim=1), torch.zeros_like(feats_skel.mean(dim=1)), atol=1e-5)
-    assert torch.allclose(
-        feats_imu.std(dim=1, unbiased=False),
-        torch.ones_like(feats_imu.std(dim=1, unbiased=False)),
-        atol=1e-4,
-    )
+    assert torch.allclose(feats_imu[..., :3], accel)
+    assert torch.allclose(feats_skel[:, :, 0, :], feats_skel[:, :, 1, :])
+    expected_mag = torch.linalg.norm(accel, dim=-1)
+    assert torch.allclose(feats_imu[..., 3], expected_mag, atol=1e-5)
 
 
 def test_compute_skeleton_acceleration_exact_shape_and_values():
@@ -203,27 +230,27 @@ def test_compute_skeleton_acceleration_exact_shape_and_values():
 
 
 def test_skeleton_graph_variants_have_shape_parity():
-    x, _, _, _, _ = _dummy_batch(batch_size=2, frames=8, joints=32)
+    x, _, _, _, _ = _dummy_batch(batch_size=2, frames=8, joints=DEFAULT_JOINTS)
     latent_dim = 32
     z = torch.randn(x.shape[0], x.shape[1], x.shape[2], latent_dim)
     t = torch.randint(0, 10, (x.shape[0],), dtype=torch.long)
     h_tokens = torch.randn(x.shape[0], x.shape[1], latent_dim)
     h_global = torch.randn(x.shape[0], latent_dim)
 
-    enc_gat = GraphEncoder(latent_dim=latent_dim, num_joints=32, depth=2)
-    enc_gcn = GraphEncoderGCN(latent_dim=latent_dim, num_joints=32, depth=2)
+    enc_gat = GraphEncoder(latent_dim=latent_dim, num_joints=DEFAULT_JOINTS, depth=2)
+    enc_gcn = GraphEncoderGCN(latent_dim=latent_dim, num_joints=DEFAULT_JOINTS, depth=2)
     z_gat = enc_gat(x)
     z_gcn = enc_gcn(x)
-    assert z_gat.shape == z_gcn.shape == (x.shape[0], x.shape[1], x.shape[2], latent_dim)
+    assert z_gat.shape == z_gcn.shape == (x.shape[0], x.shape[1], DEFAULT_JOINTS, latent_dim)
 
-    dec_gat = GraphDecoder(latent_dim=latent_dim, num_joints=32, depth=2)
-    dec_gcn = GraphDecoderGCN(latent_dim=latent_dim, num_joints=32, depth=2)
+    dec_gat = GraphDecoder(latent_dim=latent_dim, num_joints=DEFAULT_JOINTS, depth=2)
+    dec_gcn = GraphDecoderGCN(latent_dim=latent_dim, num_joints=DEFAULT_JOINTS, depth=2)
     x_hat_gat = dec_gat(z)
     x_hat_gcn = dec_gcn(z)
     assert x_hat_gat.shape == x_hat_gcn.shape == x.shape
 
-    den_gat = GraphDenoiserMasked(latent_dim=latent_dim, num_joints=32, depth=2)
-    den_gcn = GraphDenoiserMaskedGCN(latent_dim=latent_dim, num_joints=32, depth=2)
+    den_gat = GraphDenoiserMasked(latent_dim=latent_dim, num_joints=DEFAULT_JOINTS, depth=2)
+    den_gcn = GraphDenoiserMaskedGCN(latent_dim=latent_dim, num_joints=DEFAULT_JOINTS, depth=2)
     eps_gat = den_gat(z, t, h_tokens=h_tokens, h_global=h_global)
     eps_gcn = den_gcn(z, t, h_tokens=h_tokens, h_global=h_global)
     assert eps_gat.shape == eps_gcn.shape == z.shape
@@ -235,20 +262,55 @@ def test_skeleton_graph_variants_have_shape_parity():
     assert torch.isfinite(eps_gcn).all()
 
 
+def test_denoiser_temporal_attention_smoke():
+    """Verify temporal attention denoiser produces correct shapes and finite values."""
+    latent_dim = 32
+    z = torch.randn(2, 8, DEFAULT_JOINTS, latent_dim)
+    t = torch.randint(0, 10, (2,), dtype=torch.long)
+    h_tokens = torch.randn(2, 8, latent_dim)
+    h_global = torch.randn(2, latent_dim)
+
+    den = GraphDenoiserMasked(latent_dim=latent_dim, num_joints=DEFAULT_JOINTS, depth=2, temporal_block_type="attention")
+    eps = den(z, t, h_tokens=h_tokens, h_global=h_global)
+    assert eps.shape == z.shape
+    assert torch.isfinite(eps).all()
+
+    den_gcn = GraphDenoiserMaskedGCN(latent_dim=latent_dim, num_joints=DEFAULT_JOINTS, depth=2, temporal_block_type="attention")
+    eps_gcn = den_gcn(z, t, h_tokens=h_tokens, h_global=h_global)
+    assert eps_gcn.shape == z.shape
+    assert torch.isfinite(eps_gcn).all()
+
+
+def test_stage1_temporal_attention_losses_finite():
+    """Verify Stage1Model with temporal attention produces finite losses."""
+    x, _, _, gait, _ = _dummy_batch()
+    stage1 = Stage1Model(
+        latent_dim=32, num_joints=DEFAULT_JOINTS, timesteps=10,
+        gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
+        use_gait_conditioning=False,
+        temporal_block_type="attention",
+    )
+    out = stage1(x, gait_metrics=gait)
+    for key in ["loss_diff", "loss_temporal", "loss_joint_corr", "loss_cls", "loss_var"]:
+        assert torch.isfinite(out[key]), f"{key} is not finite"
+
+
 def test_stage_forward_smoke_losses_are_finite():
     x, a_hip, a_wrist, gait, y = _dummy_batch()
 
     stage1 = Stage1Model(
         latent_dim=32,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
         use_gait_conditioning=False,
     )
     out1 = stage1(x, gait_metrics=gait)
     assert torch.isfinite(out1["loss_diff"])
+    assert torch.isfinite(out1["loss_temporal"])
+    assert torch.isfinite(out1["loss_joint_corr"])
 
-    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=32, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=DEFAULT_JOINTS, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
     out2 = stage2(x=x, a_hip_stream=a_hip, a_wrist_stream=a_wrist, gait_metrics=gait)
     assert torch.isfinite(out2["loss_align"])
     assert torch.isfinite(out2["loss_feature"])
@@ -257,8 +319,9 @@ def test_stage_forward_smoke_losses_are_finite():
         encoder=stage1.encoder,
         decoder=stage1.decoder,
         denoiser=stage1.denoiser,
+        latent_normalizer=stage1.latent_normalizer,
         latent_dim=32,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         num_classes=14,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
@@ -274,10 +337,29 @@ def test_stage_forward_smoke_losses_are_finite():
         a_hip_stream=a_hip,
         a_wrist_stream=a_wrist,
     )
-    for key in ["loss_diff", "loss_pose", "loss_latent", "loss_vel", "loss_gait", "loss_motion", "loss_bone", "loss_skate", "loss_smooth", "loss_instab"]:
+    for key in [
+        "loss_diff",
+        "loss_pose",
+        "loss_latent",
+        "loss_vel",
+        "loss_angle",
+        "loss_angvel",
+        "loss_angle_limit",
+        "loss_gait",
+        "loss_motion",
+        "loss_bone",
+        "loss_skate",
+        "loss_smooth",
+        "loss_instab",
+    ]:
         assert torch.isfinite(out3[key]), key
     assert out3["gait_gen"].shape == (x.shape[0], DEFAULT_GAIT_METRICS_DIM)
     assert out3["z0_target"].shape == out3["z0_gen"].shape
+
+
+def test_stage_models_reject_noncanonical_joint_count():
+    with pytest.raises(ValueError, match="canonical 16-joint layout"):
+        Stage1Model(latent_dim=16, num_joints=SOURCE_JOINTS_32, timesteps=10, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
 
 
 def test_stage_forward_smoke_losses_are_finite_full_gcn():
@@ -285,7 +367,7 @@ def test_stage_forward_smoke_losses_are_finite_full_gcn():
 
     stage1 = Stage1Model(
         latent_dim=32,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
         use_gait_conditioning=False,
@@ -296,16 +378,19 @@ def test_stage_forward_smoke_losses_are_finite_full_gcn():
     assert isinstance(stage1.denoiser, GraphDenoiserMaskedGCN)
     out1 = stage1(x, gait_metrics=gait)
     assert torch.isfinite(out1["loss_diff"])
+    assert torch.isfinite(out1["loss_temporal"])
+    assert torch.isfinite(out1["loss_joint_corr"])
 
-    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=32, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=DEFAULT_JOINTS, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
     out2 = stage2(x=x, a_hip_stream=a_hip, a_wrist_stream=a_wrist, gait_metrics=gait)
 
     stage3 = Stage3Model(
         encoder=stage1.encoder,
         decoder=stage1.decoder,
         denoiser=stage1.denoiser,
+        latent_normalizer=stage1.latent_normalizer,
         latent_dim=32,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         num_classes=14,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
@@ -323,6 +408,8 @@ def test_stage_forward_smoke_losses_are_finite_full_gcn():
     )
     assert torch.isfinite(out3["loss_diff"])
     assert torch.isfinite(out3["loss_pose"])
+    assert torch.isfinite(out3["loss_angle"])
+    assert torch.isfinite(out3["loss_angvel"])
 
 
 def test_stage1_supports_partial_gcn_encoder_override():
@@ -336,18 +423,19 @@ def test_stage3_sampling_is_deterministic_for_fixed_seed():
     x, a_hip, a_wrist, gait, _ = _dummy_batch(batch_size=1)
     stage1 = Stage1Model(
         latent_dim=32,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
         use_gait_conditioning=False,
     )
-    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=32, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=DEFAULT_JOINTS, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
     stage3 = Stage3Model(
         encoder=stage1.encoder,
         decoder=stage1.decoder,
         denoiser=stage1.denoiser,
+        latent_normalizer=stage1.latent_normalizer,
         latent_dim=32,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         num_classes=14,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
@@ -380,13 +468,44 @@ def test_checkpoint_graph_metadata_and_inference():
     assert skeleton_graph_op == "gcn"
 
 
-def test_checkpoint_graph_inference_supports_old_partial_variant_without_metadata():
+def test_checkpoint_temporal_block_type_inference_from_state_dict():
+    stage1 = Stage1Model(latent_dim=32, skeleton_graph_op="gcn", temporal_block_type="attention")
+    with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
+        save_checkpoint(
+            handle.name,
+            stage1,
+            extra={
+                "encoder_graph_op": stage1.encoder_graph_op,
+                "skeleton_graph_op": stage1.skeleton_graph_op,
+            },
+        )
+        temporal_block_type = infer_temporal_block_type_from_checkpoint(handle.name)
+    assert temporal_block_type == "attention"
+
+
+def test_load_checkpoint_rejects_legacy_32_joint_layout_metadata():
+    stage1 = Stage1Model(latent_dim=32, skeleton_graph_op="gcn")
+    bad_payload = {
+        "state_dict": stage1.state_dict(),
+        "extra": {
+            "skeleton_layout_version": "legacy_32j",
+            "num_joints": 32,
+            "encoder_graph_op": stage1.encoder_graph_op,
+            "skeleton_graph_op": stage1.skeleton_graph_op,
+        },
+    }
+    with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
+        torch.save(bad_payload, handle.name)
+        with pytest.raises(ValueError, match="incompatible skeleton layout"):
+            load_checkpoint(handle.name, stage1, strict=False)
+
+
+def test_checkpoint_graph_inference_rejects_missing_layout_metadata():
     stage1 = Stage1Model(latent_dim=32, skeleton_graph_op="gat", encoder_type="gcn")
     with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
         torch.save({"state_dict": stage1.state_dict()}, handle.name)
-        encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(handle.name)
-    assert encoder_graph_op == "gcn"
-    assert skeleton_graph_op == "gat"
+        with pytest.raises(ValueError, match="incompatible skeleton layout"):
+            infer_graph_ops_from_checkpoint(handle.name)
 
 
 def test_imu_graph_adjacency_shape_and_edges():
@@ -445,18 +564,19 @@ def test_stage3_augment_conditioning_is_noop_without_or_before_shared_signal():
     x, a_hip, a_wrist, gait, _ = _dummy_batch(batch_size=1)
     stage1 = Stage1Model(
         latent_dim=32,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
         use_gait_conditioning=False,
     )
-    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=32, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=32, num_joints=DEFAULT_JOINTS, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
     stage3 = Stage3Model(
         encoder=stage1.encoder,
         decoder=stage1.decoder,
         denoiser=stage1.denoiser,
+        latent_normalizer=stage1.latent_normalizer,
         latent_dim=32,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         num_classes=14,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
@@ -476,7 +596,7 @@ def test_stage3_augment_conditioning_is_noop_without_or_before_shared_signal():
 
 
 def test_rotate_and_align_torch_handles_degenerate_sequences():
-    pose = torch.zeros(90, 32, 3)
+    pose = torch.zeros(90, DEFAULT_JOINTS, 3)
     aligned = rotate_and_align_torch(pose)
     assert aligned.shape == (90, 16, 3)
     assert torch.isfinite(aligned).all()
@@ -523,7 +643,7 @@ def test_stage1_evaluator_writes_latent_classifier_artifacts():
     loader = DataLoader(_EvalDummyDataset(length=4, frames=8), batch_size=2, shuffle=False)
     stage1 = Stage1Model(
         latent_dim=16,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
         use_gait_conditioning=False,
@@ -539,7 +659,7 @@ def test_stage2_lightweight_evaluator_writes_classifier_and_gait_reports():
     loader = DataLoader(_EvalDummyDataset(length=4, frames=8), batch_size=2, shuffle=False)
     stage1 = Stage1Model(
         latent_dim=16,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
         use_gait_conditioning=False,
@@ -547,7 +667,7 @@ def test_stage2_lightweight_evaluator_writes_classifier_and_gait_reports():
     stage2 = Stage2Model(
         encoder=stage1.encoder,
         latent_dim=16,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
     )
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -586,11 +706,11 @@ def test_stage2_optimizer_and_scheduler_use_stage2_specific_defaults():
     import train as train_module
 
     args = train_module.parse_args(["--stage", "2"])
-    stage1 = Stage1Model(latent_dim=16, num_joints=32, timesteps=10, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage1 = Stage1Model(latent_dim=16, num_joints=DEFAULT_JOINTS, timesteps=10, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
     stage2 = Stage2Model(
         encoder=stage1.encoder,
         latent_dim=16,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
         stage2_dropout=args.stage2_dropout,
     )
@@ -647,8 +767,8 @@ def test_stage2_checkpoint_metadata_saves_sensor_locations():
     args.run_dir = "outputs/test_stage2"
     metadata = train_module._stage2_checkpoint_metadata(args)
 
-    stage1 = Stage1Model(latent_dim=16, num_joints=32, timesteps=10, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
-    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=16, num_joints=32, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage1 = Stage1Model(latent_dim=16, num_joints=DEFAULT_JOINTS, timesteps=10, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
+    stage2 = Stage2Model(encoder=stage1.encoder, latent_dim=16, num_joints=DEFAULT_JOINTS, gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM)
     with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
         save_checkpoint(handle.name, stage2, extra=metadata)
         payload = torch.load(handle.name, map_location="cpu")
@@ -676,7 +796,7 @@ def test_stage3_evaluator_writes_eval_history_and_classifier_reports():
     loader = DataLoader(_EvalDummyDataset(length=4, frames=8), batch_size=2, shuffle=False)
     stage1 = Stage1Model(
         latent_dim=16,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
         use_gait_conditioning=False,
@@ -684,15 +804,16 @@ def test_stage3_evaluator_writes_eval_history_and_classifier_reports():
     stage2 = Stage2Model(
         encoder=stage1.encoder,
         latent_dim=16,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
     )
     stage3 = Stage3Model(
         encoder=stage1.encoder,
         decoder=stage1.decoder,
         denoiser=stage1.denoiser,
+        latent_normalizer=stage1.latent_normalizer,
         latent_dim=16,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         num_classes=14,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
@@ -724,7 +845,7 @@ def test_stage3_per_class_accuracy_uses_raw_real_skeletons_for_real_accuracy():
     loader = DataLoader(_EvalDummyDataset(length=4, frames=8), batch_size=2, shuffle=False)
     stage1 = Stage1Model(
         latent_dim=16,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
         use_gait_conditioning=False,
@@ -732,15 +853,16 @@ def test_stage3_per_class_accuracy_uses_raw_real_skeletons_for_real_accuracy():
     stage2 = Stage2Model(
         encoder=stage1.encoder,
         latent_dim=16,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
     )
     stage3 = Stage3Model(
         encoder=stage1.encoder,
         decoder=stage1.decoder,
         denoiser=stage1.denoiser,
+        latent_normalizer=stage1.latent_normalizer,
         latent_dim=16,
-        num_joints=32,
+        num_joints=DEFAULT_JOINTS,
         num_classes=14,
         timesteps=10,
         gait_metrics_dim=DEFAULT_GAIT_METRICS_DIM,
@@ -767,3 +889,41 @@ def test_stage3_per_class_accuracy_uses_raw_real_skeletons_for_real_accuracy():
             manual_correct += int((pred_real == y).sum().item())
             manual_total += int(y.numel())
         assert result["overall_real_acc"] == pytest.approx(manual_correct / max(manual_total, 1))
+
+
+# ── LatentNormalizer tests ──────────────────────────────────────────
+
+
+def test_latent_normalizer_normalize_denormalize_roundtrip():
+    from diffusion_model.model import LatentNormalizer
+    norm = LatentNormalizer(latent_dim=32)
+    norm.train()
+    z = torch.randn(2, 8, DEFAULT_JOINTS, 32) * 5 + 3  # mean=3, std=5
+    z_n = norm.normalize(z)
+    z_back = norm.denormalize(z_n)
+    assert torch.allclose(z, z_back, atol=1e-4)
+    assert abs(z_n.mean().item()) < 0.5
+    assert abs(z_n.std().item() - 1.0) < 0.5
+    # After eval, stats frozen — different input still round-trips
+    norm.eval()
+    z2 = torch.randn(2, 8, DEFAULT_JOINTS, 32) * 10
+    z2_back = norm.denormalize(norm.normalize(z2))
+    assert torch.allclose(z2, z2_back, atol=1e-4)
+
+
+def test_latent_normalizer_buffers_in_state_dict():
+    from diffusion_model.model import LatentNormalizer
+    norm = LatentNormalizer(latent_dim=16)
+    norm.train()
+    z = torch.randn(2, 4, 8, 16) * 3
+    norm.normalize(z)  # trigger stats update
+    sd = norm.state_dict()
+    assert "running_mean" in sd
+    assert "running_var" in sd
+    assert "num_batches_tracked" in sd
+    assert sd["num_batches_tracked"].item() == 1
+    # Load into fresh normalizer
+    norm2 = LatentNormalizer(latent_dim=16)
+    norm2.load_state_dict(sd)
+    assert torch.allclose(norm.running_mean, norm2.running_mean)
+    assert torch.allclose(norm.running_var, norm2.running_var)

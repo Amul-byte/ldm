@@ -31,7 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from diffusion_model.dataset import create_dataset
 from diffusion_model.gait_metrics import DEFAULT_GAIT_METRICS_DIM
 from diffusion_model.model import Stage1Model, Stage2Model, Stage3Model
-from diffusion_model.model_loader import infer_graph_ops_from_checkpoint, load_checkpoint
+from diffusion_model.model_loader import (
+    infer_graph_ops_from_checkpoint,
+    infer_temporal_block_type_from_checkpoint,
+    load_checkpoint,
+)
 from diffusion_model.training_eval import (
     _mpjpe,
     _root_trajectory_error,
@@ -213,6 +217,7 @@ def main() -> None:
     _ensure_dir(out_dir)
 
     encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(args.stage1_ckpt)
+    temporal_block_type = infer_temporal_block_type_from_checkpoint(args.stage1_ckpt)
     latent_dim = args.latent_dim or _infer_latent_dim(args.stage1_ckpt)
     d_shared = args.d_shared or (_infer_d_shared(args.stage2_ckpt) if args.stage2_ckpt else 64)
     print(
@@ -221,6 +226,7 @@ def main() -> None:
         f"d_shared={d_shared}",
         f"encoder_graph_op={encoder_graph_op}",
         f"skeleton_graph_op={skeleton_graph_op}",
+        f"temporal_block_type={temporal_block_type}",
     )
 
     stage1_before = Stage1Model(
@@ -232,6 +238,7 @@ def main() -> None:
         num_classes=args.num_classes,
         encoder_type=encoder_graph_op,
         skeleton_graph_op=skeleton_graph_op,
+        temporal_block_type=temporal_block_type,
     ).to(device)
     load_checkpoint(args.stage1_ckpt, stage1_before, strict=False)
     stage1_before.eval()
@@ -245,6 +252,7 @@ def main() -> None:
         num_classes=args.num_classes,
         encoder_type=encoder_graph_op,
         skeleton_graph_op=skeleton_graph_op,
+        temporal_block_type=temporal_block_type,
     ).to(device)
     load_checkpoint(args.stage1_ckpt, stage1_for_stage3, strict=False)
     stage1_for_stage3.eval()

@@ -22,9 +22,13 @@ from diffusion_model.util import (
     DEFAULT_FPS,
     DEFAULT_JOINTS,
     DEFAULT_NUM_CLASSES,
+    SOURCE_JOINTS_32,
     DEFAULT_WINDOW,
     assert_shape,
     get_joint_labels,
+    project_skeleton_to_canonical_numpy,
+    project_skeleton_to_canonical_torch,
+    require_canonical_joint_count,
     validate_joint_labels,
 )
 
@@ -145,14 +149,24 @@ def read_csv_files(folder: Optional[str]) -> Dict[str, pd.DataFrame]:
 
 
 def _skeleton_frame_to_joints(frame_block: np.ndarray, joints: int = DEFAULT_JOINTS) -> np.ndarray:
-    """Convert [T,96] or [T,97] skeleton rows into [T, J, 3]."""
+    """Convert raw skeleton CSV rows into canonical [T, 16, 3] joint tensors."""
     if frame_block.ndim != 2:
         raise ValueError(f"Skeleton input must be 2D, got {frame_block.shape}")
-    if frame_block.shape[1] == joints * 3 + 1:
+    if frame_block.shape[1] in {SOURCE_JOINTS_32 * 3 + 1, DEFAULT_JOINTS * 3 + 1}:
         frame_block = frame_block[:, 1:]
-    if frame_block.shape[1] != joints * 3:
-        raise ValueError(f"Expected {joints * 3} skeleton columns, got {frame_block.shape[1]}")
-    return frame_block.reshape(frame_block.shape[0], joints, 3).astype(np.float32) / 1000.0
+    if frame_block.shape[1] == SOURCE_JOINTS_32 * 3:
+        pose = frame_block.reshape(frame_block.shape[0], SOURCE_JOINTS_32, 3).astype(np.float32) / 1000.0
+    elif frame_block.shape[1] == DEFAULT_JOINTS * 3:
+        pose = frame_block.reshape(frame_block.shape[0], DEFAULT_JOINTS, 3).astype(np.float32) / 1000.0
+    else:
+        raise ValueError(
+            f"Expected {SOURCE_JOINTS_32 * 3}/{SOURCE_JOINTS_32 * 3 + 1} or "
+            f"{DEFAULT_JOINTS * 3}/{DEFAULT_JOINTS * 3 + 1} skeleton columns, got {frame_block.shape[1]}"
+        )
+    pose = project_skeleton_to_canonical_numpy(pose)
+    if joints != pose.shape[1]:
+        raise ValueError(f"Canonical skeleton has {pose.shape[1]} joints, but dataset requested {joints}")
+    return pose
 
 
 def _extract_sensor_accel3(df: pd.DataFrame) -> np.ndarray:
@@ -218,12 +232,13 @@ class TorchFileGaitDataset(Dataset):
         disable_gait_cache: bool = False,
     ) -> None:
         super().__init__()
+        require_canonical_joint_count(joints, "TorchFileGaitDataset")
         self.window = window
         self.joints = joints
         self.gait_cache_dir = gait_cache_dir or _default_gait_cache_dir(dataset_path=path, skeleton_folder=None)
         self.disable_gait_cache = disable_gait_cache
         payload = torch.load(path, map_location="cpu")
-        self.skeleton = payload["skeleton"].float() / 1000.0
+        self.skeleton = project_skeleton_to_canonical_torch(payload["skeleton"].float() / 1000.0)
         # Prefer explicit accel naming and keep legacy fallback support.
         self.A_hip = payload["A_hip"].float() if "A_hip" in payload else payload["A"].float()
         self.A_wrist = payload["A_wrist"].float() if "A_wrist" in payload else payload["Omega"].float()
@@ -284,7 +299,7 @@ class TorchFileGaitDataset(Dataset):
         self.fps = int(payload["fps"])
         sensor_identity = payload.get("sensor_identity", {})
         joint_labels = payload["joint_labels"]
-        validate_joint_labels(joint_labels)
+        validate_joint_labels(joint_labels, allow_legacy_source=True)
         if sensor_identity:
             hip_id = sensor_identity.get("A_hip", sensor_identity.get("A", ""))
             wrist_id = sensor_identity.get("A_wrist", sensor_identity.get("Omega", ""))
@@ -335,6 +350,7 @@ class CSVPairedGaitDataset(Dataset):
         disable_gait_cache: bool = False,
     ) -> None:
         super().__init__()
+        require_canonical_joint_count(joints, "CSVPairedGaitDataset")
         self.window = window
         self.joints = joints
         self.fps = 30

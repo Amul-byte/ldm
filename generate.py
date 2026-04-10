@@ -137,7 +137,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW)
     parser.add_argument("--joints", type=int, default=DEFAULT_JOINTS)
-    parser.add_argument("--latent_dim", type=int, default=DEFAULT_LATENT_DIM)
+    parser.add_argument("--latent_dim", type=int, default=128)
     parser.add_argument("--gait_metrics_dim", type=int, default=DEFAULT_GAIT_METRICS_DIM)
     parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument("--num_classes", type=int, default=14)
@@ -190,6 +190,7 @@ def main() -> None:
         encoder=stage1.encoder,
         decoder=stage1.decoder,
         denoiser=stage1.denoiser,
+        latent_normalizer=stage1.latent_normalizer,
         latent_dim=args.latent_dim,
         num_joints=args.joints,
         num_classes=args.num_classes,

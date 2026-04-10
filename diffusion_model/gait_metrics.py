@@ -13,26 +13,15 @@ import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
 
-from diffusion_model.util import DEFAULT_FPS, DEFAULT_JOINTS
-
-TARGET_INDICES: tuple[int, ...] = (
-    26,
-    3,
-    5,
-    6,
-    7,
-    12,
-    13,
-    14,
-    2,
-    0,
-    18,
-    19,
-    20,
-    22,
-    23,
-    24,
+from diffusion_model.util import (
+    DEFAULT_FPS,
+    DEFAULT_JOINTS,
+    TARGET_INDICES_16,
+    project_skeleton_to_canonical_numpy,
+    project_skeleton_to_canonical_torch,
 )
+
+TARGET_INDICES: tuple[int, ...] = TARGET_INDICES_16
 L_ANKLE = 12
 R_ANKLE = 15
 HEAD = 0
@@ -149,11 +138,7 @@ def detect_gait_events(pose: np.ndarray) -> np.ndarray:
 def _extract_pose16_numpy(pose: np.ndarray) -> np.ndarray:
     if pose.ndim != 3 or pose.shape[-1] != 3:
         raise ValueError(f"Expected pose [T,J,3], got {pose.shape}")
-    if pose.shape[1] == len(TARGET_INDICES):
-        return pose.astype(np.float32)
-    if pose.shape[1] != DEFAULT_JOINTS:
-        raise ValueError(f"Expected {DEFAULT_JOINTS} or {len(TARGET_INDICES)} joints, got {pose.shape[1]}")
-    return pose[:, TARGET_INDICES, :].astype(np.float32)
+    return project_skeleton_to_canonical_numpy(pose)
 
 
 def compute_gait_metrics_numpy(pose: np.ndarray, fps: float = DEFAULT_FPS) -> tuple[np.ndarray, OrderedDict[str, float]]:
@@ -211,12 +196,7 @@ def _gaussian_kernel1d_torch(device: torch.device, dtype: torch.dtype, sigma: fl
 def _extract_pose16_torch(pose: torch.Tensor) -> torch.Tensor:
     if pose.ndim != 3 or pose.shape[-1] != 3:
         raise ValueError(f"Expected pose [T,J,3], got {tuple(pose.shape)}")
-    if pose.shape[1] == len(TARGET_INDICES):
-        return pose
-    if pose.shape[1] != DEFAULT_JOINTS:
-        raise ValueError(f"Expected {DEFAULT_JOINTS} or {len(TARGET_INDICES)} joints, got {pose.shape[1]}")
-    index = torch.tensor(TARGET_INDICES, device=pose.device, dtype=torch.long)
-    return pose.index_select(1, index)
+    return project_skeleton_to_canonical_torch(pose)
 
 
 def _rotation_matrix_to_z_torch(normal: torch.Tensor) -> torch.Tensor:

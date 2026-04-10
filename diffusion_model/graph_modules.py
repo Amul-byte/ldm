@@ -389,6 +389,42 @@ class TemporalConvBlock(nn.Module):
         return x + y
 
 
+class TemporalAttentionBlock(nn.Module):
+    """Temporal self-attention block applied per joint (global receptive field).
+
+    Drop-in replacement for ``TemporalConvBlock`` — same input/output contract
+    ``[B, T, J, D]`` — but each frame attends to *every* frame instead of a
+    local kernel-3 window.
+    """
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+        self.norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=8, batch_first=True)
+        self.ff_norm = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply temporal self-attention to x with shape [B, T, J, D]."""
+        b, t, j, d = x.shape
+        assert_shape(x, [None, None, None, self.dim], "TemporalAttentionBlock.x")
+        # Treat each joint independently: [B, T, J, D] -> [B*J, T, D]
+        x_perm = x.permute(0, 2, 1, 3).reshape(b * j, t, d)
+        h = self.norm(x_perm)
+        attn_out, _ = self.attn(h, h, h)
+        x_perm = x_perm + attn_out
+        x_perm = x_perm + self.ff(self.ff_norm(x_perm))
+        # Reshape back: [B*J, T, D] -> [B, T, J, D]
+        out = x_perm.reshape(b, j, t, d).permute(0, 2, 1, 3)
+        assert_shape(out, [b, t, j, d], "TemporalAttentionBlock.out")
+        return out
+
+
 def build_edge_index(num_joints: int, device: torch.device) -> torch.Tensor:
     """Build edge_index tensor for torch_geometric from fixed skeleton adjacency."""
     adj = build_adjacency_matrix(num_joints=num_joints, device=device)

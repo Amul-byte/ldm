@@ -13,7 +13,11 @@ from torch.utils.data import DataLoader, Dataset
 
 from diffusion_model.dataset import create_dataset, parse_subject_list, split_train_val_dataset
 from diffusion_model.model import Stage1Model
-from diffusion_model.model_loader import infer_graph_ops_from_checkpoint, load_checkpoint
+from diffusion_model.model_loader import (
+    infer_graph_ops_from_checkpoint,
+    infer_temporal_block_type_from_checkpoint,
+    load_checkpoint,
+)
 from diffusion_model.util import (
     DEFAULT_JOINTS,
     DEFAULT_LATENT_DIM,
@@ -23,7 +27,7 @@ from diffusion_model.util import (
     get_skeleton_edges,
     set_seed,
 )
-
+DEFAULT_LATENT_DIM = 128
 try:
     import matplotlib.pyplot as plt
 except Exception:
@@ -199,6 +203,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
     encoder_graph_op, skeleton_graph_op = infer_graph_ops_from_checkpoint(args.stage1_ckpt)
+    temporal_block_type = infer_temporal_block_type_from_checkpoint(args.stage1_ckpt)
 
     dataset = select_dataset(args)
     loader = DataLoader(
@@ -217,6 +222,7 @@ def main() -> None:
         gait_metrics_dim=args.gait_metrics_dim,
         encoder_type=encoder_graph_op,
         skeleton_graph_op=skeleton_graph_op,
+        temporal_block_type=temporal_block_type,
     ).to(device)
     load_checkpoint(args.stage1_ckpt, model, strict=True)
     model.eval()

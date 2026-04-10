@@ -11,6 +11,7 @@ from diffusion_model.graph_modules import (
     CrossAttentionBlock,
     GraphBlock,
     GraphBlockGCN,
+    TemporalAttentionBlock,
     TemporalConvBlock,
     HAS_TORCH_GEOMETRIC,
     build_edge_index,
@@ -20,7 +21,13 @@ from diffusion_model.shared_features import (
     build_shared_motion_features,
     compute_skeleton_acceleration,
 )
-from diffusion_model.util import assert_shape, build_adjacency_matrix, sinusoidal_timestep_embedding
+from diffusion_model.util import (
+    DEFAULT_JOINTS,
+    assert_shape,
+    build_adjacency_matrix,
+    require_canonical_joint_count,
+    sinusoidal_timestep_embedding,
+)
 
 
 # Skeleton features now combine raw position with shared acceleration-derived motion features.
@@ -63,13 +70,14 @@ class GraphEncoder(nn.Module):
         self,
         input_dim: int = SKELETON_FEATURE_DIM,
         latent_dim: int = 256,
-        num_joints: int = 32,
+        num_joints: int = DEFAULT_JOINTS,
         depth: int = 4,
         gait_metrics_dim: int = 0,
         use_gait_conditioning: bool = True,
         graph_op: str = "gat",
     ) -> None:
         super().__init__()
+        require_canonical_joint_count(num_joints, "GraphEncoder")
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.num_joints = num_joints
@@ -133,11 +141,12 @@ class GraphEncoderGCN(GraphEncoder):
         self,
         input_dim: int = SKELETON_FEATURE_DIM,
         latent_dim: int = 256,
-        num_joints: int = 32,
+        num_joints: int = DEFAULT_JOINTS,
         depth: int = 4,
         gait_metrics_dim: int = 0,
         use_gait_conditioning: bool = True,
     ) -> None:
+        require_canonical_joint_count(num_joints, "GraphEncoderGCN")
         super().__init__(
             input_dim=input_dim,
             latent_dim=latent_dim,
@@ -156,11 +165,12 @@ class GraphDecoder(nn.Module):
         self,
         latent_dim: int = 256,
         output_dim: int = 3,
-        num_joints: int = 32,
+        num_joints: int = DEFAULT_JOINTS,
         depth: int = 3,
         graph_op: str = "gat",
     ) -> None:
         super().__init__()
+        require_canonical_joint_count(num_joints, "GraphDecoder")
         self.latent_dim = latent_dim
         self.output_dim = output_dim
         self.num_joints = num_joints
@@ -195,7 +205,8 @@ class GraphDecoder(nn.Module):
 class GraphDecoderGCN(GraphDecoder):
     """GCN-based skeleton decoder — same temporal stack, GCN spatial blocks."""
 
-    def __init__(self, latent_dim: int = 256, output_dim: int = 3, num_joints: int = 32, depth: int = 3) -> None:
+    def __init__(self, latent_dim: int = 256, output_dim: int = 3, num_joints: int = DEFAULT_JOINTS, depth: int = 3) -> None:
+        require_canonical_joint_count(num_joints, "GraphDecoderGCN")
         super().__init__(
             latent_dim=latent_dim,
             output_dim=output_dim,
@@ -211,17 +222,20 @@ class GraphDenoiserMasked(nn.Module):
     def __init__(
         self,
         latent_dim: int = 256,
-        num_joints: int = 32,
+        num_joints: int = DEFAULT_JOINTS,
         depth: int = 6,
         gait_metrics_dim: int = 0,
         use_gait_conditioning: bool = True,
         graph_op: str = "gat",
+        temporal_block_type: str = "conv",
     ) -> None:
         super().__init__()
+        require_canonical_joint_count(num_joints, "GraphDenoiserMasked")
         self.latent_dim = latent_dim
         self.num_joints = num_joints
         self.gait_metrics_dim = gait_metrics_dim
         self.graph_op_name = _normalize_skeleton_graph_op(graph_op)
+        self.temporal_block_type = temporal_block_type
         self.use_gait_conditioning = False  # disabled: gait metrics used only as eval/loss, not conditioning
         self.time_mlp = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
@@ -245,7 +259,8 @@ class GraphDenoiserMasked(nn.Module):
             [_build_skeleton_graph_block(self.graph_op_name, dim=latent_dim, num_joints=num_joints) for _ in range(depth)]
         )
         self.cross_attn_blocks = nn.ModuleList([CrossAttentionBlock(dim=latent_dim, num_heads=8) for _ in range(depth)])
-        self.temporal_blocks = nn.ModuleList([TemporalConvBlock(dim=latent_dim) for _ in range(depth)])
+        _temporal_cls = TemporalAttentionBlock if temporal_block_type == "attention" else TemporalConvBlock
+        self.temporal_blocks = nn.ModuleList([_temporal_cls(dim=latent_dim) for _ in range(depth)])
         self.out = nn.Linear(latent_dim, latent_dim)
         _adj = build_adjacency_matrix(num_joints=num_joints, device=torch.device("cpu"))
         self.register_buffer("_skel_adjacency", _adj, persistent=False)
@@ -316,11 +331,13 @@ class GraphDenoiserMaskedGCN(GraphDenoiserMasked):
     def __init__(
         self,
         latent_dim: int = 256,
-        num_joints: int = 32,
+        num_joints: int = DEFAULT_JOINTS,
         depth: int = 6,
         gait_metrics_dim: int = 0,
         use_gait_conditioning: bool = True,
+        temporal_block_type: str = "conv",
     ) -> None:
+        require_canonical_joint_count(num_joints, "GraphDenoiserMaskedGCN")
         super().__init__(
             latent_dim=latent_dim,
             num_joints=num_joints,
@@ -328,4 +345,5 @@ class GraphDenoiserMaskedGCN(GraphDenoiserMasked):
             gait_metrics_dim=gait_metrics_dim,
             use_gait_conditioning=use_gait_conditioning,
             graph_op="gcn",
+            temporal_block_type=temporal_block_type,
         )

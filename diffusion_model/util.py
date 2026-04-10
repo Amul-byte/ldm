@@ -12,14 +12,16 @@ import torch
 DEFAULT_TIMESTEPS = 500
 DEFAULT_LATENT_DIM = 256
 DEFAULT_WINDOW = 90
-DEFAULT_JOINTS = 32
 DEFAULT_NUM_CLASSES = 14
 DEFAULT_LAMBDA_CLS = 0.1
 DEFAULT_FPS = 30.0
 EPS = 1e-6
 
-# Joint order provided from skeleton analysis notebook.
-JOINT_LABELS: Tuple[str, ...] = (
+SKELETON_LAYOUT_VERSION = "16j_gait_order_v1"
+
+# Legacy source joint order present in raw SmartFall skeleton CSVs and older
+# checkpoints/datasets. This remains available only for input normalization.
+SOURCE_JOINT_LABELS_32: Tuple[str, ...] = (
     "PELVIS",
     "SPINE_NAVAL",
     "SPINE_CHEST",
@@ -53,40 +55,32 @@ JOINT_LABELS: Tuple[str, ...] = (
     "EYE_RIGHT",
     "EAR_RIGHT",
 )
+SOURCE_JOINTS_32 = len(SOURCE_JOINT_LABELS_32)
+
+# Canonical internal 16-joint gait-order skeleton used across the whole repo.
+TARGET_INDICES_16: Tuple[int, ...] = (26, 3, 5, 6, 7, 12, 13, 14, 2, 0, 18, 19, 20, 22, 23, 24)
+JOINT_LABELS: Tuple[str, ...] = tuple(SOURCE_JOINT_LABELS_32[idx] for idx in TARGET_INDICES_16)
+DEFAULT_JOINTS = len(JOINT_LABELS)
 
 _SKELETON_CONNECTIONS_BY_NAME: Tuple[Tuple[str, str], ...] = (
-    ("PELVIS", "SPINE_NAVAL"),
-    ("SPINE_NAVAL", "SPINE_CHEST"),
+    ("PELVIS", "SPINE_CHEST"),
     ("SPINE_CHEST", "NECK"),
     ("NECK", "HEAD"),
-    ("HEAD", "NOSE"),
-    ("NOSE", "EYE_LEFT"),
-    ("NOSE", "EYE_RIGHT"),
-    ("EYE_LEFT", "EAR_LEFT"),
-    ("EYE_RIGHT", "EAR_RIGHT"),
-    ("NECK", "CLAVICLE_LEFT"),
-    ("CLAVICLE_LEFT", "SHOULDER_LEFT"),
+    ("NECK", "SHOULDER_LEFT"),
     ("SHOULDER_LEFT", "ELBOW_LEFT"),
     ("ELBOW_LEFT", "WRIST_LEFT"),
-    ("WRIST_LEFT", "HAND_LEFT"),
-    ("HAND_LEFT", "HANDTIP_LEFT"),
-    ("WRIST_LEFT", "THUMB_LEFT"),
-    ("NECK", "CLAVICLE_RIGHT"),
-    ("CLAVICLE_RIGHT", "SHOULDER_RIGHT"),
+    ("NECK", "SHOULDER_RIGHT"),
     ("SHOULDER_RIGHT", "ELBOW_RIGHT"),
     ("ELBOW_RIGHT", "WRIST_RIGHT"),
-    ("WRIST_RIGHT", "HAND_RIGHT"),
-    ("HAND_RIGHT", "HANDTIP_RIGHT"),
-    ("WRIST_RIGHT", "THUMB_RIGHT"),
     ("PELVIS", "HIP_LEFT"),
     ("HIP_LEFT", "KNEE_LEFT"),
     ("KNEE_LEFT", "ANKLE_LEFT"),
-    ("ANKLE_LEFT", "FOOT_LEFT"),
     ("PELVIS", "HIP_RIGHT"),
     ("HIP_RIGHT", "KNEE_RIGHT"),
     ("KNEE_RIGHT", "ANKLE_RIGHT"),
-    ("ANKLE_RIGHT", "FOOT_RIGHT"),
 )
+
+_JOINT_TO_INDEX = {label: idx for idx, label in enumerate(JOINT_LABELS)}
 
 
 def set_seed(seed: int) -> None:
@@ -97,30 +91,86 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def get_joint_index(name: str) -> int:
+    """Return the canonical joint index for a named 16-joint skeleton node."""
+    try:
+        return _JOINT_TO_INDEX[name]
+    except KeyError as exc:
+        raise KeyError(f"Unknown canonical joint name: {name}") from exc
+
+
 def get_skeleton_edges() -> List[Tuple[int, int]]:
-    """Return adjacency edges derived from the fixed JOINT_LABELS ordering."""
-    label_to_index = {label: idx for idx, label in enumerate(JOINT_LABELS)}
-    return [(label_to_index[a], label_to_index[b]) for a, b in _SKELETON_CONNECTIONS_BY_NAME]
+    """Return adjacency edges derived from the canonical 16-joint skeleton graph."""
+    return [(get_joint_index(a), get_joint_index(b)) for a, b in _SKELETON_CONNECTIONS_BY_NAME]
 
 
 def get_joint_labels() -> Tuple[str, ...]:
-    """Return the exact expected joint label order."""
+    """Return the exact expected canonical joint label order."""
     return JOINT_LABELS
 
 
-def validate_joint_labels(labels: Sequence[str]) -> None:
-    """Validate that dataset joint labels match the expected exact order."""
-    expected = list(JOINT_LABELS)
+def get_source_joint_labels_32() -> Tuple[str, ...]:
+    """Return the legacy 32-joint source label order."""
+    return SOURCE_JOINT_LABELS_32
+
+
+def require_canonical_joint_count(num_joints: int, context: str = "skeleton") -> None:
+    """Fail fast when code tries to instantiate a non-canonical internal layout."""
+    if int(num_joints) != DEFAULT_JOINTS:
+        raise ValueError(
+            f"{context} must use the canonical {DEFAULT_JOINTS}-joint layout "
+            f"({SKELETON_LAYOUT_VERSION}); got {num_joints}. Legacy 32-joint data is supported "
+            "only as an input format and is projected at load time."
+        )
+
+
+def validate_joint_labels(labels: Sequence[str], allow_legacy_source: bool = False) -> None:
+    """Validate canonical 16-joint labels, optionally allowing legacy 32-joint labels."""
     got = list(labels)
-    assert got == expected, (
+    expected = list(JOINT_LABELS)
+    if got == expected:
+        return
+    if allow_legacy_source and got == list(SOURCE_JOINT_LABELS_32):
+        return
+    raise AssertionError(
         "Joint label order mismatch.\n"
-        f"Expected: {expected}\n"
-        f"Got:      {got}"
+        f"Expected canonical: {expected}\n"
+        f"Got:                {got}"
     )
 
 
+def _project_numpy_impl(pose: np.ndarray) -> np.ndarray:
+    joints = pose.shape[-2]
+    if joints == DEFAULT_JOINTS:
+        return pose.astype(np.float32, copy=False)
+    if joints == SOURCE_JOINTS_32:
+        return pose[..., TARGET_INDICES_16, :].astype(np.float32, copy=False)
+    raise ValueError(f"Expected {DEFAULT_JOINTS} or {SOURCE_JOINTS_32} joints, got {joints}")
+
+
+def project_skeleton_to_canonical_numpy(pose: np.ndarray) -> np.ndarray:
+    """Project a skeleton array with trailing shape [..., J, 3] to canonical 16 joints."""
+    arr = np.asarray(pose, dtype=np.float32)
+    if arr.ndim < 2 or arr.shape[-1] != 3:
+        raise ValueError(f"Expected skeleton array ending in [J,3], got {arr.shape}")
+    return _project_numpy_impl(arr)
+
+
+def project_skeleton_to_canonical_torch(pose: torch.Tensor) -> torch.Tensor:
+    """Project a skeleton tensor with trailing shape [..., J, 3] to canonical 16 joints."""
+    if pose.ndim < 2 or pose.shape[-1] != 3:
+        raise ValueError(f"Expected skeleton tensor ending in [J,3], got {tuple(pose.shape)}")
+    joints = pose.shape[-2]
+    if joints == DEFAULT_JOINTS:
+        return pose
+    if joints == SOURCE_JOINTS_32:
+        index = torch.tensor(TARGET_INDICES_16, device=pose.device, dtype=torch.long)
+        return pose.index_select(dim=pose.ndim - 2, index=index)
+    raise ValueError(f"Expected {DEFAULT_JOINTS} or {SOURCE_JOINTS_32} joints, got {joints}")
+
+
 def build_adjacency_matrix(num_joints: int, device: torch.device | None = None) -> torch.Tensor:
-    """Build a binary adjacency matrix with self-loops for the fixed skeleton graph."""
+    """Build a binary adjacency matrix with self-loops for the canonical skeleton graph."""
     adj = torch.zeros((num_joints, num_joints), dtype=torch.float32, device=device)
     for i, j in get_skeleton_edges():
         if i < num_joints and j < num_joints:
